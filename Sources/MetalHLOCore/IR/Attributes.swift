@@ -180,6 +180,14 @@ public struct HLOAttributes: Sendable {
     /// If conditional regions (then and else).
     public var ifRegions: IfRegions?
 
+    // MARK: - Custom Call Attributes
+
+    /// Target name for custom_call operation.
+    public var callTargetName: String?
+
+    /// Backend configuration JSON string for custom_call.
+    public var backendConfig: String?
+
     // MARK: - Initialization
 
     public init() {}

@@ -380,9 +380,52 @@ public final class Parser {
             // Map has a computation region - simplified parsing
             break
 
+        case .customCall:
+            // Parse custom call attributes: @target_name { backend_config = "..." }
+            attributes = try parseCustomCallAttributes()
+
         default:
             // No special attributes needed
             break
+        }
+
+        return attributes
+    }
+
+    // MARK: - Custom Call Attribute Parsing
+
+    private func parseCustomCallAttributes() throws -> HLOAttributes {
+        var attributes = HLOAttributes()
+
+        // Parse target name: @target_name
+        if check(.atIdentifier) {
+            attributes.callTargetName = String(currentToken.text.dropFirst())  // Remove @
+            advance()
+        }
+
+        // Skip operands (already parsed)
+
+        // Parse attribute block: { backend_config = "..." }
+        if match(.leftBrace) {
+            skipNewlines()
+            while !check(.rightBrace) && !check(.eof) {
+                // Parse attribute key
+                if checkIdentifier("backend_config") {
+                    try expectIdentifier("backend_config")
+                    try expect(.equal)
+                    // Parse string value
+                    if case .string(let value) = currentToken.kind {
+                        attributes.backendConfig = value
+                        advance()
+                    }
+                } else {
+                    // Skip unknown attributes
+                    advance()
+                }
+                _ = match(.comma)
+                skipNewlines()
+            }
+            try expect(.rightBrace)
         }
 
         return attributes

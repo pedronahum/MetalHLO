@@ -294,6 +294,20 @@ public enum HLOOpKind: String, CaseIterable, Sendable {
 
     /// Dequantize integer to float.
     case uniformDequantize = "uniform_dequantize"
+
+    // MARK: - Custom Calls (1 op)
+
+    /// Custom call for fused operations.
+    /// These are handled by specialized Metal kernels or MPSGraph implementations.
+    /// Supported targets:
+    /// - fused_scaled_dot_product_attention
+    /// - fused_layer_norm
+    /// - fused_rms_norm
+    /// - fused_matmul_bias_activation
+    /// - fused_softmax
+    /// - fused_gelu
+    /// - fused_rope
+    case customCall = "custom_call"
 }
 
 // MARK: - Operation Categories
@@ -454,6 +468,9 @@ extension HLOOpKind {
 
         case .rngBitGenerator:
             return .exactly(1)  // initial_state
+
+        case .customCall:
+            return .atLeast(1)  // variable inputs depending on target
         }
     }
 }

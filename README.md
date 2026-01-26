@@ -156,6 +156,7 @@ int main() {
 | **Quantization** | uniform_quantize, uniform_dequantize |
 | **Complex Numbers** | complex, real, imag |
 | **Select/Scatter** | select_and_scatter |
+| **Custom Calls** | fused_scaled_dot_product_attention, fused_layer_norm, fused_rms_norm, fused_matmul_bias_activation, fused_softmax, fused_gelu, fused_rope |
 
 ### Operations Requiring MPS Kernel Bridging (3 ops)
 
@@ -355,7 +356,8 @@ swift test --filter "Convolution"
 | Control Flow | 8 |
 | Activation Functions | 35 |
 | CNN Operations | 10 |
-| **Total** | **174** |
+| Custom Call Handlers | 46 |
+| **Total** | **220** |
 
 ## Limitations
 

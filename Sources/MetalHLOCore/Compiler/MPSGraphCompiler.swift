@@ -312,6 +312,46 @@ public final class MPSGraphCompiler {
             return try compileQuantize(op)
         case .uniformDequantize:
             return try compileDequantize(op)
+
+        // Custom calls (fused operations from Magma)
+        case .customCall:
+            return try compileCustomCall(op)
+        }
+    }
+
+    // MARK: - Custom Call Compilation
+
+    private func compileCustomCall(_ op: HLOOperation) throws -> MPSGraphTensor {
+        // Extract target name from attributes
+        guard let target = op.attributes.callTargetName else {
+            throw CompilationError.missingAttribute("call_target_name", operation: "custom_call")
+        }
+
+        // Get the handler for this target
+        guard let handler = CustomCallRegistry.shared.handler(for: target) else {
+            throw CompilationError.unsupportedOperation("custom_call:\(target)")
+        }
+
+        // Resolve input operands
+        var inputs: [MPSGraphTensor] = []
+        for operandName in op.operands {
+            let tensor = try getOperand(operandName)
+            inputs.append(tensor)
+        }
+
+        // Parse backend config
+        let backendConfig = op.attributes.backendConfig ?? ""
+        let config = BackendConfigParser.parse(backendConfig)
+
+        // Emit the custom call
+        do {
+            let outputs = try handler.emit(operation: op, graph: graph, inputs: inputs, config: config)
+            guard let output = outputs.first else {
+                throw CompilationError.invalidAttribute("no_outputs", operation: "custom_call:\(target)")
+            }
+            return output
+        } catch let error as CustomCallError {
+            throw CompilationError.invalidAttribute(error.description, operation: "custom_call:\(target)")
         }
     }
 
