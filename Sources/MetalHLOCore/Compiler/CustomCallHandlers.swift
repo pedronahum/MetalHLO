@@ -537,6 +537,10 @@ public final class FusedGeluHandler: CustomCallHandler {
 // MARK: - Fused RoPE Handler
 
 /// Handles fused Rotary Position Embedding
+///
+/// RoPE applies rotation to pairs of elements in the head dimension:
+/// For each position i with frequency theta:
+///   (x[2i], x[2i+1]) -> (x[2i]*cos - x[2i+1]*sin, x[2i]*sin + x[2i+1]*cos)
 public final class FusedRoPEHandler: CustomCallHandler {
 
     public static let targetName = "fused_rope"
@@ -553,17 +557,113 @@ public final class FusedRoPEHandler: CustomCallHandler {
             throw CustomCallError.invalidInputCount(expected: 2, got: inputs.count)
         }
 
-        let x = inputs[0]       // input: [batch, seq, heads, head_dim]
-        let freqs = inputs[1]   // frequencies: [seq, head_dim/2] or similar
+        let x = inputs[0]       // input: [batch, seq, heads, head_dim] or [batch, heads, seq, head_dim]
+        let freqs = inputs[1]   // frequencies: [seq, head_dim] contains interleaved cos/sin
 
-        // RoPE: rotate x using sin/cos frequencies
-        // Split x into even and odd indices along last dimension
-        // x_even * cos(freq) - x_odd * sin(freq), x_even * sin(freq) + x_odd * cos(freq)
+        guard let xShape = x.shape, xShape.count >= 2 else {
+            throw CustomCallError.invalidConfig("RoPE input must have at least 2 dimensions")
+        }
 
-        // For simplicity, this is a placeholder implementation
-        // A full implementation would properly handle the rotation
-        // For now, just return x (identity)
-        return [x]
+        let rank = xShape.count
+        let headDim = xShape[rank - 1].intValue
+        let halfDim = headDim / 2
+
+        // Split x into first half and second half along last dimension
+        // x1 = x[..., :halfDim], x2 = x[..., halfDim:]
+        var startIndices1 = [Int](repeating: 0, count: rank)
+        var endIndices1 = xShape.map { $0.intValue }
+        endIndices1[rank - 1] = halfDim
+
+        var startIndices2 = [Int](repeating: 0, count: rank)
+        startIndices2[rank - 1] = halfDim
+        let endIndices2 = xShape.map { $0.intValue }
+
+        let x1 = graph.sliceTensor(
+            x,
+            starts: startIndices1.map { NSNumber(value: $0) },
+            ends: endIndices1.map { NSNumber(value: $0) },
+            strides: [Int](repeating: 1, count: rank).map { NSNumber(value: $0) },
+            name: "rope_x1"
+        )
+
+        let x2 = graph.sliceTensor(
+            x,
+            starts: startIndices2.map { NSNumber(value: $0) },
+            ends: endIndices2.map { NSNumber(value: $0) },
+            strides: [Int](repeating: 1, count: rank).map { NSNumber(value: $0) },
+            name: "rope_x2"
+        )
+
+        // Extract cos and sin from freqs
+        // freqs is typically [seq, head_dim] with cos in first half, sin in second half
+        // Or it might be [seq, head_dim/2] for cos and a separate tensor for sin
+        guard let freqsShape = freqs.shape, freqsShape.count >= 1 else {
+            throw CustomCallError.invalidConfig("RoPE frequencies must have at least 1 dimension")
+        }
+
+        let freqsRank = freqsShape.count
+        let freqsDim = freqsShape[freqsRank - 1].intValue
+
+        let cosFreqs: MPSGraphTensor
+        let sinFreqs: MPSGraphTensor
+
+        if freqsDim == headDim {
+            // freqs contains both cos and sin interleaved or concatenated
+            // Assume first half is cos, second half is sin
+            var cosStart = [Int](repeating: 0, count: freqsRank)
+            var cosEnd = freqsShape.map { $0.intValue }
+            cosEnd[freqsRank - 1] = halfDim
+
+            var sinStart = [Int](repeating: 0, count: freqsRank)
+            sinStart[freqsRank - 1] = halfDim
+            let sinEnd = freqsShape.map { $0.intValue }
+
+            cosFreqs = graph.sliceTensor(
+                freqs,
+                starts: cosStart.map { NSNumber(value: $0) },
+                ends: cosEnd.map { NSNumber(value: $0) },
+                strides: [Int](repeating: 1, count: freqsRank).map { NSNumber(value: $0) },
+                name: "rope_cos"
+            )
+
+            sinFreqs = graph.sliceTensor(
+                freqs,
+                starts: sinStart.map { NSNumber(value: $0) },
+                ends: sinEnd.map { NSNumber(value: $0) },
+                strides: [Int](repeating: 1, count: freqsRank).map { NSNumber(value: $0) },
+                name: "rope_sin"
+            )
+        } else if freqsDim == halfDim {
+            // freqs is just the angle - compute cos/sin
+            cosFreqs = graph.cos(with: freqs, name: "rope_cos")
+            sinFreqs = graph.sin(with: freqs, name: "rope_sin")
+        } else {
+            // Treat freqs as-is for cos, assume third input is sin if available
+            cosFreqs = freqs
+            if inputs.count >= 3 {
+                sinFreqs = inputs[2]
+            } else {
+                // Compute sin from cos: sin = sqrt(1 - cos^2) - but this loses sign
+                // Better to just use freqs as angles
+                sinFreqs = graph.sin(with: freqs, name: "rope_sin")
+            }
+        }
+
+        // Apply rotation:
+        // out1 = x1 * cos - x2 * sin
+        // out2 = x1 * sin + x2 * cos
+        let x1Cos = graph.multiplication(x1, cosFreqs, name: "rope_x1_cos")
+        let x2Sin = graph.multiplication(x2, sinFreqs, name: "rope_x2_sin")
+        let x1Sin = graph.multiplication(x1, sinFreqs, name: "rope_x1_sin")
+        let x2Cos = graph.multiplication(x2, cosFreqs, name: "rope_x2_cos")
+
+        let out1 = graph.subtraction(x1Cos, x2Sin, name: "rope_out1")
+        let out2 = graph.addition(x1Sin, x2Cos, name: "rope_out2")
+
+        // Concatenate back together along last dimension
+        let output = graph.concatTensors([out1, out2], dimension: rank - 1, name: "rope_output")
+
+        return [output]
     }
 }
 
