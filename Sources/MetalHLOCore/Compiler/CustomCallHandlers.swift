@@ -263,17 +263,31 @@ public final class FusedLayerNormHandler: CustomCallHandler {
         let eps = BackendConfigParser.getFloat(config, key: "eps", default: 1e-5)
         let axes = BackendConfigParser.getIntArray(config, key: "axes", default: [-1])
 
+        // Get input shape
+        guard let inputShape = x.shape else {
+            throw CustomCallError.invalidConfig("Input tensor has no shape")
+        }
+        let rank = inputShape.count
+
         // Normalize axis (handle negative indices)
-        let rank = x.shape?.count ?? 1
         let normalizedAxes = axes.map { $0 < 0 ? rank + $0 : $0 }
 
-        // Compute mean
-        let mean = graph.mean(of: x, axes: normalizedAxes.map { NSNumber(value: $0) }, name: "ln_mean")
+        // Compute shape for keepDims semantics: replace reduced dims with 1
+        var keepDimsShape = inputShape.map { $0.intValue }
+        for axis in normalizedAxes {
+            keepDimsShape[axis] = 1
+        }
+        let keepDimsShapeNS = keepDimsShape.map { NSNumber(value: $0) }
+
+        // Compute mean and reshape to keep dimensions
+        let meanReduced = graph.mean(of: x, axes: normalizedAxes.map { NSNumber(value: $0) }, name: "ln_mean_reduced")
+        let mean = graph.reshape(meanReduced, shape: keepDimsShapeNS, name: "ln_mean")
 
         // Compute variance: mean((x - mean)^2)
         let centered = graph.subtraction(x, mean, name: "ln_centered")
         let squared = graph.square(with: centered, name: "ln_squared")
-        let variance = graph.mean(of: squared, axes: normalizedAxes.map { NSNumber(value: $0) }, name: "ln_variance")
+        let varianceReduced = graph.mean(of: squared, axes: normalizedAxes.map { NSNumber(value: $0) }, name: "ln_variance_reduced")
+        let variance = graph.reshape(varianceReduced, shape: keepDimsShapeNS, name: "ln_variance")
 
         // Normalize: (x - mean) / sqrt(variance + eps)
         let epsConst = graph.constant(Double(eps), dataType: x.dataType)

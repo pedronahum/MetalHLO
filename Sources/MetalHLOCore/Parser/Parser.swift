@@ -227,21 +227,72 @@ public final class Parser {
         var operands: [String] = []
         var attributes = HLOAttributes()
 
-        // Parse operands (% identifiers before attributes/type)
-        while check(.percentIdentifier) {
-            let operand = try parsePercentIdentifier()
-            operands.append(operand)
-            _ = match(.comma)
-        }
+        // Special handling for custom_call which has @target(operands) format
+        if kind == .customCall {
+            (operands, attributes) = try parseCustomCallOperandsAndAttributes()
+        } else {
+            // Parse operands (% identifiers before attributes/type)
+            while check(.percentIdentifier) {
+                let operand = try parsePercentIdentifier()
+                operands.append(operand)
+                _ = match(.comma)
+            }
 
-        // Parse attributes based on operation kind
-        attributes = try parseAttributes(for: kind)
+            // Parse attributes based on operation kind
+            attributes = try parseAttributes(for: kind)
+        }
 
         // Parse type signature
         try expect(.colon)
         let resultType = try parseTypeSignature()
 
         return (operands, attributes, resultType)
+    }
+
+    /// Parse custom_call operands and attributes in the format: @target(operands) { backend_config = "..." }
+    private func parseCustomCallOperandsAndAttributes() throws -> ([String], HLOAttributes) {
+        var operands: [String] = []
+        var attributes = HLOAttributes()
+
+        // Parse target name: @target_name
+        if check(.atIdentifier) {
+            attributes.callTargetName = String(currentToken.text.dropFirst())  // Remove @
+            advance()
+        }
+
+        // Parse operands: (%op1, %op2, ...)
+        if match(.leftParen) {
+            if !check(.rightParen) {
+                repeat {
+                    let operand = try parsePercentIdentifier()
+                    operands.append(operand)
+                } while match(.comma)
+            }
+            try expect(.rightParen)
+        }
+
+        // Parse attribute block: { backend_config = "..." }
+        if match(.leftBrace) {
+            skipNewlines()
+            while !check(.rightBrace) && !check(.eof) {
+                if checkIdentifier("backend_config") {
+                    try expectIdentifier("backend_config")
+                    try expect(.equal)
+                    if case .string(let value) = currentToken.kind {
+                        attributes.backendConfig = value
+                        advance()
+                    }
+                } else {
+                    // Skip unknown attributes
+                    advance()
+                }
+                _ = match(.comma)
+                skipNewlines()
+            }
+            try expect(.rightBrace)
+        }
+
+        return (operands, attributes)
     }
 
     private func parseAttributes(for kind: HLOOpKind) throws -> HLOAttributes {
@@ -381,51 +432,12 @@ public final class Parser {
             break
 
         case .customCall:
-            // Parse custom call attributes: @target_name { backend_config = "..." }
-            attributes = try parseCustomCallAttributes()
+            // custom_call is handled specially in parseOperationBody via parseCustomCallOperandsAndAttributes()
+            break
 
         default:
             // No special attributes needed
             break
-        }
-
-        return attributes
-    }
-
-    // MARK: - Custom Call Attribute Parsing
-
-    private func parseCustomCallAttributes() throws -> HLOAttributes {
-        var attributes = HLOAttributes()
-
-        // Parse target name: @target_name
-        if check(.atIdentifier) {
-            attributes.callTargetName = String(currentToken.text.dropFirst())  // Remove @
-            advance()
-        }
-
-        // Skip operands (already parsed)
-
-        // Parse attribute block: { backend_config = "..." }
-        if match(.leftBrace) {
-            skipNewlines()
-            while !check(.rightBrace) && !check(.eof) {
-                // Parse attribute key
-                if checkIdentifier("backend_config") {
-                    try expectIdentifier("backend_config")
-                    try expect(.equal)
-                    // Parse string value
-                    if case .string(let value) = currentToken.kind {
-                        attributes.backendConfig = value
-                        advance()
-                    }
-                } else {
-                    // Skip unknown attributes
-                    advance()
-                }
-                _ = match(.comma)
-                skipNewlines()
-            }
-            try expect(.rightBrace)
         }
 
         return attributes
