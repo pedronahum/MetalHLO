@@ -41,7 +41,48 @@ public final class BufferStorage: @unchecked Sendable {
 
     // MARK: - Initialization
 
-    /// Creates storage from numeric data.
+    /// Creates storage from Float data (optimized fast path).
+    /// This avoids expensive per-element type conversion.
+    public init(
+        floatData data: [Float],
+        shape: [Int],
+        device: MTLDevice
+    ) {
+        self.shape = shape
+        self.elementType = .float32
+        self.device = device
+
+        // Direct byte copy - no conversion needed
+        self.data = data.withUnsafeBytes { Data($0) }
+    }
+
+    /// Creates storage from Int32 data (optimized fast path).
+    public init(
+        int32Data data: [Int32],
+        shape: [Int],
+        device: MTLDevice
+    ) {
+        self.shape = shape
+        self.elementType = .int32
+        self.device = device
+
+        self.data = data.withUnsafeBytes { Data($0) }
+    }
+
+    /// Creates storage from Int64 data (optimized fast path).
+    public init(
+        int64Data data: [Int64],
+        shape: [Int],
+        device: MTLDevice
+    ) {
+        self.shape = shape
+        self.elementType = .int64
+        self.device = device
+
+        self.data = data.withUnsafeBytes { Data($0) }
+    }
+
+    /// Creates storage from numeric data (generic, slower path with type conversion).
     public init<T: Numeric>(
         data: [T],
         shape: [Int],
@@ -52,8 +93,19 @@ public final class BufferStorage: @unchecked Sendable {
         self.elementType = elementType
         self.device = device
 
-        // Convert data to the appropriate format
-        self.data = try Self.convertToData(data, elementType: elementType)
+        // Fast path: if T is already the correct type, use direct copy
+        if elementType == .float32, let floatData = data as? [Float] {
+            self.data = floatData.withUnsafeBytes { Data($0) }
+        } else if elementType == .int32, let int32Data = data as? [Int32] {
+            self.data = int32Data.withUnsafeBytes { Data($0) }
+        } else if elementType == .int64, let int64Data = data as? [Int64] {
+            self.data = int64Data.withUnsafeBytes { Data($0) }
+        } else if elementType == .float64, let doubleData = data as? [Double] {
+            self.data = doubleData.withUnsafeBytes { Data($0) }
+        } else {
+            // Slow path: convert data to the appropriate format
+            self.data = try Self.convertToData(data, elementType: elementType)
+        }
     }
 
     /// Creates storage from raw bytes.

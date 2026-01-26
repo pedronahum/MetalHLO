@@ -88,7 +88,43 @@ public final class MetalExecutor: @unchecked Sendable {
 
     // MARK: - Buffer Creation
 
-    /// Creates a buffer storage from numeric data.
+    /// Creates a buffer storage from Float data (optimized fast path).
+    public func createBufferStorage(
+        _ data: [Float],
+        shape: [Int]
+    ) -> BufferStorage {
+        BufferStorage(
+            floatData: data,
+            shape: shape,
+            device: device
+        )
+    }
+
+    /// Creates a buffer storage from Int32 data (optimized fast path).
+    public func createBufferStorage(
+        _ data: [Int32],
+        shape: [Int]
+    ) -> BufferStorage {
+        BufferStorage(
+            int32Data: data,
+            shape: shape,
+            device: device
+        )
+    }
+
+    /// Creates a buffer storage from Int64 data (optimized fast path).
+    public func createBufferStorage(
+        _ data: [Int64],
+        shape: [Int]
+    ) -> BufferStorage {
+        BufferStorage(
+            int64Data: data,
+            shape: shape,
+            device: device
+        )
+    }
+
+    /// Creates a buffer storage from numeric data (generic path).
     public func createBufferStorage<T: Numeric>(
         _ data: [T],
         shape: [Int],
