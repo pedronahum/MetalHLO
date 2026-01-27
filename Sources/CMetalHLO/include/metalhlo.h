@@ -95,6 +95,32 @@ void mhlo_client_destroy(MHLOClientRef client);
 char* mhlo_client_device_name(MHLOClientRef client);
 
 // ============================================================================
+// Compilation Configuration
+// ============================================================================
+
+/// Optimization levels for compilation.
+typedef enum {
+    MHLO_OPT_O0 = 0,  // No optimization
+    MHLO_OPT_O1 = 1,  // Basic optimization (algebraic simplification, DCE)
+    MHLO_OPT_O2 = 2,  // Standard optimization (default - includes fusion)
+    MHLO_OPT_O3 = 3,  // Aggressive optimization (multiple fusion passes)
+} MHLOOptimizationLevel;
+
+/// Compilation configuration.
+typedef struct {
+    /// Optimization level (default: MHLO_OPT_O2).
+    MHLOOptimizationLevel optimization_level;
+    /// Enable compilation caching (default: true).
+    bool enable_caching;
+    /// Enable debug info generation (default: false).
+    bool enable_debug_info;
+} MHLOCompileConfig;
+
+/// Initialize a compilation configuration with defaults.
+/// - Parameter out_config: Output configuration struct.
+void mhlo_compile_config_init(MHLOCompileConfig* out_config);
+
+// ============================================================================
 // Compilation API
 // ============================================================================
 
@@ -115,6 +141,20 @@ MHLOStatusCode mhlo_compile_n(
     MHLOClientRef client,
     const char* mlir_text,
     size_t mlir_length,
+    MHLOExecutableRef* out_executable
+);
+
+/// Compile StableHLO MLIR with configuration options.
+/// - Parameters:
+///   - client: The client to compile with.
+///   - mlir_text: StableHLO MLIR module text (null-terminated).
+///   - config: Pointer to compilation configuration (or NULL for defaults).
+///   - out_executable: Output executable handle.
+/// - Returns: MHLO_OK on success, error code otherwise.
+MHLOStatusCode mhlo_compile_with_config(
+    MHLOClientRef client,
+    const char* mlir_text,
+    const MHLOCompileConfig* config,
     MHLOExecutableRef* out_executable
 );
 
@@ -151,6 +191,35 @@ MHLOStatusCode mhlo_executable_output_type(
     int32_t* out_rank,
     MHLOElementType* out_element_type
 );
+
+// ============================================================================
+// Execution Statistics
+// ============================================================================
+
+/// Execution statistics structure.
+typedef struct {
+    /// Number of times the executable has been run.
+    int64_t execution_count;
+    /// Total execution time across all runs (milliseconds).
+    double total_execution_time_ms;
+    /// Last execution time (milliseconds).
+    double last_execution_time_ms;
+    /// Average execution time (milliseconds).
+    double average_execution_time_ms;
+} MHLOExecutionStats;
+
+/// Get execution statistics for an executable.
+/// - Parameters:
+///   - executable: The executable.
+///   - out_stats: Output statistics structure.
+/// - Returns: MHLO_OK on success.
+MHLOStatusCode mhlo_executable_get_stats(
+    MHLOExecutableRef executable,
+    MHLOExecutionStats* out_stats
+);
+
+/// Reset execution statistics for an executable.
+void mhlo_executable_reset_stats(MHLOExecutableRef executable);
 
 // ============================================================================
 // Buffer API

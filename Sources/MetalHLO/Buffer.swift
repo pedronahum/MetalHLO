@@ -58,6 +58,14 @@ public final class Buffer: @unchecked Sendable {
         try storage.toArray(as: Float.self)
     }
 
+    /// Copies buffer contents to host as a Double array.
+    ///
+    /// - Throws: `MetalHLOError.transferFailed` on failure.
+    /// - Returns: An array of double values.
+    public func toDoubleArray() throws -> [Double] {
+        try storage.toArray(as: Double.self)
+    }
+
     /// Copies buffer contents to host as a Float16 array.
     ///
     /// - Throws: `MetalHLOError.transferFailed` on failure.
@@ -81,6 +89,54 @@ public final class Buffer: @unchecked Sendable {
     /// - Returns: An array of Int64 values.
     public func toInt64Array() throws -> [Int64] {
         try storage.toArray(as: Int64.self)
+    }
+
+    /// Copies buffer contents to host as an Int8 array.
+    ///
+    /// - Throws: `MetalHLOError.transferFailed` on failure.
+    /// - Returns: An array of Int8 values.
+    public func toInt8Array() throws -> [Int8] {
+        try storage.toArray(as: Int8.self)
+    }
+
+    /// Copies buffer contents to host as an Int16 array.
+    ///
+    /// - Throws: `MetalHLOError.transferFailed` on failure.
+    /// - Returns: An array of Int16 values.
+    public func toInt16Array() throws -> [Int16] {
+        try storage.toArray(as: Int16.self)
+    }
+
+    /// Copies buffer contents to host as a UInt8 array.
+    ///
+    /// - Throws: `MetalHLOError.transferFailed` on failure.
+    /// - Returns: An array of UInt8 values.
+    public func toUInt8Array() throws -> [UInt8] {
+        try storage.toArray(as: UInt8.self)
+    }
+
+    /// Copies buffer contents to host as a UInt16 array.
+    ///
+    /// - Throws: `MetalHLOError.transferFailed` on failure.
+    /// - Returns: An array of UInt16 values.
+    public func toUInt16Array() throws -> [UInt16] {
+        try storage.toArray(as: UInt16.self)
+    }
+
+    /// Copies buffer contents to host as a UInt32 array.
+    ///
+    /// - Throws: `MetalHLOError.transferFailed` on failure.
+    /// - Returns: An array of UInt32 values.
+    public func toUInt32Array() throws -> [UInt32] {
+        try storage.toArray(as: UInt32.self)
+    }
+
+    /// Copies buffer contents to host as a UInt64 array.
+    ///
+    /// - Throws: `MetalHLOError.transferFailed` on failure.
+    /// - Returns: An array of UInt64 values.
+    public func toUInt64Array() throws -> [UInt64] {
+        try storage.toArray(as: UInt64.self)
     }
 
     /// Copies buffer contents to host as a Bool array.

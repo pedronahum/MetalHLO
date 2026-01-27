@@ -33,6 +33,7 @@ struct MetalKernelTests {
         #expect(registry.getKernel("gelu") != nil)
         #expect(registry.getKernel("layer_norm") != nil)
         #expect(registry.getKernel("rms_norm") != nil)
+        #expect(registry.getKernel("flash_attention") != nil)
     }
 
     @Test("Kernel registry returns nil for unknown kernel")
@@ -270,6 +271,358 @@ struct MetalKernelTests {
         #expect(abs(output[1] - 1.6) < 1e-4)
         #expect(abs(output[2]) < 1e-5)
         #expect(abs(output[3]) < 1e-5)
+    }
+
+    // MARK: - FlashAttention Kernel Tests
+
+    @Test("FlashAttention kernel compiles")
+    func flashAttentionKernelCompiles() throws {
+        let registry = MetalKernelRegistry.shared
+        let kernel = registry.getKernel("flash_attention")!
+
+        let pipeline = try registry.getPipeline(for: kernel, device: device)
+        #expect(pipeline.maxTotalThreadsPerThreadgroup > 0)
+    }
+
+    @Test("FlashAttention params initialization")
+    func flashAttentionParamsInit() {
+        // Default initialization
+        let params1 = FlashAttentionParams(
+            batchSize: 2,
+            seqLenQ: 128,
+            numHeads: 8,
+            headDim: 64
+        )
+
+        #expect(params1.batchSize == 2)
+        #expect(params1.seqLenQ == 128)
+        #expect(params1.seqLenKV == 128)  // Defaults to seqLenQ
+        #expect(params1.numHeads == 8)
+        #expect(params1.headDim == 64)
+        #expect(abs(params1.scale - (1.0 / sqrt(64.0))) < 1e-6)  // Default scale
+        #expect(!params1.isCausal)
+        #expect(params1.blockSize == 64)
+
+        // Custom initialization
+        let params2 = FlashAttentionParams(
+            batchSize: 4,
+            seqLenQ: 256,
+            seqLenKV: 512,
+            numHeads: 12,
+            headDim: 32,
+            scale: 0.1,
+            isCausal: true,
+            blockSize: 32
+        )
+
+        #expect(params2.seqLenKV == 512)
+        #expect(params2.scale == 0.1)
+        #expect(params2.isCausal)
+        #expect(params2.blockSize == 32)
+    }
+
+    @Test("FlashAttention statistics computation")
+    func flashAttentionStatistics() {
+        let params = FlashAttentionParams(
+            batchSize: 2,
+            seqLenQ: 256,
+            seqLenKV: 256,
+            numHeads: 8,
+            headDim: 64,
+            isCausal: false
+        )
+
+        let stats = params.computeStatistics()
+
+        #expect(stats.numQBlocks == 4)  // 256 / 64 = 4
+        #expect(stats.avgKVBlocksPerQ == 4.0)  // Non-causal: all 4 blocks
+        #expect(stats.totalThreadgroups == 2 * 8 * 4)  // batch * heads * q_blocks
+        #expect(stats.memorySavingsRatio > 1.0)  // Should save memory
+    }
+
+    @Test("FlashAttention statistics with causal mask")
+    func flashAttentionStatisticsCausal() {
+        let params = FlashAttentionParams(
+            batchSize: 1,
+            seqLenQ: 128,
+            seqLenKV: 128,
+            numHeads: 4,
+            headDim: 64,
+            isCausal: true
+        )
+
+        let stats = params.computeStatistics()
+
+        #expect(stats.isCausal)
+        #expect(stats.avgKVBlocksPerQ == 1.0)  // Causal: half the blocks on average
+    }
+
+    @Test("FlashAttention total elements calculation")
+    func flashAttentionTotalElements() {
+        let params = FlashAttentionParams(
+            batchSize: 2,
+            seqLenQ: 64,
+            numHeads: 4,
+            headDim: 32
+        )
+
+        #expect(params.totalElements == 2 * 4 * 64 * 32)
+    }
+
+    @Test("FlashAttention threadgroup calculation")
+    func flashAttentionThreadgroups() throws {
+        let kernel = FlashAttentionKernel()
+        let pipeline = try MetalKernelRegistry.shared.getPipeline(for: kernel, device: device)
+
+        let params = FlashAttentionParams(
+            batchSize: 2,
+            seqLenQ: 128,
+            numHeads: 8,
+            headDim: 64,
+            blockSize: 64
+        )
+
+        let (gridSize, threadgroupSize) = kernel.calculateThreadgroups(for: params, pipeline: pipeline)
+
+        // Simplified kernel: one thread per query position
+        // Grid: (ceil(seq_q / threadgroup_width), num_heads, batch_size)
+        #expect(gridSize.height == 8)  // num_heads
+        #expect(gridSize.depth == 2)   // batch_size
+
+        // Threadgroup width should be min(seqLen, maxThreads)
+        #expect(threadgroupSize.width <= 256)  // Limited by max threads
+        #expect(threadgroupSize.width > 0)
+        #expect(threadgroupSize.height == 1)
+        #expect(threadgroupSize.depth == 1)
+
+        // Verify grid covers all query positions
+        let totalQueries = gridSize.width * threadgroupSize.width
+        #expect(totalQueries >= params.seqLenQ)
+    }
+
+    @Test("FlashAttention kernel produces valid output shape")
+    func flashAttentionProducesValidOutput() throws {
+        let registry = MetalKernelRegistry.shared
+        let kernel = registry.getKernel("flash_attention")!
+        let pipeline = try registry.getPipeline(for: kernel, device: device)
+
+        // Small test case: batch=1, heads=1, seq=64, dim=32
+        let batchSize = 1
+        let numHeads = 1
+        let seqLen = 64
+        let headDim = 32
+        let totalElements = batchSize * numHeads * seqLen * headDim
+
+        // Create random Q, K, V inputs
+        var q = [Float](repeating: 0, count: totalElements)
+        var k = [Float](repeating: 0, count: totalElements)
+        var v = [Float](repeating: 0, count: totalElements)
+
+        for i in 0..<totalElements {
+            q[i] = Float.random(in: -1...1)
+            k[i] = Float.random(in: -1...1)
+            v[i] = Float.random(in: -1...1)
+        }
+
+        let qBuffer = device.makeBuffer(bytes: q, length: q.count * MemoryLayout<Float>.stride, options: [])!
+        let kBuffer = device.makeBuffer(bytes: k, length: k.count * MemoryLayout<Float>.stride, options: [])!
+        let vBuffer = device.makeBuffer(bytes: v, length: v.count * MemoryLayout<Float>.stride, options: [])!
+        let oBuffer = device.makeBuffer(length: totalElements * MemoryLayout<Float>.stride, options: [])!
+
+        let params = FlashAttentionParams(
+            batchSize: batchSize,
+            seqLenQ: seqLen,
+            numHeads: numHeads,
+            headDim: headDim
+        )
+
+        let commandBuffer = commandQueue.makeCommandBuffer()!
+        let encoder = commandBuffer.makeComputeCommandEncoder()!
+
+        kernel.encode(
+            into: encoder,
+            inputs: [qBuffer, kBuffer, vBuffer],
+            outputs: [oBuffer],
+            params: params,
+            pipeline: pipeline
+        )
+
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        // Read output
+        let outputPtr = oBuffer.contents().bindMemory(to: Float.self, capacity: totalElements)
+        let output = Array(UnsafeBufferPointer(start: outputPtr, count: totalElements))
+
+        // Verify output is not all zeros and not NaN
+        var hasNonZero = false
+        for val in output {
+            #expect(!val.isNaN, "Output should not contain NaN")
+            #expect(!val.isInfinite, "Output should not contain Inf")
+            if abs(val) > 1e-10 {
+                hasNonZero = true
+            }
+        }
+        #expect(hasNonZero, "Output should have non-zero values")
+    }
+
+    @Test("FlashAttention with causal mask")
+    func flashAttentionWithCausalMask() throws {
+        let registry = MetalKernelRegistry.shared
+        let kernel = registry.getKernel("flash_attention")!
+        let pipeline = try registry.getPipeline(for: kernel, device: device)
+
+        let batchSize = 1
+        let numHeads = 1
+        let seqLen = 64
+        let headDim = 32
+        let totalElements = batchSize * numHeads * seqLen * headDim
+
+        var q = [Float](repeating: 0, count: totalElements)
+        var k = [Float](repeating: 0, count: totalElements)
+        var v = [Float](repeating: 0, count: totalElements)
+
+        for i in 0..<totalElements {
+            q[i] = Float.random(in: -1...1)
+            k[i] = Float.random(in: -1...1)
+            v[i] = Float.random(in: -1...1)
+        }
+
+        let qBuffer = device.makeBuffer(bytes: q, length: q.count * MemoryLayout<Float>.stride, options: [])!
+        let kBuffer = device.makeBuffer(bytes: k, length: k.count * MemoryLayout<Float>.stride, options: [])!
+        let vBuffer = device.makeBuffer(bytes: v, length: v.count * MemoryLayout<Float>.stride, options: [])!
+        let oBuffer = device.makeBuffer(length: totalElements * MemoryLayout<Float>.stride, options: [])!
+
+        let params = FlashAttentionParams(
+            batchSize: batchSize,
+            seqLenQ: seqLen,
+            numHeads: numHeads,
+            headDim: headDim,
+            isCausal: true
+        )
+
+        let commandBuffer = commandQueue.makeCommandBuffer()!
+        let encoder = commandBuffer.makeComputeCommandEncoder()!
+
+        kernel.encode(
+            into: encoder,
+            inputs: [qBuffer, kBuffer, vBuffer],
+            outputs: [oBuffer],
+            params: params,
+            pipeline: pipeline
+        )
+
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        let outputPtr = oBuffer.contents().bindMemory(to: Float.self, capacity: totalElements)
+        let output = Array(UnsafeBufferPointer(start: outputPtr, count: totalElements))
+
+        // Verify no NaN or Inf
+        for val in output {
+            #expect(!val.isNaN, "Output should not contain NaN")
+            #expect(!val.isInfinite, "Output should not contain Inf")
+        }
+    }
+
+    @Test("FlashAttention with multiple heads and batches")
+    func flashAttentionMultiHeadBatch() throws {
+        let registry = MetalKernelRegistry.shared
+        let kernel = registry.getKernel("flash_attention")!
+        let pipeline = try registry.getPipeline(for: kernel, device: device)
+
+        let batchSize = 2
+        let numHeads = 4
+        let seqLen = 64
+        let headDim = 32
+        let totalElements = batchSize * numHeads * seqLen * headDim
+
+        var q = [Float](repeating: 0, count: totalElements)
+        var k = [Float](repeating: 0, count: totalElements)
+        var v = [Float](repeating: 0, count: totalElements)
+
+        for i in 0..<totalElements {
+            q[i] = Float.random(in: -0.5...0.5)
+            k[i] = Float.random(in: -0.5...0.5)
+            v[i] = Float.random(in: -0.5...0.5)
+        }
+
+        let qBuffer = device.makeBuffer(bytes: q, length: q.count * MemoryLayout<Float>.stride, options: [])!
+        let kBuffer = device.makeBuffer(bytes: k, length: k.count * MemoryLayout<Float>.stride, options: [])!
+        let vBuffer = device.makeBuffer(bytes: v, length: v.count * MemoryLayout<Float>.stride, options: [])!
+        let oBuffer = device.makeBuffer(length: totalElements * MemoryLayout<Float>.stride, options: [])!
+
+        let params = FlashAttentionParams(
+            batchSize: batchSize,
+            seqLenQ: seqLen,
+            numHeads: numHeads,
+            headDim: headDim
+        )
+
+        let commandBuffer = commandQueue.makeCommandBuffer()!
+        let encoder = commandBuffer.makeComputeCommandEncoder()!
+
+        kernel.encode(
+            into: encoder,
+            inputs: [qBuffer, kBuffer, vBuffer],
+            outputs: [oBuffer],
+            params: params,
+            pipeline: pipeline
+        )
+
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        let outputPtr = oBuffer.contents().bindMemory(to: Float.self, capacity: totalElements)
+        let output = Array(UnsafeBufferPointer(start: outputPtr, count: totalElements))
+
+        // Verify all batches and heads produce valid output
+        for b in 0..<batchSize {
+            for h in 0..<numHeads {
+                let offset = (b * numHeads + h) * seqLen * headDim
+                var hasNonZero = false
+                for i in 0..<(seqLen * headDim) {
+                    let val = output[offset + i]
+                    #expect(!val.isNaN, "Batch \(b) head \(h) should not contain NaN")
+                    #expect(!val.isInfinite, "Batch \(b) head \(h) should not contain Inf")
+                    if abs(val) > 1e-10 {
+                        hasNonZero = true
+                    }
+                }
+                #expect(hasNonZero, "Batch \(b) head \(h) should have non-zero values")
+            }
+        }
+    }
+
+    @Test("FlashAttention estimated FLOPs")
+    func flashAttentionEstimatedFLOPs() {
+        let params = FlashAttentionParams(
+            batchSize: 1,
+            seqLenQ: 1024,
+            numHeads: 8,
+            headDim: 64
+        )
+
+        let stats = params.computeStatistics()
+        let flops = stats.estimatedFLOPs
+
+        // QK^T: batch * heads * seq_q * seq_kv * head_dim * 2
+        // = 1 * 8 * 1024 * 1024 * 64 * 2 = 1,073,741,824
+        let expectedQKFlops = 1 * 8 * 1024 * 1024 * 64 * 2
+
+        // Softmax: batch * heads * seq_q * seq_kv * 5
+        // = 1 * 8 * 1024 * 1024 * 5 = 41,943,040
+        let expectedSoftmaxFlops = 1 * 8 * 1024 * 1024 * 5
+
+        // AV: batch * heads * seq_q * head_dim * seq_kv * 2
+        // = 1 * 8 * 1024 * 64 * 1024 * 2 = 1,073,741,824
+        let expectedAVFlops = 1 * 8 * 1024 * 64 * 1024 * 2
+
+        let expectedTotal = expectedQKFlops + expectedSoftmaxFlops + expectedAVFlops
+        #expect(flops == expectedTotal)
     }
 
     // MARK: - Performance Tests

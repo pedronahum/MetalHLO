@@ -230,6 +230,18 @@ public final class Parser {
         // Special handling for custom_call which has @target(operands) format
         if kind == .customCall {
             (operands, attributes) = try parseCustomCallOperandsAndAttributes()
+        } else if kind == .reduce {
+            // Special handling for reduce: (%input init: %init) applies stablehlo.add across dimensions = [0]
+            (operands, attributes) = try parseReduceOperandsAndAttributes()
+        } else if kind == .compare {
+            // Special handling for compare: EQ, %arg0, %arg1, FLOAT : types
+            (operands, attributes) = try parseCompareOperandsAndAttributes()
+        } else if kind == .select {
+            // Special handling for select: %pred, %on_true, %on_false : pred_type, result_type
+            (operands, attributes) = try parseSelectOperandsAndAttributes()
+        } else if kind == .iota {
+            // Special handling for iota: dim = N : tensor<...>
+            (operands, attributes) = try parseIotaOperandsAndAttributes()
         } else {
             // Parse operands (% identifiers before attributes/type)
             while check(.percentIdentifier) {
@@ -244,7 +256,7 @@ public final class Parser {
 
         // Parse type signature
         try expect(.colon)
-        let resultType = try parseTypeSignature()
+        let resultType = try parseTypeSignature(for: kind)
 
         return (operands, attributes, resultType)
     }
@@ -295,6 +307,163 @@ public final class Parser {
         return (operands, attributes)
     }
 
+    /// Parse reduce operands and attributes
+    /// Supports two formats:
+    ///   1. (%input init: %init) applies stablehlo.add across dimensions = [0]
+    ///   2. %input, %init applies stablehlo.add across dimensions = [0]
+    private func parseReduceOperandsAndAttributes() throws -> ([String], HLOAttributes) {
+        var operands: [String] = []
+        var attributes = HLOAttributes()
+
+        // Check which format we're parsing
+        if check(.leftParen) {
+            // Format 1: (%input init: %init)
+            try expect(.leftParen)
+
+            // Parse input operand
+            let inputOperand = try parsePercentIdentifier()
+            operands.append(inputOperand)
+
+            // Parse "init:" and init operand
+            try expectIdentifier("init")
+            try expect(.colon)
+            let initOperand = try parsePercentIdentifier()
+            operands.append(initOperand)
+
+            try expect(.rightParen)
+        } else {
+            // Format 2: %input, %init
+            // Parse input operand
+            let inputOperand = try parsePercentIdentifier()
+            operands.append(inputOperand)
+
+            _ = match(.comma)
+
+            // Parse init operand
+            let initOperand = try parsePercentIdentifier()
+            operands.append(initOperand)
+        }
+
+        // Parse: applies stablehlo.add across dimensions = [0]
+        if checkIdentifier("applies") {
+            try expectIdentifier("applies")
+            let reductionOp = try parseOperationName()
+
+            if reductionOp.contains("add") {
+                attributes.reductionKind = .sum
+            } else if reductionOp.contains("max") {
+                attributes.reductionKind = .max
+            } else if reductionOp.contains("min") {
+                attributes.reductionKind = .min
+            }
+            // Note: multiply/prod reduction not currently supported
+
+            if checkIdentifier("across") {
+                try expectIdentifier("across")
+                try expectIdentifier("dimensions")
+                try expect(.equal)
+                attributes.dimensions = try parseDimensionList()
+            }
+        }
+
+        return (operands, attributes)
+    }
+
+    /// Parse compare operands and attributes
+    /// Supports two formats:
+    ///   1. Direction first: EQ, %arg0, %arg1, FLOAT : types (official StableHLO test format)
+    ///   2. Operands first: %arg0, %arg1, EQ, FLOAT : types (common MLIR format)
+    private func parseCompareOperandsAndAttributes() throws -> ([String], HLOAttributes) {
+        var operands: [String] = []
+        var attributes = HLOAttributes()
+
+        let directions = ["EQ", "NE", "LT", "LE", "GT", "GE"]
+
+        // Check if direction comes first (official StableHLO format)
+        var directionFirst = false
+        for dir in directions {
+            if checkIdentifier(dir) {
+                directionFirst = true
+                attributes.comparisonDirection = ComparisonDirection(rawValue: dir)
+                advance()
+                _ = match(.comma)
+                break
+            }
+        }
+
+        // Parse operands
+        while check(.percentIdentifier) {
+            let operand = try parsePercentIdentifier()
+            operands.append(operand)
+            _ = match(.comma)
+        }
+
+        // If direction wasn't first, parse it after operands
+        if !directionFirst {
+            var foundDirection = false
+            for dir in directions {
+                if checkIdentifier(dir) {
+                    attributes.comparisonDirection = ComparisonDirection(rawValue: dir)
+                    advance()
+                    _ = match(.comma)
+                    foundDirection = true
+                    break
+                }
+            }
+
+            if !foundDirection {
+                throw ParseError.unexpectedToken(expected: "comparison direction (EQ, NE, LT, LE, GT, GE)", got: currentToken)
+            }
+        }
+
+        // Skip optional comparison type (FLOAT, SIGNED, UNSIGNED, TOTALORDER)
+        let compTypes = ["FLOAT", "SIGNED", "UNSIGNED", "TOTALORDER"]
+        for compType in compTypes {
+            if checkIdentifier(compType) {
+                advance()
+                break
+            }
+        }
+
+        return (operands, attributes)
+    }
+
+    /// Parse select operands in the format: %pred, %on_true, %on_false
+    private func parseSelectOperandsAndAttributes() throws -> ([String], HLOAttributes) {
+        var operands: [String] = []
+        let attributes = HLOAttributes()
+
+        // Parse the three operands: predicate, true value, false value
+        while check(.percentIdentifier) {
+            let operand = try parsePercentIdentifier()
+            operands.append(operand)
+            _ = match(.comma)
+        }
+
+        return (operands, attributes)
+    }
+
+    /// Parse iota operands and attributes in the format: dim = N
+    /// iota has no operands, just a dimension attribute
+    private func parseIotaOperandsAndAttributes() throws -> ([String], HLOAttributes) {
+        let operands: [String] = []
+        var attributes = HLOAttributes()
+
+        // Parse: dim = N
+        if checkIdentifier("dim") {
+            try expectIdentifier("dim")
+            try expect(.equal)
+            if case .integer(let dimValue) = currentToken.kind {
+                attributes.iotaDimension = Int(dimValue)
+                advance()
+            } else {
+                throw ParseError.unexpectedToken(expected: "integer dimension", got: currentToken)
+            }
+        }
+
+        return (operands, attributes)
+    }
+
     private func parseAttributes(for kind: HLOOpKind) throws -> HLOAttributes {
         var attributes = HLOAttributes()
 
@@ -331,7 +500,7 @@ public final class Parser {
             attributes.gatherDimensionNumbers = try parseGatherDimensionNumbers()
 
         case .scatter:
-            attributes.scatterDimensionNumbers = try parseScatterDimensionNumbers()
+            (attributes.scatterDimensionNumbers, attributes.scatterComputationKind) = try parseScatterAttributes()
 
         case .compare:
             attributes.comparisonDirection = try parseComparisonDirection()
@@ -501,26 +670,70 @@ public final class Parser {
             advance()
         }
 
-        // Parse the dimension format: [b, 0, 1, f]x[0, 1, i, o]->[b, 0, 1, f]
-        // For now, use default NHWC layout
-        let inputBatch = 0
-        let inputFeature = 3
-        let inputSpatial = [1, 2]
-        let kernelInput = 2
-        let kernelOutput = 3
-        let kernelSpatial = [0, 1]
-        let outputBatch = 0
-        let outputFeature = 3
-        let outputSpatial = [1, 2]
-
-        // Skip the format string until we hit > or :
+        // Collect the format string: [b, 0, 1, f]x[0, 1, i, o]->[b, 0, 1, f]
+        var formatString = ""
         while !check(.rightAngle) && !check(.colon) && !check(.eof) {
+            formatString += currentToken.text
             advance()
         }
 
         if check(.rightAngle) {
             advance()
         }
+
+        // Parse the dimension format
+        // Format: input_layout x kernel_layout -> output_layout
+        // Example: [b, 0, 1, f]x[0, 1, i, o]->[b, 0, 1, f]
+        return parseDimensionFormat(formatString)
+    }
+
+    /// Parse dimension format string like [b, 0, 1, f]x[0, 1, i, o]->[b, 0, 1, f]
+    private func parseDimensionFormat(_ format: String) -> ConvolutionDimensionNumbers {
+        // Default NHWC layout
+        var inputBatch = 0
+        var inputFeature = 3
+        var inputSpatial = [1, 2]
+        var kernelInput = 2
+        var kernelOutput = 3
+        var kernelSpatial = [0, 1]
+        var outputBatch = 0
+        var outputFeature = 3
+        var outputSpatial = [1, 2]
+
+        // Clean up the format string
+        let cleaned = format.replacingOccurrences(of: " ", with: "")
+                           .replacingOccurrences(of: ",", with: "")
+
+        // Split into parts: input x kernel -> output
+        // Try to find the 'x' separator between input and kernel
+        let xParts = cleaned.components(separatedBy: "x")
+        guard xParts.count >= 2 else {
+            // Malformed, return defaults
+            return ConvolutionDimensionNumbers(
+                inputBatchDimension: inputBatch,
+                inputFeatureDimension: inputFeature,
+                inputSpatialDimensions: inputSpatial,
+                kernelInputFeatureDimension: kernelInput,
+                kernelOutputFeatureDimension: kernelOutput,
+                kernelSpatialDimensions: kernelSpatial,
+                outputBatchDimension: outputBatch,
+                outputFeatureDimension: outputFeature,
+                outputSpatialDimensions: outputSpatial
+            )
+        }
+
+        let inputPart = xParts[0]
+        let restPart = xParts[1]
+
+        // Split kernel and output by ->
+        let arrowParts = restPart.components(separatedBy: "->")
+        let kernelPart = arrowParts[0]
+        let outputPart = arrowParts.count > 1 ? arrowParts[1] : inputPart
+
+        // Parse each layout part
+        (inputBatch, inputFeature, inputSpatial) = parseLayoutPart(inputPart, isKernel: false)
+        (kernelInput, kernelOutput, kernelSpatial) = parseKernelLayoutPart(kernelPart)
+        (outputBatch, outputFeature, outputSpatial) = parseLayoutPart(outputPart, isKernel: false)
 
         return ConvolutionDimensionNumbers(
             inputBatchDimension: inputBatch,
@@ -533,6 +746,74 @@ public final class Parser {
             outputFeatureDimension: outputFeature,
             outputSpatialDimensions: outputSpatial
         )
+    }
+
+    /// Parse a layout part like [b, 0, 1, f] for input/output tensors
+    /// Returns (batchDim, featureDim, spatialDims)
+    private func parseLayoutPart(_ part: String, isKernel: Bool) -> (Int, Int, [Int]) {
+        // Remove brackets
+        let cleaned = part.replacingOccurrences(of: "[", with: "")
+                         .replacingOccurrences(of: "]", with: "")
+
+        var batchDim = 0
+        var featureDim = 3
+        var spatialDims: [Int] = []
+
+        // Parse each character/token
+        var position = 0
+        for char in cleaned {
+            switch char {
+            case "b", "B":
+                batchDim = position
+            case "f", "F":
+                featureDim = position
+            case "0"..."9":
+                // Spatial dimension numbered 0, 1, 2, etc.
+                spatialDims.append(position)
+            default:
+                continue
+            }
+            position += 1
+        }
+
+        // Ensure spatialDims is sorted
+        spatialDims.sort()
+
+        return (batchDim, featureDim, spatialDims)
+    }
+
+    /// Parse a kernel layout part like [0, 1, i, o]
+    /// Returns (inputFeatureDim, outputFeatureDim, spatialDims)
+    private func parseKernelLayoutPart(_ part: String) -> (Int, Int, [Int]) {
+        // Remove brackets
+        let cleaned = part.replacingOccurrences(of: "[", with: "")
+                         .replacingOccurrences(of: "]", with: "")
+
+        var inputDim = 2
+        var outputDim = 3
+        var spatialDims: [Int] = []
+
+        // Parse each character/token
+        var position = 0
+        for char in cleaned {
+            switch char {
+            case "i", "I":
+                inputDim = position
+            case "o", "O":
+                outputDim = position
+            case "0"..."9":
+                // Spatial dimension
+                spatialDims.append(position)
+            default:
+                continue
+            }
+            position += 1
+        }
+
+        // Ensure spatialDims is sorted by their numeric label, not position
+        spatialDims.sort()
+
+        return (inputDim, outputDim, spatialDims)
     }
 
     private func parseArrayAttribute() throws -> [Int] {
@@ -1146,7 +1427,7 @@ public final class Parser {
         return elementType
     }
 
-    private func parseTypeSignature() throws -> TensorType {
+    private func parseTypeSignature(for kind: HLOOpKind = .add) throws -> TensorType {
         // Handle both simple types: tensor<2x3xf32>
         // and function-like types: (tensor<2x3xf32>, tensor<2x3xf32>) -> tensor<2x3xf32>
 
@@ -1160,6 +1441,15 @@ public final class Parser {
                 advance()
             }
             try expect(.arrow)
+            return try parseTensorType()
+        }
+
+        // For select: pred_type, result_type - skip predicate type and get result type
+        if kind == .select {
+            // Skip the predicate type (e.g., tensor<2x3xi1>)
+            _ = try parseTensorType()
+            _ = match(.comma)
+            // Parse the result type
             return try parseTensorType()
         }
 
@@ -1282,40 +1572,64 @@ public final class Parser {
     }
 
     private func parseDotDimensionNumbers() throws -> DotDimensionNumbers? {
-        guard check(.hashIdentifier) && currentToken.text == "#stablehlo.dot" else {
-            return nil
-        }
-        advance()
-
-        try expect(.leftAngle)
-
         var lhsBatching: [Int] = []
         var rhsBatching: [Int] = []
         var lhsContracting: [Int] = []
         var rhsContracting: [Int] = []
 
-        while !check(.rightAngle) {
-            if checkIdentifier("lhs_batching_dimensions") {
-                try expectIdentifier("lhs_batching_dimensions")
+        // Handle verbose format: #stablehlo.dot<lhs_batching_dimensions = [], ...>
+        if check(.hashIdentifier) && currentToken.text == "#stablehlo.dot" {
+            advance()
+            try expect(.leftAngle)
+
+            while !check(.rightAngle) {
+                if checkIdentifier("lhs_batching_dimensions") {
+                    try expectIdentifier("lhs_batching_dimensions")
+                    try expect(.equal)
+                    lhsBatching = try parseDimensionList()
+                } else if checkIdentifier("rhs_batching_dimensions") {
+                    try expectIdentifier("rhs_batching_dimensions")
+                    try expect(.equal)
+                    rhsBatching = try parseDimensionList()
+                } else if checkIdentifier("lhs_contracting_dimensions") {
+                    try expectIdentifier("lhs_contracting_dimensions")
+                    try expect(.equal)
+                    lhsContracting = try parseDimensionList()
+                } else if checkIdentifier("rhs_contracting_dimensions") {
+                    try expectIdentifier("rhs_contracting_dimensions")
+                    try expect(.equal)
+                    rhsContracting = try parseDimensionList()
+                }
+                _ = match(.comma)
+            }
+
+            try expect(.rightAngle)
+        }
+        // Handle simple format: contracting_dims = [1] x [0]
+        // and optionally: batching_dims = [0] x [0]
+        else if checkIdentifier("contracting_dims") || checkIdentifier("batching_dims") {
+            // Parse optional batching_dims = [lhs] x [rhs]
+            if checkIdentifier("batching_dims") {
+                try expectIdentifier("batching_dims")
                 try expect(.equal)
                 lhsBatching = try parseDimensionList()
-            } else if checkIdentifier("rhs_batching_dimensions") {
-                try expectIdentifier("rhs_batching_dimensions")
-                try expect(.equal)
+                try expectIdentifier("x")
                 rhsBatching = try parseDimensionList()
-            } else if checkIdentifier("lhs_contracting_dimensions") {
-                try expectIdentifier("lhs_contracting_dimensions")
+                _ = match(.comma)
+            }
+
+            // Parse contracting_dims = [lhs] x [rhs]
+            if checkIdentifier("contracting_dims") {
+                try expectIdentifier("contracting_dims")
                 try expect(.equal)
                 lhsContracting = try parseDimensionList()
-            } else if checkIdentifier("rhs_contracting_dimensions") {
-                try expectIdentifier("rhs_contracting_dimensions")
-                try expect(.equal)
+                try expectIdentifier("x")
                 rhsContracting = try parseDimensionList()
             }
-            _ = match(.comma)
+        } else {
+            // No dimension numbers provided
+            return nil
         }
-
-        try expect(.rightAngle)
 
         return DotDimensionNumbers(
             lhsBatchingDimensions: lhsBatching,
@@ -1328,13 +1642,16 @@ public final class Parser {
     private func parseGatherDimensionNumbers() throws -> GatherDimensionNumbers? {
         // Parse gather dimension numbers in inline format:
         // offset_dims = [...], collapsed_slice_dims = [...], start_index_map = [...],
-        // index_vector_dim = N, slice_sizes = [...]
+        // index_vector_dim = N, slice_sizes = [...],
+        // operand_batching_dims = [...], start_indices_batching_dims = [...]
 
         var offsetDims: [Int] = []
         var collapsedSliceDims: [Int] = []
         var startIndexMap: [Int] = []
         var indexVectorDim: Int = 0
         var sliceSizes: [Int] = []
+        var operandBatchingDims: [Int] = []
+        var startIndicesBatchingDims: [Int] = []
 
         while !check(.colon) && !check(.eof) {
             if checkIdentifier("offset_dims") {
@@ -1357,6 +1674,14 @@ public final class Parser {
                 try expectIdentifier("slice_sizes")
                 try expect(.equal)
                 sliceSizes = try parseDimensionList()
+            } else if checkIdentifier("operand_batching_dims") {
+                try expectIdentifier("operand_batching_dims")
+                try expect(.equal)
+                operandBatchingDims = try parseDimensionList()
+            } else if checkIdentifier("start_indices_batching_dims") {
+                try expectIdentifier("start_indices_batching_dims")
+                try expect(.equal)
+                startIndicesBatchingDims = try parseDimensionList()
             } else {
                 // Skip unknown tokens
                 break
@@ -1374,19 +1699,26 @@ public final class Parser {
             collapsedSliceDims: collapsedSliceDims,
             startIndexMap: startIndexMap,
             indexVectorDim: indexVectorDim,
-            sliceSizes: sliceSizes
+            sliceSizes: sliceSizes,
+            operandBatchingDims: operandBatchingDims,
+            startIndicesBatchingDims: startIndicesBatchingDims
         )
     }
 
-    private func parseScatterDimensionNumbers() throws -> ScatterDimensionNumbers? {
-        // Parse scatter dimension numbers in inline format:
+    private func parseScatterAttributes() throws -> (ScatterDimensionNumbers?, ScatterComputationKind?) {
+        // Parse scatter attributes in inline format:
         // update_window_dims = [...], inserted_window_dims = [...],
-        // scatter_dims_to_operand_dims = [...], index_vector_dim = N
+        // scatter_dims_to_operand_dims = [...], index_vector_dim = N,
+        // input_batching_dims = [...], scatter_indices_batching_dims = [...],
+        // computation = add/max/min/mul
 
         var updateWindowDims: [Int] = []
         var insertedWindowDims: [Int] = []
         var scatterDimsToOperandDims: [Int] = []
         var indexVectorDim: Int = 0
+        var inputBatchingDims: [Int] = []
+        var scatterIndicesBatchingDims: [Int] = []
+        var computationKind: ScatterComputationKind? = nil
 
         while !check(.colon) && !check(.eof) {
             if checkIdentifier("update_window_dims") {
@@ -1405,6 +1737,34 @@ public final class Parser {
                 try expectIdentifier("index_vector_dim")
                 try expect(.equal)
                 indexVectorDim = try parseInteger()
+            } else if checkIdentifier("input_batching_dims") {
+                try expectIdentifier("input_batching_dims")
+                try expect(.equal)
+                inputBatchingDims = try parseDimensionList()
+            } else if checkIdentifier("scatter_indices_batching_dims") {
+                try expectIdentifier("scatter_indices_batching_dims")
+                try expect(.equal)
+                scatterIndicesBatchingDims = try parseDimensionList()
+            } else if checkIdentifier("computation") {
+                try expectIdentifier("computation")
+                try expect(.equal)
+                // Parse computation kind: add, max, min, mul
+                if checkIdentifier("add") {
+                    try expectIdentifier("add")
+                    computationKind = .add
+                } else if checkIdentifier("max") {
+                    try expectIdentifier("max")
+                    computationKind = .max
+                } else if checkIdentifier("min") {
+                    try expectIdentifier("min")
+                    computationKind = .min
+                } else if checkIdentifier("mul") {
+                    try expectIdentifier("mul")
+                    computationKind = .mul
+                } else if checkIdentifier("set") {
+                    try expectIdentifier("set")
+                    computationKind = .set
+                }
             } else {
                 // Skip unknown tokens
                 break
@@ -1413,12 +1773,15 @@ public final class Parser {
         }
 
         // Return even if some fields are empty (they have defaults)
-        return ScatterDimensionNumbers(
+        let dimNumbers = ScatterDimensionNumbers(
             updateWindowDims: updateWindowDims,
             insertedWindowDims: insertedWindowDims,
             scatterDimsToOperandDims: scatterDimsToOperandDims,
-            indexVectorDim: indexVectorDim
+            indexVectorDim: indexVectorDim,
+            inputBatchingDims: inputBatchingDims,
+            scatterIndicesBatchingDims: scatterIndicesBatchingDims
         )
+        return (dimNumbers, computationKind)
     }
 
     private func parseComparisonDirection() throws -> ComparisonDirection? {

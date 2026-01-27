@@ -132,11 +132,12 @@ public final class HLOPatternRegistry: @unchecked Sendable {
     }
 
     private func registerDefaultPatterns() {
-        // Register built-in patterns in priority order
-        register(SoftmaxPattern())
-        register(GELUPattern())
-        register(LayerNormPattern())
-        register(RMSNormPattern())
+        // Register built-in patterns in priority order (higher priority first)
+        register(AttentionPattern())  // Priority 110 - check before softmax
+        register(SoftmaxPattern())    // Priority 100
+        register(GELUPattern())       // Priority 90
+        register(LayerNormPattern())  // Priority 95
+        register(RMSNormPattern())    // Priority 94
     }
 
     /// Registers a pattern.

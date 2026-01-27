@@ -216,6 +216,82 @@ int main(int argc, char* argv[]) {
     mhlo_buffer_destroy(linear_outputs[0]);
     mhlo_executable_destroy(linear_exe);
 
+    // ========================================================================
+    // Example 4: Compilation configuration and execution statistics
+    // ========================================================================
+    printf("Example 4: Compilation Config & Statistics\n");
+    printf("------------------------------------------\n");
+
+    // Initialize compilation configuration
+    MHLOCompileConfig config;
+    mhlo_compile_config_init(&config);
+    printf("  Default config:\n");
+    printf("    Optimization level: O%d\n", config.optimization_level);
+    printf("    Caching enabled: %s\n", config.enable_caching ? "true" : "false");
+    printf("    Debug info: %s\n\n", config.enable_debug_info ? "true" : "false");
+
+    // Compile with custom configuration (optimization level O3)
+    config.optimization_level = MHLO_OPT_O3;
+
+    const char* stats_mlir =
+        "module @stats_example {\n"
+        "  func.func @main(%a: tensor<8xf32>, %b: tensor<8xf32>) -> (tensor<8xf32>) {\n"
+        "    %0 = stablehlo.multiply %a, %b : tensor<8xf32>\n"
+        "    return %0 : tensor<8xf32>\n"
+        "  }\n"
+        "}\n";
+
+    MHLOExecutableRef stats_exe = NULL;
+    status = mhlo_compile_with_config(client, stats_mlir, &config, &stats_exe);
+    CHECK_STATUS(status, "Failed to compile with config");
+    printf("  Compiled with O3 optimization\n");
+
+    // Create input buffers for statistics test
+    float stat_a[] = {1, 2, 3, 4, 5, 6, 7, 8};
+    float stat_b[] = {2, 2, 2, 2, 2, 2, 2, 2};
+    int64_t stat_shape[] = {8};
+
+    MHLOBufferRef stat_buf_a = NULL, stat_buf_b = NULL;
+    status = mhlo_buffer_create(client, stat_a, sizeof(stat_a), stat_shape, 1, MHLO_F32, &stat_buf_a);
+    CHECK_STATUS(status, "Failed to create stats buffer A");
+    status = mhlo_buffer_create(client, stat_b, sizeof(stat_b), stat_shape, 1, MHLO_F32, &stat_buf_b);
+    CHECK_STATUS(status, "Failed to create stats buffer B");
+
+    // Execute multiple times to gather statistics
+    printf("\n  Running 5 executions to gather statistics...\n");
+    for (int i = 0; i < 5; i++) {
+        MHLOBufferRef stat_inputs[] = {stat_buf_a, stat_buf_b};
+        MHLOBufferRef stat_outputs[1] = {NULL};
+        int32_t stat_num_outputs = 0;
+
+        status = mhlo_execute(stats_exe, stat_inputs, 2, stat_outputs, &stat_num_outputs);
+        CHECK_STATUS(status, "Failed to execute for statistics");
+
+        mhlo_buffer_destroy(stat_outputs[0]);
+    }
+
+    // Get execution statistics
+    MHLOExecutionStats stats;
+    status = mhlo_executable_get_stats(stats_exe, &stats);
+    CHECK_STATUS(status, "Failed to get execution stats");
+
+    printf("\n  Execution Statistics:\n");
+    printf("    Execution count: %lld\n", stats.execution_count);
+    printf("    Total time: %.3f ms\n", stats.total_execution_time_ms);
+    printf("    Last execution: %.3f ms\n", stats.last_execution_time_ms);
+    printf("    Average time: %.3f ms\n\n", stats.average_execution_time_ms);
+
+    // Reset statistics and verify
+    mhlo_executable_reset_stats(stats_exe);
+    status = mhlo_executable_get_stats(stats_exe, &stats);
+    CHECK_STATUS(status, "Failed to get reset stats");
+    printf("  After reset: execution count = %lld\n\n", stats.execution_count);
+
+    // Cleanup example 4
+    mhlo_buffer_destroy(stat_buf_a);
+    mhlo_buffer_destroy(stat_buf_b);
+    mhlo_executable_destroy(stats_exe);
+
     // Cleanup
     mhlo_client_destroy(client);
 

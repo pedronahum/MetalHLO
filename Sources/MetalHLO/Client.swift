@@ -62,6 +62,8 @@ public final class Client: @unchecked Sendable {
 
     /// Compiles StableHLO MLIR text to an executable.
     ///
+    /// This uses the default compilation path with standard optimization (O2).
+    ///
     /// - Parameter mlir: The StableHLO MLIR module text.
     /// - Throws: `MetalHLOError.parseFailed` or `MetalHLOError.compilationFailed`.
     /// - Returns: A compiled `Executable` ready for execution.
@@ -84,6 +86,77 @@ public final class Client: @unchecked Sendable {
         let compiled = try executor.compile(module: module)
 
         return Executable(compiled: compiled, executor: executor)
+    }
+
+    /// Compiles StableHLO MLIR text with explicit compilation configuration.
+    ///
+    /// This method uses the full MetalHLO compiler pipeline with the specified
+    /// optimization level. Higher optimization levels enable more aggressive
+    /// transformations like operator fusion and algebraic simplification.
+    ///
+    /// ## Example
+    /// ```swift
+    /// // Aggressive optimization for production
+    /// let config = CompilationConfig(optimizationLevel: .O3)
+    /// let exe = try client.compile(mlir, config: config)
+    ///
+    /// // Debug mode with no optimization
+    /// let debugExe = try client.compile(mlir, config: .debug)
+    /// ```
+    ///
+    /// - Parameters:
+    ///   - mlir: The StableHLO MLIR module text.
+    ///   - config: Compilation configuration specifying optimization level and options.
+    /// - Throws: `MetalHLOError.parseFailed` or `MetalHLOError.compilationFailed`.
+    /// - Returns: A compiled `Executable` ready for execution.
+    public func compile(_ mlir: String, config: CompilationConfig) throws -> Executable {
+        // Convert public config to internal compiler config
+        let passManagerConfig = PassManager.Config(
+            enabledPasses: config.enabledPasses,
+            disabledPasses: config.disabledPasses
+        )
+
+        let compilerConfig = MetalHLOCompiler.Config(
+            optimizationLevel: config.optimizationLevel.toCompilerLevel(),
+            enableCaching: config.enableCaching,
+            generateDebugInfo: config.generateDebugInfo,
+            passManagerConfig: passManagerConfig
+        )
+
+        // Create compiler with the configuration
+        let compiler = MetalHLOCompiler(device: device, config: compilerConfig)
+
+        // Compile through the full optimization pipeline
+        let compiled: CompiledExecutable
+        do {
+            compiled = try compiler.compile(mlir)
+        } catch let error as MetalCompilationError {
+            throw Self.convertCompilationError(error)
+        }
+
+        // Create integrated executor for the compiled executable
+        let integratedExecutor = IntegratedExecutor(device: device, executable: compiled)
+
+        return Executable(compiled: compiled, executor: integratedExecutor)
+    }
+
+    // MARK: - Error Conversion
+
+    private static func convertCompilationError(_ error: MetalCompilationError) -> MetalHLOError {
+        switch error {
+        case .parseError(let message):
+            return .parseFailed(line: 1, column: 1, message: message)
+        case .metalCompilationFailed(let kernel, let errorMsg):
+            return .compilationFailed("Metal compilation failed for kernel '\(kernel)': \(errorMsg)")
+        case .kernelNotFound(let name):
+            return .compilationFailed("Kernel not found: \(name)")
+        case .pipelineCreationFailed(let kernel, let errorMsg):
+            return .compilationFailed("Pipeline creation failed for kernel '\(kernel)': \(errorMsg)")
+        case .timeout:
+            return .compilationFailed("Compilation timeout")
+        case .invalidInput(let reason):
+            return .compilationFailed("Invalid input: \(reason)")
+        }
     }
 
     // MARK: - Buffer Creation

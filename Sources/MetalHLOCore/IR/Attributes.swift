@@ -17,6 +17,9 @@ public struct HLOAttributes: Sendable {
     /// Single axis (for softmax, concatenate, etc.).
     public var axis: Int?
 
+    /// Iota dimension - which dimension to fill with sequential indices.
+    public var iotaDimension: Int?
+
     // MARK: - Dot Product Attributes
 
     /// Dot product dimension numbers for dot_general.
@@ -29,6 +32,10 @@ public struct HLOAttributes: Sendable {
 
     /// Scatter dimension numbers.
     public var scatterDimensionNumbers: ScatterDimensionNumbers?
+
+    /// Scatter computation kind (how to combine existing and update values).
+    /// Defaults to .set if not specified (simple replacement).
+    public var scatterComputationKind: ScatterComputationKind?
 
     // MARK: - Comparison Attributes
 
@@ -224,60 +231,84 @@ public struct DotDimensionNumbers: Sendable, Equatable {
 
 /// Dimension numbers for gather operation.
 public struct GatherDimensionNumbers: Sendable, Equatable {
-    /// Offset dimensions.
+    /// Offset dimensions in the output.
     public let offsetDims: [Int]
 
     /// Collapsed slice dimensions.
     public let collapsedSliceDims: [Int]
 
-    /// Start index map.
+    /// Start index map - maps index vector elements to operand dimensions.
     public let startIndexMap: [Int]
 
-    /// Index vector dimension.
+    /// Index vector dimension in start_indices.
     public let indexVectorDim: Int
 
-    /// Slice sizes.
+    /// Slice sizes for each dimension of the operand.
     public let sliceSizes: [Int]
+
+    /// Operand batching dimensions - dimensions of operand that are batching dimensions.
+    /// These correspond to startIndicesBatchingDims in the indices tensor.
+    public let operandBatchingDims: [Int]
+
+    /// Start indices batching dimensions - dimensions of start_indices that are batching dimensions.
+    /// These correspond to operandBatchingDims in the operand tensor.
+    public let startIndicesBatchingDims: [Int]
 
     public init(
         offsetDims: [Int],
         collapsedSliceDims: [Int],
         startIndexMap: [Int],
         indexVectorDim: Int,
-        sliceSizes: [Int]
+        sliceSizes: [Int],
+        operandBatchingDims: [Int] = [],
+        startIndicesBatchingDims: [Int] = []
     ) {
         self.offsetDims = offsetDims
         self.collapsedSliceDims = collapsedSliceDims
         self.startIndexMap = startIndexMap
         self.indexVectorDim = indexVectorDim
         self.sliceSizes = sliceSizes
+        self.operandBatchingDims = operandBatchingDims
+        self.startIndicesBatchingDims = startIndicesBatchingDims
     }
 }
 
 /// Dimension numbers for scatter operation.
 public struct ScatterDimensionNumbers: Sendable, Equatable {
-    /// Update window dimensions.
+    /// Update window dimensions in the updates tensor.
     public let updateWindowDims: [Int]
 
-    /// Inserted window dimensions.
+    /// Inserted window dimensions - dimensions that are inserted (size 1) during scatter.
     public let insertedWindowDims: [Int]
 
     /// Scatter dimensions to operand dimensions mapping.
     public let scatterDimsToOperandDims: [Int]
 
-    /// Index vector dimension.
+    /// Index vector dimension in scatter_indices.
     public let indexVectorDim: Int
+
+    /// Input (operand) batching dimensions - dimensions of inputs that are batching dimensions.
+    /// These correspond to scatterIndicesBatchingDims in the indices tensor.
+    public let inputBatchingDims: [Int]
+
+    /// Scatter indices batching dimensions - dimensions of scatter_indices that are batching dimensions.
+    /// These correspond to inputBatchingDims in the operand tensor.
+    public let scatterIndicesBatchingDims: [Int]
 
     public init(
         updateWindowDims: [Int],
         insertedWindowDims: [Int],
         scatterDimsToOperandDims: [Int],
-        indexVectorDim: Int
+        indexVectorDim: Int,
+        inputBatchingDims: [Int] = [],
+        scatterIndicesBatchingDims: [Int] = []
     ) {
         self.updateWindowDims = updateWindowDims
         self.insertedWindowDims = insertedWindowDims
         self.scatterDimsToOperandDims = scatterDimsToOperandDims
         self.indexVectorDim = indexVectorDim
+        self.inputBatchingDims = inputBatchingDims
+        self.scatterIndicesBatchingDims = scatterIndicesBatchingDims
     }
 }
 
@@ -364,6 +395,21 @@ public enum ReductionKind: Sendable {
     case max
     case min
     case mean
+}
+
+/// Scatter computation kind for combining values.
+/// Maps to MPS scatter modes.
+public enum ScatterComputationKind: Sendable {
+    /// Replace the existing value with the update (MPS .set mode).
+    case set
+    /// Add the update to the existing value (MPS .add mode).
+    case add
+    /// Take the maximum of existing and update (MPS .max mode).
+    case max
+    /// Take the minimum of existing and update (MPS .min mode).
+    case min
+    /// Multiply the existing value by the update (MPS .mul mode).
+    case mul
 }
 
 /// RNG distribution type.

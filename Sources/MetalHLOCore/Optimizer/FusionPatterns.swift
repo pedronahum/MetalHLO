@@ -385,6 +385,322 @@ public struct LayerNormPattern: HLOPattern {
     }
 }
 
+// MARK: - Attention Pattern
+
+/// Detects scaled dot-product attention pattern:
+/// softmax(Q @ K^T * scale + mask) @ V
+///
+/// The pattern looks for:
+/// 1. dot_general (Weights @ V) - the final output
+/// 2. softmax feeding into the weights
+/// 3. optional scale multiply and mask add
+/// 4. dot_general (Q @ K^T) - scores computation
+public struct AttentionPattern: HLOPattern {
+    public let name = "attention"
+    public let priority = 110  // Higher than softmax (100) to check first
+
+    public init() {}
+
+    public func match(
+        at op: HLOOperation,
+        index: Int,
+        in function: HLOFunction,
+        definingOps: [String: (op: HLOOperation, index: Int)]
+    ) -> PatternMatch? {
+        // Attention ends with dotGeneral (Weights @ V)
+        guard op.kind == .dotGeneral else { return nil }
+
+        // The LHS of final dot should come from softmax (divide op in our decomposed form)
+        // or directly if softmax is already fused
+        let weightsSource = op.operands[0]
+        let vSource = op.operands[1]
+
+        // Try to find softmax pattern feeding into weights
+        // Softmax ends with divide: exp(x - max) / sum(exp(x - max))
+        guard let softmaxEndOp = definingOps[weightsSource]?.op else { return nil }
+
+        // Check if this is a divide (end of softmax) or already a fused softmax
+        var softmaxInputSource: String?
+        var softmaxOps: [HLOOperation] = []
+        var softmaxIndices: [Int] = []
+
+        if softmaxEndOp.kind == .divide {
+            // Walk back through softmax pattern: divide <- exp, sum <- exp <- subtract <- max, input
+            guard let expOp = definingOps[softmaxEndOp.operands[0]]?.op,
+                  expOp.kind == .exponential else { return nil }
+
+            guard let sumOp = definingOps[softmaxEndOp.operands[1]]?.op,
+                  sumOp.kind == .reduce else { return nil }
+
+            // Sum's input should be same exp
+            guard sumOp.operands.first == expOp.result else { return nil }
+
+            // Exp's input should be subtract (x - max)
+            guard let subOp = definingOps[expOp.operands[0]]?.op,
+                  subOp.kind == .subtract else { return nil }
+
+            // Find the max operation (possibly via broadcast)
+            let maxSource = subOp.operands[1]
+            var maxOp: HLOOperation?
+            var broadcastOp: HLOOperation?
+
+            if let directMax = definingOps[maxSource]?.op {
+                if directMax.kind == .reduce {
+                    maxOp = directMax
+                } else if directMax.kind == .broadcastInDim {
+                    broadcastOp = directMax
+                    if let innerMax = definingOps[directMax.operands[0]]?.op,
+                       innerMax.kind == .reduce {
+                        maxOp = innerMax
+                    }
+                }
+            }
+
+            guard maxOp != nil else { return nil }
+
+            // Collect softmax operations
+            if let m = maxOp, let idx = definingOps[m.result]?.index {
+                softmaxOps.append(m)
+                softmaxIndices.append(idx)
+            }
+            if let b = broadcastOp, let idx = definingOps[b.result]?.index {
+                softmaxOps.append(b)
+                softmaxIndices.append(idx)
+            }
+            if let idx = definingOps[subOp.result]?.index {
+                softmaxOps.append(subOp)
+                softmaxIndices.append(idx)
+            }
+            if let idx = definingOps[expOp.result]?.index {
+                softmaxOps.append(expOp)
+                softmaxIndices.append(idx)
+            }
+            if let idx = definingOps[sumOp.result]?.index {
+                softmaxOps.append(sumOp)
+                softmaxIndices.append(idx)
+            }
+            if let idx = definingOps[softmaxEndOp.result]?.index {
+                softmaxOps.append(softmaxEndOp)
+                softmaxIndices.append(idx)
+            }
+
+            // The input to softmax is the first operand of subtract
+            softmaxInputSource = subOp.operands[0]
+        } else {
+            // Not a recognized softmax pattern
+            return nil
+        }
+
+        guard let scoresSource = softmaxInputSource else { return nil }
+
+        // Now look for scale multiply and optional mask add before softmax
+        var scaleValue: Float = 1.0
+        var hasMask = false
+        var maskOperand: String?
+        var preOps: [HLOOperation] = []
+        var preIndices: [Int] = []
+        var qkDotSource: String = scoresSource
+
+        // Check if scores come from add (mask) or multiply (scale) or directly from dot
+        if let scoresOp = definingOps[scoresSource]?.op {
+            if scoresOp.kind == .add {
+                // This might be mask addition: scores + mask
+                // One operand should lead to Q@K*scale, other is mask
+                let op0 = scoresOp.operands[0]
+                let op1 = scoresOp.operands[1]
+
+                // Try to find which one is the scale/dot chain
+                var foundChain = false
+                for (chainOp, otherOp) in [(op0, op1), (op1, op0)] {
+                    if let chainDef = definingOps[chainOp]?.op {
+                        if chainDef.kind == .multiply {
+                            // This is the scale multiply
+                            if let scaleConst = extractScaleConstant(chainDef, definingOps: definingOps) {
+                                scaleValue = scaleConst
+                            }
+                            // The input to multiply should be Q@K
+                            qkDotSource = findDotInput(chainDef, definingOps: definingOps)
+                            if let idx = definingOps[chainDef.result]?.index {
+                                preOps.append(chainDef)
+                                preIndices.append(idx)
+                            }
+                            hasMask = true
+                            maskOperand = otherOp
+                            foundChain = true
+                            break
+                        } else if chainDef.kind == .dotGeneral {
+                            // Direct Q@K without scale
+                            qkDotSource = chainOp
+                            hasMask = true
+                            maskOperand = otherOp
+                            foundChain = true
+                            break
+                        }
+                    }
+                }
+
+                if foundChain {
+                    if let idx = definingOps[scoresOp.result]?.index {
+                        preOps.append(scoresOp)
+                        preIndices.append(idx)
+                    }
+                }
+            } else if scoresOp.kind == .multiply {
+                // Scale multiply without mask
+                if let scaleConst = extractScaleConstant(scoresOp, definingOps: definingOps) {
+                    scaleValue = scaleConst
+                }
+                qkDotSource = findDotInput(scoresOp, definingOps: definingOps)
+                if let idx = definingOps[scoresOp.result]?.index {
+                    preOps.append(scoresOp)
+                    preIndices.append(idx)
+                }
+            } else if scoresOp.kind == .dotGeneral {
+                // Direct Q@K without scale or mask
+                qkDotSource = scoresSource
+            }
+        }
+
+        // Now find the Q @ K^T dot_general
+        guard let qkDotOp = definingOps[qkDotSource]?.op,
+              qkDotOp.kind == .dotGeneral else { return nil }
+
+        let qOperand = qkDotOp.operands[0]  // Q
+        let kOperand = qkDotOp.operands[1]  // K
+
+        // Verify V is external (not from within this pattern)
+        // V should be the second operand of the final dot
+        let vOperand = vSource
+
+        // Build the complete list of matched operations
+        var matchedOps: [HLOOperation] = []
+        var matchedIndices: [Int] = []
+
+        // Add Q@K dot
+        if let idx = definingOps[qkDotOp.result]?.index {
+            matchedOps.append(qkDotOp)
+            matchedIndices.append(idx)
+        }
+
+        // Add pre-softmax ops (scale, mask)
+        matchedOps.append(contentsOf: preOps)
+        matchedIndices.append(contentsOf: preIndices)
+
+        // Add softmax ops
+        matchedOps.append(contentsOf: softmaxOps)
+        matchedIndices.append(contentsOf: softmaxIndices)
+
+        // Add final Weights @ V dot
+        matchedOps.append(op)
+        matchedIndices.append(index)
+
+        // Build inputs list: Q, K, V, [optional mask]
+        var inputs = [qOperand, kOperand, vOperand]
+        if hasMask, let mask = maskOperand {
+            inputs.append(mask)
+        }
+
+        return PatternMatch(
+            operations: matchedOps,
+            indices: matchedIndices.sorted(),
+            rootOperation: op,
+            metadata: [
+                "scale": .float(scaleValue),
+                "has_mask": .bool(hasMask),
+                "is_causal": .bool(false),  // Would need more analysis to detect causal
+                "pattern": .string("attention")
+            ],
+            inputs: inputs
+        )
+    }
+
+    public func replacement(for match: PatternMatch, in function: HLOFunction) -> [HLOOperation] {
+        // Extract configuration from metadata
+        var scale: Float = 1.0
+        var hasMask = false
+        var isCausal = false
+
+        if case .float(let s) = match.metadata["scale"] {
+            scale = s
+        }
+        if case .bool(let m) = match.metadata["has_mask"] {
+            hasMask = m
+        }
+        if case .bool(let c) = match.metadata["is_causal"] {
+            isCausal = c
+        }
+
+        // Build backend config JSON
+        let configDict: [String: Any] = [
+            "scale": scale,
+            "has_mask": hasMask,
+            "is_causal": isCausal
+        ]
+
+        let configJSON: String
+        if let data = try? JSONSerialization.data(withJSONObject: configDict, options: []),
+           let str = String(data: data, encoding: .utf8) {
+            configJSON = str
+        } else {
+            configJSON = "{\"scale\": \(scale), \"has_mask\": \(hasMask), \"is_causal\": \(isCausal)}"
+        }
+
+        var attributes = HLOAttributes()
+        attributes.callTargetName = "fused_scaled_dot_product_attention"
+        attributes.backendConfig = configJSON
+
+        return [HLOOperation(
+            result: match.rootOperation.result,
+            kind: .customCall,
+            operands: match.inputs,
+            resultType: match.rootOperation.resultType,
+            attributes: attributes
+        )]
+    }
+
+    // MARK: - Helper Methods
+
+    /// Extract scale constant from a multiply operation
+    private func extractScaleConstant(
+        _ mulOp: HLOOperation,
+        definingOps: [String: (op: HLOOperation, index: Int)]
+    ) -> Float? {
+        for operand in mulOp.operands {
+            if let constOp = definingOps[operand]?.op,
+               constOp.kind == .constant,
+               let constVal = constOp.attributes.constantValue {
+                switch constVal {
+                case .scalar(let v):
+                    return Float(v)
+                case .splat(let v, _):
+                    return Float(v)
+                default:
+                    break
+                }
+            }
+        }
+        return nil
+    }
+
+    /// Find the dot operation input from a multiply (skip the constant)
+    private func findDotInput(
+        _ mulOp: HLOOperation,
+        definingOps: [String: (op: HLOOperation, index: Int)]
+    ) -> String {
+        for operand in mulOp.operands {
+            if let def = definingOps[operand]?.op {
+                if def.kind != .constant {
+                    return operand
+                }
+            } else {
+                // External operand - could be the dot result
+                return operand
+            }
+        }
+        return mulOp.operands[0]
+    }
+}
+
 // MARK: - RMSNorm Pattern
 
 /// Detects RMSNorm pattern: x / sqrt(mean(x^2) + eps) * gamma

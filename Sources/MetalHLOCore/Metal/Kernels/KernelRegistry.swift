@@ -13,6 +13,7 @@ import Foundation
 /// - Runtime compilation of Metal shaders
 /// - Caching of compiled pipeline states
 /// - Specialization via function constants
+/// - Shape-specialized kernel generation (Phase 2A)
 public final class MetalKernelRegistry: @unchecked Sendable {
 
     // MARK: - Singleton
@@ -31,6 +32,12 @@ public final class MetalKernelRegistry: @unchecked Sendable {
     /// Compiled Metal libraries by kernel name.
     private var compiledLibraries: [String: MTLLibrary] = [:]
 
+    /// Kernel specializer for shape-specialized codegen.
+    private var kernelSpecializer: KernelSpecializer?
+
+    /// Cached specialized pipeline states.
+    private var specializedPipelines: [String: MTLComputePipelineState] = [:]
+
     /// Lock for thread-safe access.
     private let lock = NSLock()
 
@@ -44,6 +51,19 @@ public final class MetalKernelRegistry: @unchecked Sendable {
     /// Creates a registry for a specific device (for testing).
     public init(device: MTLDevice) {
         registerBuiltInKernels()
+        self.kernelSpecializer = KernelSpecializer(device: device)
+    }
+
+    /// Initializes the kernel specializer for a device.
+    ///
+    /// Call this before using shape-specialized kernels.
+    /// - Parameter device: The Metal device.
+    public func initializeSpecializer(for device: MTLDevice) {
+        lock.lock()
+        defer { lock.unlock() }
+        if kernelSpecializer == nil {
+            kernelSpecializer = KernelSpecializer(device: device)
+        }
     }
 
     private func registerBuiltInKernels() {
@@ -52,6 +72,7 @@ public final class MetalKernelRegistry: @unchecked Sendable {
         registerKernel(GELUKernel())
         registerKernel(LayerNormKernel())
         registerKernel(RMSNormKernel())
+        registerKernel(FlashAttentionKernel())
     }
 
     // MARK: - Registration
@@ -226,6 +247,130 @@ public final class MetalKernelRegistry: @unchecked Sendable {
         }
     }
 
+    // MARK: - Shape-Specialized Kernels
+
+    /// Gets or generates a shape-specialized pipeline for the given operation.
+    ///
+    /// Shape-specialized kernels have compile-time constant dimensions,
+    /// enabling better optimizations like loop unrolling and optimal tiling.
+    ///
+    /// - Parameters:
+    ///   - op: The HLO operation kind.
+    ///   - shapes: Input and output tensor shapes.
+    ///   - config: Additional configuration parameters.
+    ///   - device: The Metal device.
+    /// - Returns: The compiled pipeline state, or nil if specialization not supported.
+    /// - Throws: `KernelError` if compilation fails.
+    public func getSpecializedPipeline(
+        for op: HLOOpKind,
+        shapes: [TensorType],
+        config: [String: Int] = [:],
+        device: MTLDevice
+    ) throws -> MTLComputePipelineState? {
+        // Initialize specializer if needed
+        initializeSpecializer(for: device)
+
+        guard let specializer = kernelSpecializer else {
+            return nil
+        }
+
+        // Check if we should specialize
+        guard specializer.shouldSpecialize(op: op, shapes: shapes) else {
+            return nil
+        }
+
+        // Get the specialized kernel
+        guard let kernel = specializer.getSpecializedKernel(op: op, shapes: shapes, config: config) else {
+            return nil
+        }
+
+        // Check pipeline cache
+        let cacheKey = "\(kernel.functionName)_\(device.name)"
+
+        lock.lock()
+        if let cached = specializedPipelines[cacheKey] {
+            lock.unlock()
+            return cached
+        }
+        lock.unlock()
+
+        // Compile the specialized kernel
+        let pipeline = try specializer.compile(kernel, device: device)
+
+        // Cache the result
+        lock.lock()
+        specializedPipelines[cacheKey] = pipeline
+        lock.unlock()
+
+        return pipeline
+    }
+
+    /// Gets a specialized matmul pipeline for exact dimensions.
+    ///
+    /// - Parameters:
+    ///   - M: Rows of output.
+    ///   - N: Columns of output.
+    ///   - K: Contraction dimension.
+    ///   - dtype: Data type.
+    ///   - device: The Metal device.
+    /// - Returns: The compiled pipeline state.
+    /// - Throws: `KernelError` if compilation fails.
+    public func getSpecializedMatMulPipeline(
+        M: Int, N: Int, K: Int,
+        dtype: ElementType = .float32,
+        device: MTLDevice
+    ) throws -> MTLComputePipelineState? {
+        let shapes = [
+            TensorType(shape: [M, K], elementType: dtype),
+            TensorType(shape: [K, N], elementType: dtype)
+        ]
+        return try getSpecializedPipeline(for: .dot, shapes: shapes, device: device)
+    }
+
+    /// Gets a specialized attention pipeline for exact dimensions.
+    ///
+    /// - Parameters:
+    ///   - batchSize: Batch size.
+    ///   - numHeads: Number of attention heads.
+    ///   - seqLen: Sequence length.
+    ///   - headDim: Dimension per head.
+    ///   - isCausal: Whether to use causal masking.
+    ///   - dtype: Data type.
+    ///   - device: The Metal device.
+    /// - Returns: The compiled pipeline state.
+    /// - Throws: `KernelError` if compilation fails.
+    public func getSpecializedAttentionPipeline(
+        batchSize: Int,
+        numHeads: Int,
+        seqLen: Int,
+        headDim: Int,
+        isCausal: Bool = true,
+        dtype: ElementType = .float32,
+        device: MTLDevice
+    ) throws -> MTLComputePipelineState? {
+        let qkvShape = TensorType(
+            shape: [batchSize, numHeads, seqLen, headDim],
+            elementType: dtype
+        )
+        let config: [String: Int] = [
+            "is_attention": 1,
+            "is_causal": isCausal ? 1 : 0
+        ]
+        return try getSpecializedPipeline(
+            for: .customCall,
+            shapes: [qkvShape, qkvShape, qkvShape],
+            config: config,
+            device: device
+        )
+    }
+
+    /// Returns specialization statistics.
+    public var specializationStatistics: SpecializationStats? {
+        lock.lock()
+        defer { lock.unlock() }
+        return kernelSpecializer?.statistics
+    }
+
     // MARK: - Cache Management
 
     /// Clears all cached pipelines and libraries.
@@ -234,6 +379,8 @@ public final class MetalKernelRegistry: @unchecked Sendable {
         defer { lock.unlock() }
         compiledPipelines.removeAll()
         compiledLibraries.removeAll()
+        specializedPipelines.removeAll()
+        kernelSpecializer?.clearCache()
     }
 
     /// Precompiles all registered kernels for a device.

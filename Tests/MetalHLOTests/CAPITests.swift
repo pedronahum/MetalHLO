@@ -18,7 +18,7 @@ struct CAPITests {
         #expect(version != nil)
         if let version = version {
             let str = String(cString: version)
-            #expect(str == "0.1.0")
+            #expect(str == "0.2.0")
         }
     }
 
@@ -379,6 +379,163 @@ struct CAPITests {
             mhlo_executable_destroy(executable)
         }
 
+        mhlo_client_destroy(client)
+    }
+
+    @Test("Compile config initialization")
+    func testCompileConfigInit() {
+        var config = MHLOCompileConfig(optimization_level: 0, enable_caching: false, enable_debug_info: false)
+        mhlo_compile_config_init(&config)
+
+        #expect(config.optimization_level == 2)  // O2 default
+        #expect(config.enable_caching == true)
+        #expect(config.enable_debug_info == false)
+    }
+
+    @Test("Compile with configuration")
+    func testCompileWithConfig() throws {
+        var client: OpaquePointer?
+        var status = mhlo_client_create(&client)
+        #expect(status == 0)
+
+        // Initialize config
+        var config = MHLOCompileConfig(optimization_level: 0, enable_caching: false, enable_debug_info: false)
+        mhlo_compile_config_init(&config)
+        config.optimization_level = 3  // O3
+
+        let mlir = """
+        module @config_test {
+          func.func @main(%a: tensor<4xf32>) -> (tensor<4xf32>) {
+            %0 = stablehlo.negate %a : tensor<4xf32>
+            return %0 : tensor<4xf32>
+          }
+        }
+        """
+
+        var executable: OpaquePointer?
+        status = mhlo_compile_with_config(client, mlir, &config, &executable)
+        #expect(status == 0)
+        #expect(executable != nil)
+
+        if let executable = executable {
+            #expect(mhlo_executable_input_count(executable) == 1)
+            #expect(mhlo_executable_output_count(executable) == 1)
+            mhlo_executable_destroy(executable)
+        }
+
+        mhlo_client_destroy(client)
+    }
+
+    @Test("Compile with nil config uses defaults")
+    func testCompileWithNilConfig() throws {
+        var client: OpaquePointer?
+        var status = mhlo_client_create(&client)
+        #expect(status == 0)
+
+        let mlir = """
+        module @nil_config {
+          func.func @main(%a: tensor<2xf32>) -> (tensor<2xf32>) {
+            %0 = stablehlo.abs %a : tensor<2xf32>
+            return %0 : tensor<2xf32>
+          }
+        }
+        """
+
+        var executable: OpaquePointer?
+        // Pass nil for config - should use defaults
+        status = mhlo_compile_with_config(client, mlir, nil, &executable)
+        #expect(status == 0)
+        #expect(executable != nil)
+
+        if let executable = executable {
+            mhlo_executable_destroy(executable)
+        }
+
+        mhlo_client_destroy(client)
+    }
+
+    @Test("Execution statistics tracking")
+    func testExecutionStats() throws {
+        var client: OpaquePointer?
+        var status = mhlo_client_create(&client)
+        #expect(status == 0)
+
+        let mlir = """
+        module @stats_test {
+          func.func @main(%a: tensor<4xf32>, %b: tensor<4xf32>) -> (tensor<4xf32>) {
+            %0 = stablehlo.add %a, %b : tensor<4xf32>
+            return %0 : tensor<4xf32>
+          }
+        }
+        """
+
+        var executable: OpaquePointer?
+        status = mhlo_compile(client, mlir, &executable)
+        #expect(status == 0)
+
+        // Create input buffers
+        let data: [Float] = [1.0, 2.0, 3.0, 4.0]
+        let shape: [Int64] = [4]
+        var bufferA: OpaquePointer?
+        var bufferB: OpaquePointer?
+
+        status = data.withUnsafeBytes { dataPtr in
+            shape.withUnsafeBufferPointer { shapePtr in
+                mhlo_buffer_create(client, dataPtr.baseAddress, dataPtr.count, shapePtr.baseAddress, 1, 1, &bufferA)
+            }
+        }
+        #expect(status == 0)
+
+        status = data.withUnsafeBytes { dataPtr in
+            shape.withUnsafeBufferPointer { shapePtr in
+                mhlo_buffer_create(client, dataPtr.baseAddress, dataPtr.count, shapePtr.baseAddress, 1, 1, &bufferB)
+            }
+        }
+        #expect(status == 0)
+
+        // Check initial stats (should be zero)
+        var stats = MHLOExecutionStats(execution_count: 0, total_execution_time_ms: 0, last_execution_time_ms: 0, average_execution_time_ms: 0)
+        status = mhlo_executable_get_stats(executable, &stats)
+        #expect(status == 0)
+        #expect(stats.execution_count == 0)
+
+        // Execute 3 times
+        for _ in 0..<3 {
+            var inputs: [OpaquePointer?] = [bufferA, bufferB]
+            var outputs: [OpaquePointer?] = [nil]
+            var numOutputs: Int32 = 0
+
+            status = inputs.withUnsafeBufferPointer { inputsPtr in
+                outputs.withUnsafeMutableBufferPointer { outputsPtr in
+                    mhlo_execute(executable, inputsPtr.baseAddress, 2, outputsPtr.baseAddress, &numOutputs)
+                }
+            }
+            #expect(status == 0)
+
+            if let output = outputs[0] {
+                mhlo_buffer_destroy(output)
+            }
+        }
+
+        // Check stats after executions
+        status = mhlo_executable_get_stats(executable, &stats)
+        #expect(status == 0)
+        #expect(stats.execution_count == 3)
+        #expect(stats.total_execution_time_ms > 0)
+        #expect(stats.last_execution_time_ms > 0)
+        #expect(stats.average_execution_time_ms > 0)
+
+        // Reset stats
+        mhlo_executable_reset_stats(executable)
+        status = mhlo_executable_get_stats(executable, &stats)
+        #expect(status == 0)
+        #expect(stats.execution_count == 0)
+        #expect(stats.total_execution_time_ms == 0)
+
+        // Cleanup
+        mhlo_buffer_destroy(bufferA)
+        mhlo_buffer_destroy(bufferB)
+        mhlo_executable_destroy(executable)
         mhlo_client_destroy(client)
     }
 }

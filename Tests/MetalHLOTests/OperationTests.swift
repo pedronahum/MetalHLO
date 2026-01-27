@@ -542,3 +542,292 @@ struct EndToEndTests {
         #expect(result == [2, 3])
     }
 }
+
+// MARK: - Additional Math Operations (expm1, log1p, cbrt)
+
+@Suite("Additional Math Operations")
+struct AdditionalMathOperationTests {
+
+    @Test("Expm1 operation - exp(x) - 1")
+    func expm1() throws {
+        let client = try Client.create()
+        let mlir = """
+        module @expm1 {
+          func.func @main(%arg0: tensor<4xf32>) -> (tensor<4xf32>) {
+            %0 = stablehlo.exponential_minus_one %arg0 : tensor<4xf32>
+            return %0 : tensor<4xf32>
+          }
+        }
+        """
+        let executable = try client.compile(mlir)
+        let a = try client.createBuffer([0, 1, -1, 0.5] as [Float], shape: [4], elementType: .float32)
+        let outputs = try executable.execute([a])
+        let result = try outputs[0].toFloatArray()
+        // expm1(0) = e^0 - 1 = 0
+        // expm1(1) = e^1 - 1 ≈ 1.718
+        // expm1(-1) = e^-1 - 1 ≈ -0.632
+        // expm1(0.5) = e^0.5 - 1 ≈ 0.649
+        print("expm1 result: \(result)")
+        #expect(abs(result[0] - 0.0) < 0.01, "expm1(0) should be 0, got \(result[0])")
+        #expect(abs(result[1] - 1.718) < 0.01, "expm1(1) should be ~1.718, got \(result[1])")
+        #expect(abs(result[2] - (-0.632)) < 0.01, "expm1(-1) should be ~-0.632, got \(result[2])")
+        #expect(abs(result[3] - 0.649) < 0.01, "expm1(0.5) should be ~0.649, got \(result[3])")
+    }
+
+    @Test("Expm1 operation - 2D tensor with %0")
+    func expm1_2D() throws {
+        let client = try Client.create()
+        let mlir = """
+        module @expm1_2d {
+          func.func @main(%arg0: tensor<20x20xf32>) -> (tensor<20x20xf32>) {
+            %0 = stablehlo.exponential_minus_one %arg0 : tensor<20x20xf32>
+            return %0 : tensor<20x20xf32>
+          }
+        }
+        """
+        let executable = try client.compile(mlir)
+        // Create input with known values at beginning
+        var input = [Float](repeating: 0.0, count: 400)
+        input[0] = 0.0      // expm1(0) = 0
+        input[1] = 1.0      // expm1(1) ≈ 1.718
+        input[2] = -1.0     // expm1(-1) ≈ -0.632
+        input[3] = 0.5      // expm1(0.5) ≈ 0.649
+        let a = try client.createBuffer(input, shape: [20, 20], elementType: .float32)
+        let outputs = try executable.execute([a])
+        let result = try outputs[0].toFloatArray()
+        print("expm1_2D with %0 - first 10 values: \(result.prefix(10))")
+        #expect(abs(result[0] - 0.0) < 0.01, "expm1(0) should be 0, got \(result[0])")
+        #expect(abs(result[1] - 1.718) < 0.01, "expm1(1) should be ~1.718, got \(result[1])")
+        #expect(abs(result[2] - (-0.632)) < 0.01, "expm1(-1) should be ~-0.632, got \(result[2])")
+        #expect(abs(result[3] - 0.649) < 0.01, "expm1(0.5) should be ~0.649, got \(result[3])")
+    }
+
+    @Test("Expm1 operation - 2D tensor with %result")
+    func expm1_2D_result() throws {
+        let client = try Client.create()
+        let mlir = """
+        module @expm1_2d_result {
+          func.func @main(%arg0: tensor<20x20xf32>) -> (tensor<20x20xf32>) {
+            %result = stablehlo.exponential_minus_one %arg0 : tensor<20x20xf32>
+            return %result : tensor<20x20xf32>
+          }
+        }
+        """
+        let executable = try client.compile(mlir)
+        var input = [Float](repeating: 0.0, count: 400)
+        input[0] = 0.0
+        input[1] = 1.0
+        input[2] = -1.0
+        input[3] = 0.5
+        let a = try client.createBuffer(input, shape: [20, 20], elementType: .float32)
+        let outputs = try executable.execute([a])
+        let result = try outputs[0].toFloatArray()
+        print("expm1_2D with %result - first 10 values: \(result.prefix(10))")
+        #expect(abs(result[0] - 0.0) < 0.01, "expm1(0) should be 0, got \(result[0])")
+        #expect(abs(result[1] - 1.718) < 0.01, "expm1(1) should be ~1.718, got \(result[1])")
+        #expect(abs(result[2] - (-0.632)) < 0.01, "expm1(-1) should be ~-0.632, got \(result[2])")
+        #expect(abs(result[3] - 0.649) < 0.01, "expm1(0.5) should be ~0.649, got \(result[3])")
+    }
+
+    @Test("Expm1 operation - 2D tensor from raw bytes (no config)")
+    func expm1_2D_bytes() throws {
+        let client = try Client.create()
+        // Use exact same module name as conformance test
+        let mlir = """
+        module @expm1_float32_20_20 {
+          func.func @main(%arg0: tensor<20x20xf32>) -> (tensor<20x20xf32>) {
+            %result = stablehlo.exponential_minus_one %arg0 : tensor<20x20xf32>
+            return %result : tensor<20x20xf32>
+          }
+        }
+        """
+        let executable = try client.compile(mlir)
+        // Create input from raw bytes, similar to how conformance tests do
+        var input = [Float](repeating: 0.0, count: 400)
+        input[0] = -1.0676893
+        input[1] = -0.7723734
+        input[2] = 0.82516915
+        input[3] = -0.44986543
+        input[4] = 0.59195614
+        // Convert to Data
+        let inputData = input.withUnsafeBytes { Data($0) }
+        let a = try client.createBuffer(bytes: inputData, shape: [20, 20], elementType: .float32)
+        // Verify the buffer content
+        let inputCheck = try a.toFloatArray()
+        print("expm1_2D_bytes (no config) input first 5 values: \(inputCheck.prefix(5))")
+        let outputs = try executable.execute([a])
+        let result = try outputs[0].toFloatArray()
+        print("expm1_2D_bytes (no config) output first 10 values: \(result.prefix(10))")
+        // Expected: expm1(-1.0676893) ≈ -0.6562
+        #expect(abs(result[0] - (-0.6562)) < 0.01, "expm1(-1.07) should be ~-0.656, got \(result[0])")
+    }
+
+    @Test("Expm1 operation - 2D tensor WITH config (like conformance)")
+    func expm1_2D_with_config() throws {
+        let client = try Client.create()
+        // Use exact same module name as conformance test
+        let mlir = """
+        module @expm1_float32_20_20 {
+          func.func @main(%arg0: tensor<20x20xf32>) -> (tensor<20x20xf32>) {
+            %result = stablehlo.exponential_minus_one %arg0 : tensor<20x20xf32>
+            return %result : tensor<20x20xf32>
+          }
+        }
+        """
+        // Use the same compile path as conformance tests
+        let config = CompilationConfig.default
+        let executable = try client.compile(mlir, config: config)
+        // Create input from raw bytes
+        var input = [Float](repeating: 0.0, count: 400)
+        input[0] = -1.0676893
+        input[1] = -0.7723734
+        input[2] = 0.82516915
+        input[3] = -0.44986543
+        input[4] = 0.59195614
+        let inputData = input.withUnsafeBytes { Data($0) }
+        let a = try client.createBuffer(bytes: inputData, shape: [20, 20], elementType: .float32)
+        let inputCheck = try a.toFloatArray()
+        print("expm1_2D_with_config input first 5 values: \(inputCheck.prefix(5))")
+        let outputs = try executable.execute([a])
+        let result = try outputs[0].toFloatArray()
+        print("expm1_2D_with_config output first 10 values: \(result.prefix(10))")
+        #expect(abs(result[0] - (-0.6562)) < 0.01, "expm1(-1.07) should be ~-0.656, got \(result[0])")
+    }
+
+    @Test("Log1p operation - log(1 + x)")
+    func log1p() throws {
+        let client = try Client.create()
+        let mlir = """
+        module @log1p {
+          func.func @main(%arg0: tensor<4xf32>) -> (tensor<4xf32>) {
+            %0 = stablehlo.log_plus_one %arg0 : tensor<4xf32>
+            return %0 : tensor<4xf32>
+          }
+        }
+        """
+        let executable = try client.compile(mlir)
+        let a = try client.createBuffer([0, 1, 1.718281828, -0.5] as [Float], shape: [4], elementType: .float32)
+        let outputs = try executable.execute([a])
+        let result = try outputs[0].toFloatArray()
+        // log1p(0) = log(1) = 0
+        // log1p(1) = log(2) ≈ 0.693
+        // log1p(e-1) = log(e) = 1
+        // log1p(-0.5) = log(0.5) ≈ -0.693
+        print("log1p result: \(result)")
+        #expect(abs(result[0] - 0.0) < 0.01, "log1p(0) should be 0, got \(result[0])")
+        #expect(abs(result[1] - 0.693) < 0.01, "log1p(1) should be ~0.693, got \(result[1])")
+        #expect(abs(result[2] - 1.0) < 0.01, "log1p(e-1) should be ~1.0, got \(result[2])")
+        #expect(abs(result[3] - (-0.693)) < 0.01, "log1p(-0.5) should be ~-0.693, got \(result[3])")
+    }
+
+    @Test("Cbrt operation - cube root")
+    func cbrt() throws {
+        let client = try Client.create()
+        let mlir = """
+        module @cbrt {
+          func.func @main(%arg0: tensor<4xf32>) -> (tensor<4xf32>) {
+            %0 = stablehlo.cbrt %arg0 : tensor<4xf32>
+            return %0 : tensor<4xf32>
+          }
+        }
+        """
+        let executable = try client.compile(mlir)
+        let a = try client.createBuffer([1, 8, 27, -8] as [Float], shape: [4], elementType: .float32)
+        let outputs = try executable.execute([a])
+        let result = try outputs[0].toFloatArray()
+        // cbrt(1) = 1
+        // cbrt(8) = 2
+        // cbrt(27) = 3
+        // cbrt(-8) = -2
+        print("cbrt result: \(result)")
+        #expect(abs(result[0] - 1.0) < 0.01, "cbrt(1) should be 1, got \(result[0])")
+        #expect(abs(result[1] - 2.0) < 0.01, "cbrt(8) should be 2, got \(result[1])")
+        #expect(abs(result[2] - 3.0) < 0.01, "cbrt(27) should be 3, got \(result[2])")
+        #expect(abs(result[3] - (-2.0)) < 0.01, "cbrt(-8) should be -2, got \(result[3])")
+    }
+}
+
+// MARK: - Reduction Operations
+
+@Suite("Reduction Operations")
+struct ReductionOperationTests {
+
+    @Test("Reduce sum along dimension 0 (no config - MPSGraph)")
+    func reduceSumDim0_NoConfig() throws {
+        let client = try Client.create()
+        let mlir = """
+        module @reduce_sum {
+          func.func @main(%arg0: tensor<2x3xf32>) -> (tensor<3xf32>) {
+            %init = stablehlo.constant dense<0.0> : tensor<f32>
+            %result = stablehlo.reduce(%arg0 init: %init) applies stablehlo.add across dimensions = [0] : (tensor<2x3xf32>, tensor<f32>) -> tensor<3xf32>
+            return %result : tensor<3xf32>
+          }
+        }
+        """
+        let executable = try client.compile(mlir)  // No config - uses MPSGraph
+        // Input: [[1, 2, 3],
+        //         [4, 5, 6]]
+        // Sum along dim 0: [5, 7, 9]
+        let a = try client.createBuffer([1, 2, 3, 4, 5, 6] as [Float], shape: [2, 3], elementType: .float32)
+        let outputs = try executable.execute([a])
+        let result = try outputs[0].toFloatArray()
+        print("reduce_sum (no config) result: \(result)")
+        #expect(result.count == 3, "Expected 3 elements, got \(result.count)")
+        #expect(abs(result[0] - 5.0) < 0.01, "Expected 5, got \(result[0])")
+        #expect(abs(result[1] - 7.0) < 0.01, "Expected 7, got \(result[1])")
+        #expect(abs(result[2] - 9.0) < 0.01, "Expected 9, got \(result[2])")
+    }
+
+    @Test("Reduce sum along dimension 0 (with config - IntegratedExecutor)")
+    func reduceSumDim0_WithConfig() throws {
+        let client = try Client.create()
+        let mlir = """
+        module @reduce_sum {
+          func.func @main(%arg0: tensor<2x3xf32>) -> (tensor<3xf32>) {
+            %init = stablehlo.constant dense<0.0> : tensor<f32>
+            %result = stablehlo.reduce(%arg0 init: %init) applies stablehlo.add across dimensions = [0] : (tensor<2x3xf32>, tensor<f32>) -> tensor<3xf32>
+            return %result : tensor<3xf32>
+          }
+        }
+        """
+        let config = CompilationConfig.default
+        let executable = try client.compile(mlir, config: config)  // With config - uses IntegratedExecutor
+        // Input: [[1, 2, 3],
+        //         [4, 5, 6]]
+        // Sum along dim 0: [5, 7, 9]
+        let a = try client.createBuffer([1, 2, 3, 4, 5, 6] as [Float], shape: [2, 3], elementType: .float32)
+        let outputs = try executable.execute([a])
+        let result = try outputs[0].toFloatArray()
+        print("reduce_sum (with config) result: \(result)")
+        #expect(result.count == 3, "Expected 3 elements, got \(result.count)")
+        #expect(abs(result[0] - 5.0) < 0.01, "Expected 5, got \(result[0])")
+        #expect(abs(result[1] - 7.0) < 0.01, "Expected 7, got \(result[1])")
+        #expect(abs(result[2] - 9.0) < 0.01, "Expected 9, got \(result[2])")
+    }
+
+    @Test("Reduce max along dimension 0 (no config - MPSGraph)")
+    func reduceMaxDim0_NoConfig() throws {
+        let client = try Client.create()
+        let mlir = """
+        module @reduce_max {
+          func.func @main(%arg0: tensor<2x3xf32>) -> (tensor<3xf32>) {
+            %init = stablehlo.constant dense<-0x1.FFFFFEp127> : tensor<f32>
+            %result = stablehlo.reduce(%arg0 init: %init) applies stablehlo.maximum across dimensions = [0] : (tensor<2x3xf32>, tensor<f32>) -> tensor<3xf32>
+            return %result : tensor<3xf32>
+          }
+        }
+        """
+        let executable = try client.compile(mlir)  // No config - uses MPSGraph
+        // Input: [[1, 5, 3],
+        //         [4, 2, 6]]
+        // Max along dim 0: [4, 5, 6]
+        let a = try client.createBuffer([1, 5, 3, 4, 2, 6] as [Float], shape: [2, 3], elementType: .float32)
+        let outputs = try executable.execute([a])
+        let result = try outputs[0].toFloatArray()
+        print("reduce_max (no config) result: \(result)")
+        #expect(result.count == 3, "Expected 3 elements, got \(result.count)")
+        #expect(abs(result[0] - 4.0) < 0.01, "Expected 4, got \(result[0])")
+        #expect(abs(result[1] - 5.0) < 0.01, "Expected 5, got \(result[1])")
+        #expect(abs(result[2] - 6.0) < 0.01, "Expected 6, got \(result[2])")
+    }
+}

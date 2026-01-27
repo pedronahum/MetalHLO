@@ -37,6 +37,12 @@ private let MHLO_UI16: Int32 = 10
 private let MHLO_UI32: Int32 = 11
 private let MHLO_UI64: Int32 = 12
 
+// Optimization level codes (matches MHLOOptimizationLevel enum in header)
+private let MHLO_OPT_O0: Int32 = 0
+private let MHLO_OPT_O1: Int32 = 1
+private let MHLO_OPT_O2: Int32 = 2
+private let MHLO_OPT_O3: Int32 = 3
+
 // MARK: - Opaque Handle Wrappers
 
 /// Wrapper class to hold a Client reference across the C boundary.
@@ -52,11 +58,32 @@ final class ExecutableHandle {
     var inputShapes: [[Int64]] = []
     var outputShapes: [[Int64]] = []
 
+    // Execution statistics
+    var executionCount: Int64 = 0
+    var totalExecutionTimeMs: Double = 0
+    var lastExecutionTimeMs: Double = 0
+
     init(_ executable: Executable) {
         self.executable = executable
         // Pre-compute shapes for C API access
         self.inputShapes = executable.inputTypes.map { $0.shape.map { Int64($0) } }
         self.outputShapes = executable.outputTypes.map { $0.shape.map { Int64($0) } }
+    }
+
+    func recordExecution(timeMs: Double) {
+        executionCount += 1
+        totalExecutionTimeMs += timeMs
+        lastExecutionTimeMs = timeMs
+    }
+
+    func resetStats() {
+        executionCount = 0
+        totalExecutionTimeMs = 0
+        lastExecutionTimeMs = 0
+    }
+
+    var averageExecutionTimeMs: Double {
+        executionCount > 0 ? totalExecutionTimeMs / Double(executionCount) : 0
     }
 }
 
@@ -167,7 +194,7 @@ private func elementTypeToC(_ swiftType: ElementType) -> Int32 {
 @_cdecl("mhlo_version")
 public func mhlo_version() -> UnsafePointer<CChar>? {
     // Return a static string - this doesn't need to be freed
-    return ("0.1.0" as NSString).utf8String
+    return ("0.2.0" as NSString).utf8String
 }
 
 // MARK: - Error Message
@@ -640,7 +667,13 @@ public func mhlo_execute(
 
     do {
         clearError()
+        let startTime = CFAbsoluteTimeGetCurrent()
         let outputs = try execHandle.executable.execute(inputBuffers)
+        let endTime = CFAbsoluteTimeGetCurrent()
+
+        // Record execution time for statistics
+        let executionTimeMs = (endTime - startTime) * 1000.0
+        execHandle.recordExecution(timeMs: executionTimeMs)
 
         outNumOutputs.pointee = Int32(outputs.count)
 
@@ -717,10 +750,142 @@ public func mhlo_execute_with_timing(
             outTotalTime.pointee = timing.totalTime
         }
 
+        // Record execution time for statistics
+        execHandle.recordExecution(timeMs: timing.totalTime * 1000.0)
+
         return MHLO_OK
     } catch let error as MetalHLOError {
         return statusFromError(error)
     } catch {
         return setError(MHLO_ERROR_EXECUTION_FAILED, error.localizedDescription)
     }
+}
+
+// MARK: - Compilation Configuration API
+
+/// C-compatible compilation configuration structure layout.
+/// Must match MHLOCompileConfig in the C header exactly.
+/// Using @frozen to ensure stable layout.
+@frozen
+public struct MHLOCompileConfig {
+    public var optimization_level: Int32
+    public var enable_caching: Bool
+    public var enable_debug_info: Bool
+}
+
+/// Initialize a compilation configuration with defaults.
+@_cdecl("mhlo_compile_config_init")
+public func mhlo_compile_config_init(_ outConfig: UnsafeMutableRawPointer?) {
+    guard let outConfig = outConfig else { return }
+
+    let config = outConfig.assumingMemoryBound(to: MHLOCompileConfig.self)
+    config.pointee.optimization_level = MHLO_OPT_O2
+    config.pointee.enable_caching = true
+    config.pointee.enable_debug_info = false
+}
+
+/// Compile StableHLO MLIR with configuration options.
+/// Uses the full MetalHLO compiler pipeline with the specified optimization level.
+@_cdecl("mhlo_compile_with_config")
+public func mhlo_compile_with_config(
+    _ client: OpaquePointer?,
+    _ mlirText: UnsafePointer<CChar>?,
+    _ config: UnsafeRawPointer?,
+    _ outExecutable: UnsafeMutablePointer<OpaquePointer?>?
+) -> Int32 {
+    guard let client = client else {
+        return setError(MHLO_ERROR_INVALID_ARGUMENT, "client is null")
+    }
+    guard let mlirText = mlirText else {
+        return setError(MHLO_ERROR_INVALID_ARGUMENT, "mlir_text is null")
+    }
+    guard let outExecutable = outExecutable else {
+        return setError(MHLO_ERROR_INVALID_ARGUMENT, "out_executable is null")
+    }
+
+    let handle = Unmanaged<ClientHandle>.fromOpaque(UnsafeRawPointer(client)).takeUnretainedValue()
+    let mlirString = String(cString: mlirText)
+
+    // Convert C config to Swift CompilationConfig
+    let swiftConfig: CompilationConfig
+    if let config = config {
+        let configStruct = config.assumingMemoryBound(to: MHLOCompileConfig.self).pointee
+        let optLevel = optimizationLevelFromC(configStruct.optimization_level)
+        swiftConfig = CompilationConfig(
+            optimizationLevel: optLevel,
+            enableCaching: configStruct.enable_caching,
+            generateDebugInfo: configStruct.enable_debug_info
+        )
+    } else {
+        // Use default config if not provided
+        swiftConfig = .default
+    }
+
+    do {
+        clearError()
+        let executable = try handle.client.compile(mlirString, config: swiftConfig)
+        let execHandle = ExecutableHandle(executable)
+        let retained = Unmanaged.passRetained(execHandle).toOpaque()
+        outExecutable.pointee = OpaquePointer(retained)
+        return MHLO_OK
+    } catch let error as MetalHLOError {
+        return statusFromError(error)
+    } catch {
+        return setError(MHLO_ERROR_COMPILATION_FAILED, error.localizedDescription)
+    }
+}
+
+/// Converts C optimization level to Swift OptimizationLevel.
+private func optimizationLevelFromC(_ cLevel: Int32) -> OptimizationLevel {
+    switch cLevel {
+    case MHLO_OPT_O0: return .O0
+    case MHLO_OPT_O1: return .O1
+    case MHLO_OPT_O2: return .O2
+    case MHLO_OPT_O3: return .O3
+    default: return .O2
+    }
+}
+
+// MARK: - Execution Statistics API
+
+/// C-compatible execution statistics structure layout.
+/// Must match MHLOExecutionStats in the C header exactly.
+@frozen
+public struct MHLOExecutionStats {
+    public var execution_count: Int64
+    public var total_execution_time_ms: Double
+    public var last_execution_time_ms: Double
+    public var average_execution_time_ms: Double
+}
+
+/// Get execution statistics for an executable.
+@_cdecl("mhlo_executable_get_stats")
+public func mhlo_executable_get_stats(
+    _ executable: OpaquePointer?,
+    _ outStats: UnsafeMutableRawPointer?
+) -> Int32 {
+    guard let executable = executable else {
+        return setError(MHLO_ERROR_INVALID_ARGUMENT, "executable is null")
+    }
+    guard let outStats = outStats else {
+        return setError(MHLO_ERROR_INVALID_ARGUMENT, "out_stats is null")
+    }
+
+    let handle = Unmanaged<ExecutableHandle>.fromOpaque(UnsafeRawPointer(executable)).takeUnretainedValue()
+
+    let stats = outStats.assumingMemoryBound(to: MHLOExecutionStats.self)
+    stats.pointee.execution_count = handle.executionCount
+    stats.pointee.total_execution_time_ms = handle.totalExecutionTimeMs
+    stats.pointee.last_execution_time_ms = handle.lastExecutionTimeMs
+    stats.pointee.average_execution_time_ms = handle.averageExecutionTimeMs
+
+    return MHLO_OK
+}
+
+/// Reset execution statistics for an executable.
+@_cdecl("mhlo_executable_reset_stats")
+public func mhlo_executable_reset_stats(_ executable: OpaquePointer?) {
+    guard let executable = executable else { return }
+    let handle = Unmanaged<ExecutableHandle>.fromOpaque(UnsafeRawPointer(executable)).takeUnretainedValue()
+    handle.resetStats()
 }

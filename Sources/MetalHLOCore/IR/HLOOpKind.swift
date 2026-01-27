@@ -87,6 +87,9 @@ public enum HLOOpKind: String, CaseIterable, Sendable {
     /// Tangent.
     case tan
 
+    /// Two-argument arc tangent (atan2).
+    case atan2
+
     /// Logistic (sigmoid): 1/(1+e^-x).
     case logistic
 
@@ -430,7 +433,7 @@ extension HLOOpKind {
              .convolution, .uniformQuantize, .uniformDequantize,
              .shiftLeft, .shiftRightArithmetic, .shiftRightLogical,
              .complex, .triangularSolve, .dynamicReshape, .dynamicBroadcastInDim,
-             .dynamicIota:
+             .dynamicIota, .atan2:
             return .exactly(2)
 
         // Ternary

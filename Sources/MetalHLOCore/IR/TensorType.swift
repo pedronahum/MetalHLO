@@ -9,7 +9,7 @@ import MetalPerformanceShadersGraph
 ///
 /// This is the internal representation used by MetalHLOCore.
 /// The public API re-exports this type.
-public struct TensorType: Equatable, Sendable, CustomStringConvertible {
+public struct TensorType: Equatable, Hashable, Sendable, CustomStringConvertible {
 
     // MARK: - Properties
 

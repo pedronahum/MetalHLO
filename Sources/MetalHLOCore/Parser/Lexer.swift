@@ -189,7 +189,51 @@ public final class Lexer {
             text.append(advance())
         }
 
-        // Integer part
+        // Check for hexadecimal format: 0x or 0X
+        if peek() == "0" && (peekNext() == "x" || peekNext() == "X") {
+            text.append(advance())  // consume '0'
+            text.append(advance())  // consume 'x' or 'X'
+
+            // Parse hex digits
+            while !isAtEnd && isHexDigit(peek()) {
+                text.append(advance())
+            }
+
+            // Check for hex float: 0x1.FFFFFEp127
+            if peek() == "." {
+                isFloat = true
+                text.append(advance())  // consume '.'
+                while !isAtEnd && isHexDigit(peek()) {
+                    text.append(advance())
+                }
+            }
+
+            // Hex exponent: p or P followed by decimal exponent
+            if peek() == "p" || peek() == "P" {
+                isFloat = true
+                text.append(advance())
+                if peek() == "+" || peek() == "-" {
+                    text.append(advance())
+                }
+                while !isAtEnd && peek().isNumber {
+                    text.append(advance())
+                }
+            }
+
+            if isFloat {
+                // Parse hex float using Swift's built-in support
+                let value = Double(text) ?? 0.0
+                return makeToken(.float(value), text: text, location: startLocation)
+            } else {
+                // Parse hex integer
+                let hexValue = text.dropFirst(text.hasPrefix("-") ? 3 : 2)  // Remove "-0x" or "0x"
+                let value = Int64(hexValue, radix: 16) ?? 0
+                let signedValue = text.hasPrefix("-") ? -value : value
+                return makeToken(.integer(signedValue), text: text, location: startLocation)
+            }
+        }
+
+        // Integer part (decimal)
         while !isAtEnd && peek().isNumber {
             text.append(advance())
         }
@@ -222,6 +266,10 @@ public final class Lexer {
             let value = Int64(text) ?? 0
             return makeToken(.integer(value), text: text, location: startLocation)
         }
+    }
+
+    private func isHexDigit(_ char: Character) -> Bool {
+        return char.isNumber || (char >= "a" && char <= "f") || (char >= "A" && char <= "F")
     }
 
     private func scanIdentifier() -> Token {
