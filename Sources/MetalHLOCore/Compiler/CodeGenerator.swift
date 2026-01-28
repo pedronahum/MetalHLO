@@ -552,71 +552,146 @@ public final class CodeGenerator: @unchecked Sendable {
         }
 
         let lhsShape = inputShapes[0]
-        let rhsShape = inputShapes[1]
 
-        let M = lhsShape.count >= 2 ? lhsShape[lhsShape.count - 2] : 1
-        let K = lhsShape.count >= 1 ? lhsShape[lhsShape.count - 1] : 1
-        let N = rhsShape.count >= 1 ? rhsShape[rhsShape.count - 1] : 1
+        // Calculate batch size (product of all dimensions except last 2)
+        let batchSize = lhsShape.count > 2 ? lhsShape.dropLast(2).reduce(1, *) : 1
 
         let tuning = TuningConfig.matmul
 
-        let source = """
-        #include <metal_stdlib>
-        using namespace metal;
+        // Use batched kernel if we have batch dimensions
+        let source: String
+        if batchSize > 1 {
+            source = """
+            #include <metal_stdlib>
+            using namespace metal;
 
-        #define TILE_SIZE 32
+            #define TILE_SIZE 32
 
-        kernel void kernel_matmul(
-            device const float* A [[buffer(0)]],
-            device const float* B [[buffer(1)]],
-            device float* C [[buffer(2)]],
-            constant uint& M [[buffer(3)]],
-            constant uint& N [[buffer(4)]],
-            constant uint& K [[buffer(5)]],
-            threadgroup float* tileA [[threadgroup(0)]],
-            threadgroup float* tileB [[threadgroup(1)]],
-            uint2 gid [[threadgroup_position_in_grid]],
-            uint2 tid [[thread_position_in_threadgroup]])
-        {
-            uint row = gid.y * TILE_SIZE + tid.y;
-            uint col = gid.x * TILE_SIZE + tid.x;
+            // Batched matrix multiplication kernel
+            // Handles tensors of shape [...batch_dims, M, K] x [...batch_dims, K, N] -> [...batch_dims, M, N]
+            kernel void kernel_matmul(
+                device const float* A [[buffer(0)]],
+                device const float* B [[buffer(1)]],
+                device float* C [[buffer(2)]],
+                constant uint& M [[buffer(3)]],
+                constant uint& N [[buffer(4)]],
+                constant uint& K [[buffer(5)]],
+                constant uint& batchCount [[buffer(6)]],
+                threadgroup float* tileA [[threadgroup(0)]],
+                threadgroup float* tileB [[threadgroup(1)]],
+                uint3 gid [[threadgroup_position_in_grid]],
+                uint2 tid [[thread_position_in_threadgroup]])
+            {
+                uint batch = gid.z;
+                if (batch >= batchCount) return;
 
-            float sum = 0.0f;
+                uint row = gid.y * TILE_SIZE + tid.y;
+                uint col = gid.x * TILE_SIZE + tid.x;
 
-            for (uint t = 0; t < (K + TILE_SIZE - 1) / TILE_SIZE; t++) {
-                // Load tile of A
-                uint aRow = row;
-                uint aCol = t * TILE_SIZE + tid.x;
-                if (aRow < M && aCol < K) {
-                    tileA[tid.y * TILE_SIZE + tid.x] = A[aRow * K + aCol];
-                } else {
-                    tileA[tid.y * TILE_SIZE + tid.x] = 0.0f;
+                // Calculate offsets for this batch
+                uint matrixSizeA = M * K;
+                uint matrixSizeB = K * N;
+                uint matrixSizeC = M * N;
+
+                device const float* batchA = A + batch * matrixSizeA;
+                device const float* batchB = B + batch * matrixSizeB;
+                device float* batchC = C + batch * matrixSizeC;
+
+                float sum = 0.0f;
+
+                for (uint t = 0; t < (K + TILE_SIZE - 1) / TILE_SIZE; t++) {
+                    // Load tile of A
+                    uint aRow = row;
+                    uint aCol = t * TILE_SIZE + tid.x;
+                    if (aRow < M && aCol < K) {
+                        tileA[tid.y * TILE_SIZE + tid.x] = batchA[aRow * K + aCol];
+                    } else {
+                        tileA[tid.y * TILE_SIZE + tid.x] = 0.0f;
+                    }
+
+                    // Load tile of B
+                    uint bRow = t * TILE_SIZE + tid.y;
+                    uint bCol = col;
+                    if (bRow < K && bCol < N) {
+                        tileB[tid.y * TILE_SIZE + tid.x] = batchB[bRow * N + bCol];
+                    } else {
+                        tileB[tid.y * TILE_SIZE + tid.x] = 0.0f;
+                    }
+
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                    // Compute partial sum
+                    for (uint k = 0; k < TILE_SIZE; k++) {
+                        sum += tileA[tid.y * TILE_SIZE + k] * tileB[k * TILE_SIZE + tid.x];
+                    }
+
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
                 }
 
-                // Load tile of B
-                uint bRow = t * TILE_SIZE + tid.y;
-                uint bCol = col;
-                if (bRow < K && bCol < N) {
-                    tileB[tid.y * TILE_SIZE + tid.x] = B[bRow * N + bCol];
-                } else {
-                    tileB[tid.y * TILE_SIZE + tid.x] = 0.0f;
+                if (row < M && col < N) {
+                    batchC[row * N + col] = sum;
                 }
-
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-
-                // Compute partial sum
-                for (uint k = 0; k < TILE_SIZE; k++) {
-                    sum += tileA[tid.y * TILE_SIZE + k] * tileB[k * TILE_SIZE + tid.x];
-                }
-
-                threadgroup_barrier(mem_flags::mem_threadgroup);
             }
+            """
+        } else {
+            source = """
+            #include <metal_stdlib>
+            using namespace metal;
 
-            if (row < M && col < N) {
-                C[row * N + col] = sum;
+            #define TILE_SIZE 32
+
+            kernel void kernel_matmul(
+                device const float* A [[buffer(0)]],
+                device const float* B [[buffer(1)]],
+                device float* C [[buffer(2)]],
+                constant uint& M [[buffer(3)]],
+                constant uint& N [[buffer(4)]],
+                constant uint& K [[buffer(5)]],
+                threadgroup float* tileA [[threadgroup(0)]],
+                threadgroup float* tileB [[threadgroup(1)]],
+                uint2 gid [[threadgroup_position_in_grid]],
+                uint2 tid [[thread_position_in_threadgroup]])
+            {
+                uint row = gid.y * TILE_SIZE + tid.y;
+                uint col = gid.x * TILE_SIZE + tid.x;
+
+                float sum = 0.0f;
+
+                for (uint t = 0; t < (K + TILE_SIZE - 1) / TILE_SIZE; t++) {
+                    // Load tile of A
+                    uint aRow = row;
+                    uint aCol = t * TILE_SIZE + tid.x;
+                    if (aRow < M && aCol < K) {
+                        tileA[tid.y * TILE_SIZE + tid.x] = A[aRow * K + aCol];
+                    } else {
+                        tileA[tid.y * TILE_SIZE + tid.x] = 0.0f;
+                    }
+
+                    // Load tile of B
+                    uint bRow = t * TILE_SIZE + tid.y;
+                    uint bCol = col;
+                    if (bRow < K && bCol < N) {
+                        tileB[tid.y * TILE_SIZE + tid.x] = B[bRow * N + bCol];
+                    } else {
+                        tileB[tid.y * TILE_SIZE + tid.x] = 0.0f;
+                    }
+
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                    // Compute partial sum
+                    for (uint k = 0; k < TILE_SIZE; k++) {
+                        sum += tileA[tid.y * TILE_SIZE + k] * tileB[k * TILE_SIZE + tid.x];
+                    }
+
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+
+                if (row < M && col < N) {
+                    C[row * N + col] = sum;
+                }
             }
+            """
         }
-        """
 
         return (source, "kernel_matmul", tuning)
     }
@@ -629,9 +704,24 @@ public final class CodeGenerator: @unchecked Sendable {
         // Get input shape
         let inputShape = inputShapes.first ?? []
 
-        // Calculate the size of the reduction and the number of output elements
-        // For reduction along specified dimensions, we need to handle the general case
-        // Simple case: reduce last dimension(s)
+        // Determine reduction operation based on reductionKind
+        let reductionKind = attributes.reductionKind ?? .sum
+        let (accumOp, initComment): (String, String)
+        switch reductionKind {
+        case .sum:
+            accumOp = "accum += input[inputIdx];"
+            initComment = "// Start with init value (typically 0 for sum)"
+        case .max:
+            accumOp = "accum = max(accum, input[inputIdx]);"
+            initComment = "// Start with init value (typically -FLT_MAX for max)"
+        case .min:
+            accumOp = "accum = min(accum, input[inputIdx]);"
+            initComment = "// Start with init value (typically FLT_MAX for min)"
+        case .mean:
+            // Mean reduction: sum then divide by count (handled as sum here, divide done separately)
+            accumOp = "accum += input[inputIdx];"
+            initComment = "// Start with init value (0 for mean accumulation)"
+        }
 
         // NOTE: reduce operation has two inputs: data (buffer 0) and init value (buffer 1)
         // Output is at buffer 2, followed by scalar parameters
@@ -640,8 +730,9 @@ public final class CodeGenerator: @unchecked Sendable {
         #include <metal_stdlib>
         using namespace metal;
 
-        // Simple reduction kernel: each thread handles one output element
+        // Reduction kernel: each thread handles one output element
         // and sequentially reduces over the reduction dimension
+        // Reduction type: \(reductionKind)
         kernel void kernel_reduce(
             device const float* input [[buffer(0)]],
             device const float* initValue [[buffer(1)]],
@@ -659,16 +750,16 @@ public final class CodeGenerator: @unchecked Sendable {
             uint outerIdx = tid / innerSize;
             uint innerIdx = tid % innerSize;
 
-            // Start with init value
-            float sum = initValue[0];
+            \(initComment)
+            float accum = initValue[0];
 
-            // Sum over the reduction dimension
+            // Reduce over the reduction dimension
             for (uint r = 0; r < reduceSize; r++) {
                 uint inputIdx = outerIdx * reduceSize * innerSize + r * innerSize + innerIdx;
-                sum += input[inputIdx];
+                \(accumOp)
             }
 
-            output[tid] = sum;
+            output[tid] = accum;
         }
         """
 
@@ -1317,7 +1408,21 @@ public final class CodeGenerator: @unchecked Sendable {
                 if outputShape.count >= 2 {
                     let M = outputShape[outputShape.count - 2]
                     let N = outputShape[outputShape.count - 1]
-                    return DispatchConfig.dispatch2D(width: N, height: M, tileWidth: 32, tileHeight: 32)
+                    // Calculate batch size for batched matmul
+                    let batchSize = outputShape.count > 2 ? outputShape.dropLast(2).reduce(1, *) : 1
+
+                    if batchSize > 1 {
+                        // 3D dispatch for batched matmul
+                        let tileSize = 32
+                        let gridWidth = (N + tileSize - 1) / tileSize
+                        let gridHeight = (M + tileSize - 1) / tileSize
+                        return DispatchConfig(
+                            gridSize: MTLSize(width: gridWidth, height: gridHeight, depth: batchSize),
+                            threadgroupSize: MTLSize(width: tileSize, height: tileSize, depth: 1)
+                        )
+                    } else {
+                        return DispatchConfig.dispatch2D(width: N, height: M, tileWidth: 32, tileHeight: 32)
+                    }
                 }
             case .reduce:
                 return DispatchConfig.dispatch1D(elements: totalElements, threadgroupSize: 256)
@@ -1446,6 +1551,9 @@ public final class CodeGenerator: @unchecked Sendable {
                 let K = lhsShape.count >= 1 ? UInt32(lhsShape[lhsShape.count - 1]) : 1
                 let N = rhsShape.count >= 1 ? UInt32(rhsShape[rhsShape.count - 1]) : 1
 
+                // Calculate batch size for batched matmul
+                let batchSize = lhsShape.count > 2 ? UInt32(lhsShape.dropLast(2).reduce(1, *)) : 1
+
                 bindings.append(BufferBinding(
                     index: index,
                     source: .scalar(M),
@@ -1468,6 +1576,17 @@ public final class CodeGenerator: @unchecked Sendable {
                     size: MemoryLayout<UInt32>.size,
                     access: .read
                 ))
+                index += 1
+
+                // Add batchCount for batched matmul (kernel uses this when batchSize > 1)
+                if batchSize > 1 {
+                    bindings.append(BufferBinding(
+                        index: index,
+                        source: .scalar(batchSize),
+                        size: MemoryLayout<UInt32>.size,
+                        access: .read
+                    ))
+                }
             }
         }
 
