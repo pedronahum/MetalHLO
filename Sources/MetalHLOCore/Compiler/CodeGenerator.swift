@@ -378,8 +378,17 @@ public final class CodeGenerator: @unchecked Sendable {
             return generateReductionSource(inputShapes: inputShapes, attributes: attributes)
 
         // Shape operations
-        case .reshape, .transpose:
+        case .reshape:
             source += generateCopyKernel(entryPoint: entryPoint, metalType: metalType)
+
+        case .transpose:
+            source += generateTransposeKernel(
+                entryPoint: entryPoint,
+                inputShape: inputShapes.first ?? [],
+                outputShape: outputShapes.first ?? [],
+                permutation: attributes.dimensions ?? [],
+                metalType: metalType
+            )
 
         // Broadcast operations
         case .broadcastInDim:
@@ -444,6 +453,81 @@ public final class CodeGenerator: @unchecked Sendable {
         {
             if (tid >= count) return;
             output[tid] = input[tid];
+        }
+        """
+    }
+
+    /// Generates a transpose kernel that permutes dimensions.
+    ///
+    /// The transpose operation reorders elements from input to output according to the permutation.
+    /// For example, transpose([2,3,4], perm=[2,0,1]) means:
+    /// - output dim 0 comes from input dim 2
+    /// - output dim 1 comes from input dim 0
+    /// - output dim 2 comes from input dim 1
+    private func generateTransposeKernel(
+        entryPoint: String,
+        inputShape: [Int],
+        outputShape: [Int],
+        permutation: [Int],
+        metalType: String = "float"
+    ) -> String {
+        // If no permutation or shapes are empty, fall back to copy
+        guard !inputShape.isEmpty, !permutation.isEmpty else {
+            return generateCopyKernel(entryPoint: entryPoint, metalType: metalType)
+        }
+
+        let rank = inputShape.count
+
+        // Calculate input strides (row-major)
+        var inputStrides = [Int](repeating: 1, count: rank)
+        for i in stride(from: rank - 2, through: 0, by: -1) {
+            inputStrides[i] = inputStrides[i + 1] * inputShape[i + 1]
+        }
+
+        // Calculate output strides (row-major)
+        var outputStrides = [Int](repeating: 1, count: rank)
+        for i in stride(from: rank - 2, through: 0, by: -1) {
+            outputStrides[i] = outputStrides[i + 1] * outputShape[i + 1]
+        }
+
+        // Generate code to compute output coordinates from linear index
+        var coordCode = "uint remaining = tid;\n"
+        for i in stride(from: 0, to: rank, by: 1) {
+            coordCode += "        uint coord\(i) = remaining / \(outputStrides[i]);\n"
+            coordCode += "        remaining = remaining % \(outputStrides[i]);\n"
+        }
+
+        // Generate code to compute input linear index from permuted coordinates
+        // output[coord0, coord1, ...] = input[coord_perm[0], coord_perm[1], ...]
+        // So for input index, we use coord[permutation[i]] for each input dimension i
+        var inputIndexCode = "uint inputIdx = "
+        var terms: [String] = []
+        for i in 0..<rank {
+            let outputDim = permutation[i]  // Which output coordinate maps to input dim i
+            if inputStrides[i] != 0 {
+                terms.append("coord\(outputDim) * \(inputStrides[i])")
+            }
+        }
+        inputIndexCode += terms.isEmpty ? "0" : terms.joined(separator: " + ")
+        inputIndexCode += ";"
+
+        let totalElements = outputShape.reduce(1, *)
+
+        return """
+        kernel void \(entryPoint)(
+            device const \(metalType)* input [[buffer(0)]],
+            device \(metalType)* output [[buffer(1)]],
+            constant uint& count [[buffer(2)]],
+            uint tid [[thread_position_in_grid]])
+        {
+            if (tid >= count) return;
+
+            // Compute output coordinates from linear index
+            \(coordCode)
+            // Compute input index using permuted coordinates
+            \(inputIndexCode)
+
+            output[tid] = input[inputIdx];
         }
         """
     }
@@ -580,7 +664,7 @@ public final class CodeGenerator: @unchecked Sendable {
                 threadgroup float* tileA [[threadgroup(0)]],
                 threadgroup float* tileB [[threadgroup(1)]],
                 uint3 gid [[threadgroup_position_in_grid]],
-                uint2 tid [[thread_position_in_threadgroup]])
+                uint3 tid [[thread_position_in_threadgroup]])
             {
                 uint batch = gid.z;
                 if (batch >= batchCount) return;
