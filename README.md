@@ -27,7 +27,7 @@ MetalHLO draws inspiration from both [OpenXLA](https://github.com/openxla/xla) a
 
 ## Features
 
-- **100% StableHLO Conformance** — All 191 conformance tests pass (86 skipped for fundamental MPS limitations)
+- **StableHLO Conformance** — 191 of 277 conformance tests pass (86 skipped for MPS/Metal limitations)
 - **88% StableHLO Coverage** — 92 of 105 operations implemented
 - **~99% Practical ML Coverage** — All operations needed for production ML workloads
 - **Dual API** — Native Swift API + C API for C/C++ projects
@@ -670,10 +670,11 @@ MetalHLO includes a conformance test suite based on the [official StableHLO inte
 
 | Metric | Count |
 |--------|-------|
-| **Total Tests** | 191 |
-| **Passed** | 191 (100%) |
-| **Skipped** | 86 |
+| **Total Tests in Suite** | 277 |
+| **Tests Run** | 191 |
+| **Passed** | 191 |
 | **Failed** | 0 |
+| **Skipped** | 86 (MPS/Metal limitations) |
 
 ### Running Conformance Tests
 
