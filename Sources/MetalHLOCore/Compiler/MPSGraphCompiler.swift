@@ -463,6 +463,19 @@ public final class MPSGraphCompiler {
     }
 
     private func compileDot(_ op: HLOOperation) throws -> MPSGraphTensor {
+        // Check if operands are floating point - MPSGraph matmul only supports float/complex
+        guard let lhsType = typeMap[op.operands[0]] else {
+            throw CompilationError.undefinedValue(op.operands[0])
+        }
+
+        let supportedTypes: Set<MetalHLOCore.ElementType> = [.float16, .float32, .float64, .bfloat16]
+        if !supportedTypes.contains(lhsType.elementType) {
+            throw CompilationError.unsupportedOperation(
+                "dot with \(lhsType.elementType) operands is not supported by MPSGraph. " +
+                "Only floating-point types (float16, float32, float64, bfloat16) are supported."
+            )
+        }
+
         let lhs = try getOperand(op.operands[0])
         let rhs = try getOperand(op.operands[1])
         return graph.matrixMultiplication(primary: lhs, secondary: rhs, name: op.result)
@@ -471,6 +484,20 @@ public final class MPSGraphCompiler {
     private func compileDotGeneral(_ op: HLOOperation) throws -> MPSGraphTensor {
         let lhs = try getOperand(op.operands[0])
         let rhs = try getOperand(op.operands[1])
+
+        // Check if operands are floating point - MPSGraph matmul only supports float/complex
+        guard let lhsType = typeMap[op.operands[0]],
+              let rhsType = typeMap[op.operands[1]] else {
+            throw CompilationError.undefinedValue(op.operands[0])
+        }
+
+        let supportedTypes: Set<MetalHLOCore.ElementType> = [.float16, .float32, .float64, .bfloat16]
+        if !supportedTypes.contains(lhsType.elementType) || !supportedTypes.contains(rhsType.elementType) {
+            throw CompilationError.unsupportedOperation(
+                "dot_general with \(lhsType.elementType) operands is not supported by MPSGraph. " +
+                "Only floating-point types (float16, float32, float64, bfloat16) are supported."
+            )
+        }
 
         guard let dimNumbers = op.attributes.dotDimensionNumbers else {
             // No dimension numbers provided, fall back to simple matmul
@@ -1720,6 +1747,19 @@ public final class MPSGraphCompiler {
     }
 
     private func compileConvolution(_ op: HLOOperation) throws -> MPSGraphTensor {
+        // Check input type - convolution requires floating-point types
+        guard let inputType = typeMap[op.operands[0]] else {
+            throw CompilationError.undefinedValue(op.operands[0])
+        }
+
+        let supportedTypes: Set<MetalHLOCore.ElementType> = [.float16, .float32, .float64, .bfloat16]
+        if !supportedTypes.contains(inputType.elementType) {
+            throw CompilationError.unsupportedOperation(
+                "convolution with \(inputType.elementType) operands is not supported by MPSGraph. " +
+                "Only floating-point types (float16, float32, float64, bfloat16) are supported."
+            )
+        }
+
         let input = try getOperand(op.operands[0])
         let weights = try getOperand(op.operands[1])
 
@@ -2376,6 +2416,19 @@ public final class MPSGraphCompiler {
     }
 
     private func compileFFT(_ op: HLOOperation) throws -> MPSGraphTensor {
+        // Check input type - FFT requires floating-point types
+        guard let inputType = typeMap[op.operands[0]] else {
+            throw CompilationError.undefinedValue(op.operands[0])
+        }
+
+        let supportedTypes: Set<MetalHLOCore.ElementType> = [.float16, .float32, .float64, .bfloat16]
+        if !supportedTypes.contains(inputType.elementType) {
+            throw CompilationError.unsupportedOperation(
+                "fft with \(inputType.elementType) operands is not supported. " +
+                "Only floating-point types (float16, float32, float64, bfloat16) are supported."
+            )
+        }
+
         let input = try getOperand(op.operands[0])
 
         let fftType = op.attributes.fftType ?? .fft
@@ -2388,9 +2441,6 @@ public final class MPSGraphCompiler {
 
         // Create axes tensor from fft_length indices
         // By default, FFT over the last n dimensions where n = fftLength.count
-        guard let inputType = typeMap[op.operands[0]] else {
-            throw CompilationError.undefinedValue(op.operands[0])
-        }
 
         let rank = inputType.shape.count
         let numAxes = fftLength.isEmpty ? 1 : fftLength.count

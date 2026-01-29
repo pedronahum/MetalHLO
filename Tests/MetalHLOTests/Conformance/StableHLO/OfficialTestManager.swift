@@ -56,8 +56,11 @@ public final class OfficialTestManager: @unchecked Sendable {
     /// Fallback cache directory for downloaded tests
     private let cacheDir: URL
 
-    /// In-memory file list cache
+    /// In-memory file list cache (protected by cacheQueue)
     private var fileListCache: [StableHLOTestCategory: [String]] = [:]
+
+    /// Serial queue for thread-safe cache access
+    private let cacheQueue = DispatchQueue(label: "com.metalhlo.testmanager.cache")
 
     private init() {
         // First, try to find bundled tests in the project directory
@@ -125,8 +128,9 @@ public final class OfficialTestManager: @unchecked Sendable {
 
     /// List all available test files in a category
     public func listTestFiles(in category: StableHLOTestCategory) async throws -> [String] {
-        // Check memory cache
-        if let cached = fileListCache[category] {
+        // Check memory cache (thread-safe read)
+        let cached: [String]? = cacheQueue.sync { fileListCache[category] }
+        if let cached = cached {
             return cached
         }
 
@@ -135,7 +139,7 @@ public final class OfficialTestManager: @unchecked Sendable {
             if let files = try? FileManager.default.contentsOfDirectory(atPath: bundledDir.path) {
                 let mlirFiles = files.filter { $0.hasSuffix(".mlir") }.sorted()
                 if !mlirFiles.isEmpty {
-                    fileListCache[category] = mlirFiles
+                    cacheQueue.sync { fileListCache[category] = mlirFiles }
                     return mlirFiles
                 }
             }
@@ -167,8 +171,8 @@ public final class OfficialTestManager: @unchecked Sendable {
             return name
         }.sorted()
 
-        // Cache result
-        fileListCache[category] = files
+        // Cache result (thread-safe write)
+        cacheQueue.sync { fileListCache[category] = files }
 
         return files
     }

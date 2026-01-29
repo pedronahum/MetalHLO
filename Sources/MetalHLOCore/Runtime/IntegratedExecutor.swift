@@ -122,6 +122,10 @@ public final class IntegratedExecutor: @unchecked Sendable {
     public func execute(inputs: [String: MTLBuffer]) throws -> ExecutionResult {
         let startTime = DispatchTime.now()
 
+        // Serialize Metal execution to prevent concurrent access crashes
+        metalExecutionSemaphore.wait()
+        defer { metalExecutionSemaphore.signal() }
+
         // Validate inputs
         if config.validateInputs {
             try executable.validateInputs(inputs)

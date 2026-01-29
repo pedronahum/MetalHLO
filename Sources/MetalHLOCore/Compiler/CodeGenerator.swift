@@ -174,7 +174,7 @@ public final class CodeGenerator: @unchecked Sendable {
         )
 
         // Calculate shared memory size
-        let sharedMemorySize = calculateSharedMemorySize(type: op.type, tuning: tuning)
+        let sharedMemorySize = calculateSharedMemorySize(type: op.type, tuning: tuning, elementType: elementType)
 
         return KernelSpec(
             opID: op.id,
@@ -371,7 +371,7 @@ public final class CodeGenerator: @unchecked Sendable {
 
         // Matrix operations
         case .dot, .dotGeneral:
-            return generateMatMulSource(inputShapes: inputShapes, attributes: attributes)
+            return generateMatMulSource(inputShapes: inputShapes, attributes: attributes, elementType: elementType)
 
         // Reduction operations
         case .reduce:
@@ -629,18 +629,24 @@ public final class CodeGenerator: @unchecked Sendable {
         """
     }
 
-    /// Generates matmul source.
-    private func generateMatMulSource(inputShapes: [[Int]], attributes: HLOAttributes) -> (String, String, TuningConfig?) {
+    /// Generates matmul source with support for all numeric types.
+    private func generateMatMulSource(inputShapes: [[Int]], attributes: HLOAttributes, elementType: ElementType = .float32) -> (String, String, TuningConfig?) {
         guard inputShapes.count >= 2 else {
-            return (generateCopyKernel(entryPoint: "kernel_matmul"), "kernel_matmul", nil)
+            let metalType = metalTypeName(for: elementType)
+            return (generateCopyKernel(entryPoint: "kernel_matmul", metalType: metalType), "kernel_matmul", nil)
         }
 
         let lhsShape = inputShapes[0]
+        let metalType = metalTypeName(for: elementType)
+        let isFloat = isFloatType(elementType)
 
         // Calculate batch size (product of all dimensions except last 2)
         let batchSize = lhsShape.count > 2 ? lhsShape.dropLast(2).reduce(1, *) : 1
 
         let tuning = TuningConfig.matmul
+
+        // Zero value depends on type
+        let zeroValue = isFloat ? "0.0f" : "0"
 
         // Use batched kernel if we have batch dimensions
         let source: String
@@ -653,16 +659,17 @@ public final class CodeGenerator: @unchecked Sendable {
 
             // Batched matrix multiplication kernel
             // Handles tensors of shape [...batch_dims, M, K] x [...batch_dims, K, N] -> [...batch_dims, M, N]
+            // Element type: \(metalType)
             kernel void kernel_matmul(
-                device const float* A [[buffer(0)]],
-                device const float* B [[buffer(1)]],
-                device float* C [[buffer(2)]],
+                device const \(metalType)* A [[buffer(0)]],
+                device const \(metalType)* B [[buffer(1)]],
+                device \(metalType)* C [[buffer(2)]],
                 constant uint& M [[buffer(3)]],
                 constant uint& N [[buffer(4)]],
                 constant uint& K [[buffer(5)]],
                 constant uint& batchCount [[buffer(6)]],
-                threadgroup float* tileA [[threadgroup(0)]],
-                threadgroup float* tileB [[threadgroup(1)]],
+                threadgroup \(metalType)* tileA [[threadgroup(0)]],
+                threadgroup \(metalType)* tileB [[threadgroup(1)]],
                 uint3 gid [[threadgroup_position_in_grid]],
                 uint3 tid [[thread_position_in_threadgroup]])
             {
@@ -677,11 +684,11 @@ public final class CodeGenerator: @unchecked Sendable {
                 uint matrixSizeB = K * N;
                 uint matrixSizeC = M * N;
 
-                device const float* batchA = A + batch * matrixSizeA;
-                device const float* batchB = B + batch * matrixSizeB;
-                device float* batchC = C + batch * matrixSizeC;
+                device const \(metalType)* batchA = A + batch * matrixSizeA;
+                device const \(metalType)* batchB = B + batch * matrixSizeB;
+                device \(metalType)* batchC = C + batch * matrixSizeC;
 
-                float sum = 0.0f;
+                \(metalType) sum = \(zeroValue);
 
                 for (uint t = 0; t < (K + TILE_SIZE - 1) / TILE_SIZE; t++) {
                     // Load tile of A
@@ -690,7 +697,7 @@ public final class CodeGenerator: @unchecked Sendable {
                     if (aRow < M && aCol < K) {
                         tileA[tid.y * TILE_SIZE + tid.x] = batchA[aRow * K + aCol];
                     } else {
-                        tileA[tid.y * TILE_SIZE + tid.x] = 0.0f;
+                        tileA[tid.y * TILE_SIZE + tid.x] = \(zeroValue);
                     }
 
                     // Load tile of B
@@ -699,7 +706,7 @@ public final class CodeGenerator: @unchecked Sendable {
                     if (bRow < K && bCol < N) {
                         tileB[tid.y * TILE_SIZE + tid.x] = batchB[bRow * N + bCol];
                     } else {
-                        tileB[tid.y * TILE_SIZE + tid.x] = 0.0f;
+                        tileB[tid.y * TILE_SIZE + tid.x] = \(zeroValue);
                     }
 
                     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -724,22 +731,24 @@ public final class CodeGenerator: @unchecked Sendable {
 
             #define TILE_SIZE 32
 
+            // Matrix multiplication kernel
+            // Element type: \(metalType)
             kernel void kernel_matmul(
-                device const float* A [[buffer(0)]],
-                device const float* B [[buffer(1)]],
-                device float* C [[buffer(2)]],
+                device const \(metalType)* A [[buffer(0)]],
+                device const \(metalType)* B [[buffer(1)]],
+                device \(metalType)* C [[buffer(2)]],
                 constant uint& M [[buffer(3)]],
                 constant uint& N [[buffer(4)]],
                 constant uint& K [[buffer(5)]],
-                threadgroup float* tileA [[threadgroup(0)]],
-                threadgroup float* tileB [[threadgroup(1)]],
+                threadgroup \(metalType)* tileA [[threadgroup(0)]],
+                threadgroup \(metalType)* tileB [[threadgroup(1)]],
                 uint2 gid [[threadgroup_position_in_grid]],
                 uint2 tid [[thread_position_in_threadgroup]])
             {
                 uint row = gid.y * TILE_SIZE + tid.y;
                 uint col = gid.x * TILE_SIZE + tid.x;
 
-                float sum = 0.0f;
+                \(metalType) sum = \(zeroValue);
 
                 for (uint t = 0; t < (K + TILE_SIZE - 1) / TILE_SIZE; t++) {
                     // Load tile of A
@@ -748,7 +757,7 @@ public final class CodeGenerator: @unchecked Sendable {
                     if (aRow < M && aCol < K) {
                         tileA[tid.y * TILE_SIZE + tid.x] = A[aRow * K + aCol];
                     } else {
-                        tileA[tid.y * TILE_SIZE + tid.x] = 0.0f;
+                        tileA[tid.y * TILE_SIZE + tid.x] = \(zeroValue);
                     }
 
                     // Load tile of B
@@ -757,7 +766,7 @@ public final class CodeGenerator: @unchecked Sendable {
                     if (bRow < K && bCol < N) {
                         tileB[tid.y * TILE_SIZE + tid.x] = B[bRow * N + bCol];
                     } else {
-                        tileB[tid.y * TILE_SIZE + tid.x] = 0.0f;
+                        tileB[tid.y * TILE_SIZE + tid.x] = \(zeroValue);
                     }
 
                     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1120,37 +1129,25 @@ public final class CodeGenerator: @unchecked Sendable {
     /// Example: ops = [add, multiply] with inputs [a, b, c]
     ///   x = a + b (consumes inputs 0 and 1)
     ///   x = x * c (uses previous result and input 2)
+    ///
+    /// IMPORTANT: The kernel buffer indices MUST match what buildBindings() provides:
+    /// - Input buffers at indices 0..<inputShapes.count
+    /// - Output buffer at index inputShapes.count
+    /// - Count scalar at index inputShapes.count + 1
     private func generateElementwiseChainSource(_ ops: [HLOOpKind], inputShapes: [[Int]]) -> (String, String, TuningConfig?) {
-        // Count required inputs based on operations
-        var inputsNeeded = 0
-        var hasCurrentValue = false
-
-        for op in ops {
-            if isBinaryOp(op) {
-                if hasCurrentValue {
-                    inputsNeeded += 1  // Need one more for the right operand
-                } else {
-                    inputsNeeded += 2  // Need two for first binary op
-                }
-            } else {
-                if !hasCurrentValue {
-                    inputsNeeded += 1  // Need one input for unary if no current value
-                }
-            }
-            hasCurrentValue = true
-        }
-
-        // Ensure at least 1 input
-        inputsNeeded = max(inputsNeeded, 1)
+        // Use the actual number of inputs passed to the operation.
+        // This MUST match op.inputs.count used by buildBindings() to ensure
+        // buffer indices are aligned between kernel signature and buffer bindings.
+        let inputCount = max(inputShapes.count, 1)
 
         // Generate kernel parameters for all inputs
         var inputParams: [String] = []
-        for i in 0..<inputsNeeded {
+        for i in 0..<inputCount {
             inputParams.append("device const float* input\(i) [[buffer(\(i))]]")
         }
 
-        // Output buffer comes after inputs
-        let outputBufferIndex = inputsNeeded
+        // Output buffer comes after inputs (must match buildBindings layout)
+        let outputBufferIndex = inputCount
 
         // Generate the operation code
         var code = ""
@@ -1187,7 +1184,7 @@ public final class CodeGenerator: @unchecked Sendable {
         }
 
         // If no operations, just copy input
-        if !hasX && inputsNeeded > 0 {
+        if !hasX && inputCount > 0 {
             code = "float x = input0[tid];\n"
         }
 
@@ -1896,18 +1893,34 @@ public final class CodeGenerator: @unchecked Sendable {
 
     // MARK: - Shared Memory
 
+    /// Returns the byte size of an element type.
+    private func elementByteSize(for elementType: ElementType) -> Int {
+        switch elementType {
+        case .float64, .int64, .uint64:
+            return 8
+        case .float32, .int32, .uint32:
+            return 4
+        case .float16, .bfloat16, .int16, .uint16:
+            return 2
+        case .int8, .uint8, .int1:
+            return 1
+        }
+    }
+
     /// Calculates shared memory size for an operation.
-    private func calculateSharedMemorySize(type: FusedOpType, tuning: TuningConfig?) -> Int {
+    private func calculateSharedMemorySize(type: FusedOpType, tuning: TuningConfig?, elementType: ElementType = .float32) -> Int {
+        let elemSize = elementByteSize(for: elementType)
+
         switch type {
         case .original(let opKind):
             if opKind == .dot || opKind == .dotGeneral {
                 let tileSize = tuning?.tileM ?? 32
-                return 2 * tileSize * tileSize * MemoryLayout<Float>.size
+                return 2 * tileSize * tileSize * elemSize
             }
             // Reduce kernel uses simple sequential reduction per thread, no shared memory needed
         case .fusedMatMulBiasAct:
             let tileSize = tuning?.tileM ?? 32
-            return 2 * tileSize * tileSize * MemoryLayout<Float>.size
+            return 2 * tileSize * tileSize * elemSize
         default:
             break
         }

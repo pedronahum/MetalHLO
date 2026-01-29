@@ -639,6 +639,18 @@ The following types are not supported due to Metal/MPS limitations:
 | Distributed/collective ops | Not supported | Single-device focus (all_gather, all_reduce, etc.) |
 | Token operations | Not supported | (after_all, infeed, outfeed) - I/O primitives |
 
+### Operation-Specific Type Restrictions
+
+Some operations only support floating-point types in MPSGraph:
+
+| Operation | Supported Types | Excluded Types |
+|-----------|-----------------|----------------|
+| `dot`, `dot_general` | `f16`, `f32`, `f64`, `bf16` | All integer types (MPSGraph matmul is float-only) |
+| `convolution` | `f16`, `f32`, `f64`, `bf16` | All integer types (MPSGraph conv is float-only) |
+| `fft` | `f16`, `f32`, `f64`, `bf16` | All integer types (MPSGraph FFT is float-only) |
+| `triangular_solve` | Not implemented | Requires MPSMatrix bridge |
+| `cholesky` | Not implemented | Requires MPSMatrix bridge |
+
 ### Operation-Specific Limitations
 
 | Operation | Status | Notes |
@@ -679,8 +691,8 @@ MetalHLO includes a conformance test suite based on the [official StableHLO inte
 ### Running Conformance Tests
 
 ```bash
-# Run all conformance tests
-swift test --filter "Official"
+# Run all conformance tests (recommended: use --no-parallel for stability)
+swift test --filter "Official" --no-parallel
 
 # Run specific operation tests
 swift test --filter "OfficialInterpretTests/testAdd"
@@ -709,11 +721,15 @@ The following test categories are skipped due to fundamental MPS/Metal limitatio
 |----------|--------|
 | Complex types (`complex64`, `complex128`) | MPS doesn't support complex arithmetic |
 | Small integers (`i2`, `i4`, `ui2`, `ui4`) | Incompatible overflow semantics when promoted |
+| Integer matmul (`dot`, `dot_general` with int types) | MPSGraph matmul only supports floating-point |
+| Integer convolution | MPSGraph convolution only supports floating-point |
+| Integer FFT | MPSGraph FFT only supports floating-point |
 | Integer overflow tests | Float arithmetic doesn't wrap on overflow like integers |
 | Integer division tests | Float division doesn't truncate like integer division |
 | Large integer constants | Values like `INT64_MAX` can't be exactly represented in Float32 |
 | Exotic float types (`f4E2M1FN`, etc.) | Not supported by Metal |
 | Unsigned integer bitwise ops | MPS treats all integers as signed |
+| 64-bit integer bitwise ops | MPS doesn't support 64-bit integer bitwise operations |
 
 ## Performance Tips
 

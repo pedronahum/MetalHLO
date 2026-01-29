@@ -287,6 +287,44 @@ struct OfficialInterpretTests {
         #expect(passed > 0, "At least one dot_general test should pass")
     }
 
+    @Test("dot_general.mlir - Integer matmul with integrated backend")
+    func testDotGeneralIntegerIntegrated() async throws {
+        // Use the integrated backend which now supports native integer matmul
+        let config = CompilationConfig(optimizationLevel: .O0)
+        let runner = try InterpretTestRunner(config: config)
+        let results = try await runner.runTestFile("dot_general.mlir", category: .interpret)
+
+        // Print detailed results
+        var integerPassed = 0
+        var integerSkipped = 0
+        var integerFailed = 0
+
+        for result in results {
+            // Check if this is an integer test (si64, si32, etc.)
+            let isIntegerTest = result.testName.contains("si64") ||
+                               result.testName.contains("si32") ||
+                               result.testName.contains("ui64") ||
+                               result.testName.contains("ui32")
+
+            if isIntegerTest {
+                print("Integer test: \(result.summary)")
+                if result.errorMessage?.contains("SKIPPED") == true {
+                    integerSkipped += 1
+                } else if result.passed {
+                    integerPassed += 1
+                } else {
+                    integerFailed += 1
+                }
+            }
+        }
+
+        print("\n=== Integer Matmul Summary (Integrated Backend) ===")
+        print("Passed: \(integerPassed), Skipped: \(integerSkipped), Failed: \(integerFailed)")
+
+        // With the integrated backend, integer matmul tests should run (not skip)
+        #expect(integerPassed > 0 || integerFailed > 0, "Integer matmul tests should run with integrated backend")
+    }
+
     // MARK: - Control Flow
 
     @Test("select.mlir - Select operation")

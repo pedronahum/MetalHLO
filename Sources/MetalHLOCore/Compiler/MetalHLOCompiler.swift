@@ -298,6 +298,15 @@ public final class MetalHLOCompiler: @unchecked Sendable {
             return cached
         }
 
+        // Serialize Metal compilation to prevent concurrent access crashes
+        metalExecutionSemaphore.wait()
+        defer { metalExecutionSemaphore.signal() }
+
+        // Double-check cache after acquiring semaphore
+        if let cached = cache.getCachedPipeline(hash: sourceHash) {
+            return cached
+        }
+
         // Compile Metal source
         let compileOptions = MTLCompileOptions()
         compileOptions.fastMathEnabled = config.codeGeneratorConfig.fastMath

@@ -303,6 +303,36 @@ public final class InterpretTestRunner: @unchecked Sendable {
             return "Exotic float type not supported by Metal"
         }
 
+        // Skip integer matmul (dot/dot_general) - MPSGraph only supports floating-point matmul
+        // BUT: When using the integrated backend (config != nil), we support integer matmul natively
+        let matmulOps = ["dot", "dot_general"]
+        if matmulOps.contains(testCase.operation) {
+            let intTypes = ["i8", "i16", "i32", "i64", "ui8", "ui16", "ui32", "ui64"]
+            if testCase.inputs.contains(where: { intTypes.contains($0.elementType) }) {
+                // Only skip if NOT using integrated backend
+                if config == nil {
+                    return "MPSGraph matmul only supports floating-point types (use integrated backend for integer matmul)"
+                }
+                // Integrated backend supports integer matmul - don't skip
+            }
+        }
+
+        // Skip integer convolution - MPSGraph only supports floating-point convolution
+        if testCase.operation == "convolution" {
+            let intTypes = ["i8", "i16", "i32", "i64", "ui8", "ui16", "ui32", "ui64"]
+            if testCase.inputs.contains(where: { intTypes.contains($0.elementType) }) {
+                return "MPSGraph convolution only supports floating-point types"
+            }
+        }
+
+        // Skip integer FFT - MPSGraph only supports floating-point FFT
+        if testCase.operation == "fft" {
+            let intTypes = ["i8", "i16", "i32", "i64", "ui8", "ui16", "ui32", "ui64"]
+            if testCase.inputs.contains(where: { intTypes.contains($0.elementType) }) {
+                return "MPSGraph FFT only supports floating-point types"
+            }
+        }
+
         // Skip bitwise integer operations that use types needing promotion
         // These operations require integer types and can't use float promotion
         let bitwiseIntOps = ["shift_left", "shift_right_arithmetic", "shift_right_logical",
@@ -388,8 +418,13 @@ public final class InterpretTestRunner: @unchecked Sendable {
     }
 
     /// Check if dot_general needs type promotion for integer inputs
+    /// When using the integrated backend (config != nil), we support native integer matmul
     private func needsDotGeneralPromotion(_ testCase: InterpretTestCase) -> Bool {
-        if testCase.operation == "dot_general" {
+        // Integrated backend supports native integer matmul - no promotion needed
+        if config != nil {
+            return false
+        }
+        if testCase.operation == "dot_general" || testCase.operation == "dot" {
             let intTypes = ["i8", "i16", "i32", "i64", "ui8", "ui16", "ui32", "ui64"]
             return testCase.inputs.contains { intTypes.contains($0.elementType) }
         }
@@ -398,6 +433,29 @@ public final class InterpretTestRunner: @unchecked Sendable {
 
     /// Check if any type promotion is needed for this test
     private func needsTypePromotion(_ testCase: InterpretTestCase) -> Bool {
+        // When using integrated backend for matmul, we support native integer types
+        let isMatmul = testCase.operation == "dot" || testCase.operation == "dot_general"
+        let intTypes = ["i8", "i16", "i32", "i64", "ui8", "ui16", "ui32", "ui64"]
+        let hasIntegerInputs = testCase.inputs.contains { intTypes.contains($0.elementType) }
+
+        if isMatmul && hasIntegerInputs && config != nil {
+            // Integrated backend supports native integer matmul - no promotion needed
+            // But we may still need float promotions (f64->f32, bf16->f32)
+            for input in testCase.inputs {
+                let elemType = input.elementType
+                if elemType == "f64" || elemType == "bf16" || elemType.hasPrefix("f8") {
+                    return true
+                }
+            }
+            if let expected = testCase.expected {
+                let elemType = expected.elementType
+                if elemType == "f64" || elemType == "bf16" || elemType.hasPrefix("f8") {
+                    return true
+                }
+            }
+            return false
+        }
+
         // Operations that require integer types can't use float promotion
         if requiresIntegerTypes(testCase.operation) {
             // Only do float type promotions (f64->f32, f8->f16), NOT integer->float

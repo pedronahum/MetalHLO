@@ -7,6 +7,11 @@ import Foundation
 import Metal
 @preconcurrency import MetalPerformanceShadersGraph
 
+/// Global semaphore to serialize Metal/MPSGraph operations.
+/// Metal/MPSGraph operations can crash when multiple instances execute concurrently on the same device.
+/// This limits concurrency to prevent race conditions in the Metal driver or MPS framework.
+public let metalExecutionSemaphore = DispatchSemaphore(value: 1)
+
 /// Manages Metal device, compilation, and execution.
 ///
 /// `MetalExecutor` is the central runtime component that handles
@@ -72,6 +77,15 @@ public final class MetalExecutor: @unchecked Sendable {
         // Check cache first - use content hash to avoid returning wrong cached results
         // for different modules with the same name
         let cacheKey = "\(module.name)_\(module.description.hashValue)"
+        if let cached = compilationCache.get(key: cacheKey) {
+            return cached
+        }
+
+        // Serialize MPSGraph compilation to prevent concurrent access crashes
+        metalExecutionSemaphore.wait()
+        defer { metalExecutionSemaphore.signal() }
+
+        // Double-check cache after acquiring semaphore (another thread may have compiled)
         if let cached = compilationCache.get(key: cacheKey) {
             return cached
         }
@@ -210,6 +224,10 @@ public final class MetalExecutor: @unchecked Sendable {
         }
 
         let startTime = CFAbsoluteTimeGetCurrent()
+
+        // Serialize MPSGraph operations to prevent concurrent execution crashes
+        metalExecutionSemaphore.wait()
+        defer { metalExecutionSemaphore.signal() }
 
         // Create input tensor data
         var inputDict: [MPSGraphTensor: MPSGraphTensorData] = [:]
