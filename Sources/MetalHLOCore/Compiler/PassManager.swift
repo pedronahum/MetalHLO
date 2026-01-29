@@ -470,10 +470,9 @@ final class ProducerConsumerFusionPass: OptimizationPass, @unchecked Sendable {
     let name = "producer-consumer-fusion"
     let invalidates: Set<AnalysisType> = [.lifetimes, .patterns]
 
-    // NOTE: emitCustomCalls disabled because CodeGenerator doesn't handle fused_elementwise
-    // custom calls - it falls back to a copy kernel which produces incorrect results.
-    // The pass still reorders operations and MPSGraph handles actual kernel fusion.
-    private let fusion = ProducerConsumerFusion(maxFusionSize: 50, emitCustomCalls: false)
+    // emitCustomCalls enabled since FusedOp.init(from:) maps custom_call to FusedOpType
+    // and CodeGenerator can generate proper kernels for all fused operation types.
+    private let fusion = ProducerConsumerFusion(maxFusionSize: 50, emitCustomCalls: true)
 
     func run(on function: HLOFunction, analysis: AnalysisResults) -> PassResult {
         let result = fusion.fuse(function)
@@ -487,8 +486,8 @@ final class SiblingFusionPassWrapper: OptimizationPass, @unchecked Sendable {
     let name = "sibling-fusion"
     let invalidates: Set<AnalysisType> = [.lifetimes, .patterns]
 
-    // NOTE: emitCustomCalls disabled for same reason as producer-consumer-fusion above.
-    private let fusion = SiblingFusion(maxSiblings: 8, emitCustomCalls: false)
+    // emitCustomCalls enabled since FusedOp.init(from:) maps custom_call to FusedOpType.
+    private let fusion = SiblingFusion(maxSiblings: 8, emitCustomCalls: true)
 
     func run(on function: HLOFunction, analysis: AnalysisResults) -> PassResult {
         let result = fusion.fuse(function)
@@ -544,6 +543,9 @@ final class TransformerBlockFusionPass: OptimizationPass, @unchecked Sendable {
 }
 
 /// Attention fusion pass.
+///
+/// Detects Q @ K^T -> softmax -> @ V patterns and replaces them with
+/// a fused_scaled_dot_product_attention custom_call.
 final class AttentionFusionPass: OptimizationPass, @unchecked Sendable {
     let name = "attention-fusion"
     let invalidates: Set<AnalysisType> = [.lifetimes, .patterns]
@@ -553,11 +555,107 @@ final class AttentionFusionPass: OptimizationPass, @unchecked Sendable {
         if attentionPatterns.isEmpty {
             return .unchanged(function)
         }
-        return .unchanged(function)
+
+        var newOperations = function.operations
+        var opsToRemove = Set<Int>()
+        var changed = false
+
+        for pattern in attentionPatterns {
+            // Pattern has [qk_matmul_idx, softmax_idx, root_idx]
+            guard pattern.operationIndices.count >= 3 else { continue }
+
+            let qkMatmulIdx = pattern.operationIndices[0]
+            let softmaxIdx = pattern.operationIndices[1]
+            let rootIdx = pattern.rootIndex  // final matmul (attention @ V)
+
+            guard qkMatmulIdx < function.operations.count,
+                  softmaxIdx < function.operations.count,
+                  rootIdx < function.operations.count else { continue }
+
+            let qkMatmul = function.operations[qkMatmulIdx]
+            let rootOp = function.operations[rootIdx]
+
+            // Get Q and K from the first matmul
+            guard qkMatmul.operands.count >= 2 else { continue }
+            let q = qkMatmul.operands[0]
+            let k = qkMatmul.operands[1]
+
+            // Get V from the root matmul (second operand)
+            guard rootOp.operands.count >= 2 else { continue }
+            let v = rootOp.operands[1]
+
+            // Compute scale from head dimension if available
+            let scale: Float
+            if let headDim = pattern.metadata.headDim {
+                scale = 1.0 / Float(headDim).squareRoot()
+            } else {
+                scale = 1.0
+            }
+
+            // Build backend config JSON
+            let configDict: [String: Any] = [
+                "scale": scale,
+                "is_causal": pattern.metadata.causalMask ?? false,
+                "has_mask": false
+            ]
+            let backendConfig = (try? JSONSerialization.data(withJSONObject: configDict))
+                .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+
+            // Create custom_call attributes
+            var attrs = HLOAttributes()
+            attrs.callTargetName = FusedScaledDotProductAttentionHandler.targetName
+            attrs.backendConfig = backendConfig
+
+            // Create the fused operation
+            let fusedOp = HLOOperation(
+                result: rootOp.result,
+                kind: .customCall,
+                operands: [q, k, v],
+                resultType: rootOp.resultType,
+                attributes: attrs
+            )
+
+            // Replace the root operation with the fused one
+            newOperations[rootIdx] = fusedOp
+
+            // Mark intermediate operations for removal
+            opsToRemove.insert(qkMatmulIdx)
+            opsToRemove.insert(softmaxIdx)
+            changed = true
+        }
+
+        if !changed {
+            return .unchanged(function)
+        }
+
+        // Filter out removed operations
+        let filteredOps = newOperations.enumerated()
+            .filter { !opsToRemove.contains($0.offset) }
+            .map { $0.element }
+
+        let newFunction = HLOFunction(
+            name: function.name,
+            inputs: function.inputs,
+            outputTypes: function.outputTypes,
+            operations: filteredOps,
+            returnValues: function.returnValues
+        )
+
+        return PassResult(
+            function: newFunction,
+            changed: true,
+            stats: [
+                "operationsRemoved": opsToRemove.count,
+                "operationsFused": attentionPatterns.count
+            ]
+        )
     }
 }
 
 /// FFN fusion pass.
+///
+/// Detects Feed-Forward Network patterns (up_proj → activation → down_proj)
+/// and replaces them with a fused_ffn custom_call.
 final class FFNFusionPass: OptimizationPass, @unchecked Sendable {
     let name = "ffn-fusion"
     let invalidates: Set<AnalysisType> = [.lifetimes, .patterns]
@@ -567,11 +665,134 @@ final class FFNFusionPass: OptimizationPass, @unchecked Sendable {
         if ffnPatterns.isEmpty {
             return .unchanged(function)
         }
-        return .unchanged(function)
+
+        var newOperations = function.operations
+        var opsToRemove = Set<Int>()
+        var changed = false
+
+        // Build op index map for looking up defining operations
+        var opByResult: [TensorID: (op: HLOOperation, index: Int)] = [:]
+        for (index, op) in function.operations.enumerated() {
+            opByResult[op.result] = (op, index)
+        }
+
+        for pattern in ffnPatterns {
+            // FFN pattern has: [upMatmulIdx, activationIdx, downMatmulIdx (root)]
+            guard pattern.operationIndices.count >= 3 else { continue }
+
+            let upMatmulIdx = pattern.operationIndices[0]
+            let activationIdx = pattern.operationIndices[1]
+            let rootIdx = pattern.rootIndex  // down projection matmul
+
+            guard upMatmulIdx < function.operations.count,
+                  activationIdx < function.operations.count,
+                  rootIdx < function.operations.count else { continue }
+
+            let upMatmul = function.operations[upMatmulIdx]
+            let activationOp = function.operations[activationIdx]
+            let downMatmul = function.operations[rootIdx]
+
+            // Extract operands
+            guard upMatmul.operands.count >= 2,
+                  downMatmul.operands.count >= 2 else { continue }
+
+            let input = upMatmul.operands[0]      // Input to FFN
+            let upWeight = upMatmul.operands[1]   // Up projection weight
+            let downWeight = downMatmul.operands[1]  // Down projection weight
+
+            // Determine activation type from the activation operation
+            let activationType: String
+            switch activationOp.kind {
+            case .tanh:
+                activationType = "tanh"
+            case .logistic:
+                activationType = "sigmoid"
+            case .customCall:
+                if let targetName = activationOp.attributes.callTargetName {
+                    if targetName.contains("gelu") {
+                        activationType = "gelu"
+                    } else if targetName.contains("silu") {
+                        activationType = "silu"
+                    } else if targetName.contains("relu") {
+                        activationType = "relu"
+                    } else {
+                        activationType = "gelu"  // Default
+                    }
+                } else {
+                    activationType = "gelu"
+                }
+            default:
+                activationType = "gelu"  // Default activation
+            }
+
+            // Get hidden dimension from metadata if available
+            let hiddenDim = pattern.metadata.hiddenDim ?? 0
+
+            // Build backend config JSON
+            let configDict: [String: Any] = [
+                "activation": activationType,
+                "hidden_dim": hiddenDim,
+                "is_gated": pattern.type == .gatedFFN
+            ]
+            let backendConfig = (try? JSONSerialization.data(withJSONObject: configDict))
+                .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+
+            // Create custom_call attributes
+            var attrs = HLOAttributes()
+            attrs.callTargetName = "fused_ffn"
+            attrs.backendConfig = backendConfig
+
+            // Create the fused operation
+            // Operands: [input, up_weight, down_weight]
+            let fusedOp = HLOOperation(
+                result: downMatmul.result,
+                kind: .customCall,
+                operands: [input, upWeight, downWeight],
+                resultType: downMatmul.resultType,
+                attributes: attrs
+            )
+
+            // Replace the root operation with the fused one
+            newOperations[rootIdx] = fusedOp
+
+            // Mark intermediate operations for removal
+            opsToRemove.insert(upMatmulIdx)
+            opsToRemove.insert(activationIdx)
+            changed = true
+        }
+
+        if !changed {
+            return .unchanged(function)
+        }
+
+        // Filter out removed operations
+        let filteredOps = newOperations.enumerated()
+            .filter { !opsToRemove.contains($0.offset) }
+            .map { $0.element }
+
+        let newFunction = HLOFunction(
+            name: function.name,
+            inputs: function.inputs,
+            outputTypes: function.outputTypes,
+            operations: filteredOps,
+            returnValues: function.returnValues
+        )
+
+        return PassResult(
+            function: newFunction,
+            changed: true,
+            stats: [
+                "operationsRemoved": opsToRemove.count,
+                "operationsFused": ffnPatterns.count
+            ]
+        )
     }
 }
 
 /// Norm fusion pass.
+///
+/// Detects layer normalization and RMS normalization patterns and replaces
+/// them with fused custom_call operations.
 final class NormFusionPass: OptimizationPass, @unchecked Sendable {
     let name = "norm-fusion"
     let invalidates: Set<AnalysisType> = [.lifetimes, .patterns]
@@ -581,11 +802,138 @@ final class NormFusionPass: OptimizationPass, @unchecked Sendable {
         if normPatterns.isEmpty {
             return .unchanged(function)
         }
-        return .unchanged(function)
+
+        var newOperations = function.operations
+        var opsToRemove = Set<Int>()
+        var changed = false
+
+        // Build op index map
+        var opByResult: [TensorID: (op: HLOOperation, index: Int)] = [:]
+        for (index, op) in function.operations.enumerated() {
+            opByResult[op.result] = (op, index)
+        }
+
+        for pattern in normPatterns {
+            guard !pattern.operationIndices.isEmpty else { continue }
+
+            let rootIdx = pattern.rootIndex
+            guard rootIdx < function.operations.count else { continue }
+
+            let rootOp = function.operations[rootIdx]
+
+            // Determine the target name based on pattern type
+            let targetName: String
+            if pattern.type == .layerNorm {
+                targetName = FusedLayerNormHandler.targetName
+            } else {
+                targetName = FusedRMSNormHandler.targetName
+            }
+
+            // Find the input tensor (first operation's input in the pattern)
+            let firstOpIdx = pattern.operationIndices.first!
+            guard firstOpIdx < function.operations.count else { continue }
+            let firstOp = function.operations[firstOpIdx]
+            guard !firstOp.operands.isEmpty else { continue }
+            let input = firstOp.operands[0]
+
+            // Try to find scale/gamma and bias/beta from pattern operations
+            // These are typically the last multiplication and addition
+            var operands: [TensorID] = [input]
+
+            // For layer norm we need gamma (scale) and beta (offset)
+            // For RMS norm we just need weight (scale)
+            // Look for constant tensors used in multiplications and additions
+            for idx in pattern.operationIndices.reversed() {
+                let op = function.operations[idx]
+                if op.kind == .multiply && op.operands.count >= 2 {
+                    // Second operand is likely gamma/weight
+                    if op.operands[1] != input && !operands.contains(op.operands[1]) {
+                        operands.append(op.operands[1])
+                        break
+                    }
+                }
+            }
+
+            // For layer norm, also look for bias
+            if pattern.type == .layerNorm {
+                for idx in pattern.operationIndices.reversed() {
+                    let op = function.operations[idx]
+                    if op.kind == .add && op.operands.count >= 2 {
+                        if op.operands[1] != input && !operands.contains(op.operands[1]) {
+                            operands.append(op.operands[1])
+                            break
+                        }
+                    }
+                }
+            }
+
+            // Get epsilon from metadata or use default
+            let eps = pattern.metadata.epsilon ?? 1e-5
+
+            // Build backend config
+            let configDict: [String: Any] = [
+                "eps": eps,
+                "axes": [-1]  // Default to last axis
+            ]
+            let backendConfig = (try? JSONSerialization.data(withJSONObject: configDict))
+                .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+
+            // Create custom_call attributes
+            var attrs = HLOAttributes()
+            attrs.callTargetName = targetName
+            attrs.backendConfig = backendConfig
+
+            // Create the fused operation
+            let fusedOp = HLOOperation(
+                result: rootOp.result,
+                kind: .customCall,
+                operands: operands,
+                resultType: rootOp.resultType,
+                attributes: attrs
+            )
+
+            // Replace the root operation
+            newOperations[rootIdx] = fusedOp
+
+            // Mark intermediate operations for removal
+            for idx in pattern.operationIndices where idx != rootIdx {
+                opsToRemove.insert(idx)
+            }
+            changed = true
+        }
+
+        if !changed {
+            return .unchanged(function)
+        }
+
+        // Filter out removed operations
+        let filteredOps = newOperations.enumerated()
+            .filter { !opsToRemove.contains($0.offset) }
+            .map { $0.element }
+
+        let newFunction = HLOFunction(
+            name: function.name,
+            inputs: function.inputs,
+            outputTypes: function.outputTypes,
+            operations: filteredOps,
+            returnValues: function.returnValues
+        )
+
+        return PassResult(
+            function: newFunction,
+            changed: true,
+            stats: [
+                "operationsRemoved": opsToRemove.count,
+                "operationsFused": normPatterns.count
+            ]
+        )
     }
 }
 
 /// GELU fusion pass.
+///
+/// Detects GELU activation patterns (x * 0.5 * (1 + tanh(...))) and replaces
+/// them with a fused_gelu custom_call.
 final class GELUFusionPass: OptimizationPass, @unchecked Sendable {
     let name = "gelu-fusion"
     let invalidates: Set<AnalysisType> = [.lifetimes, .patterns]
@@ -595,11 +943,90 @@ final class GELUFusionPass: OptimizationPass, @unchecked Sendable {
         if geluPatterns.isEmpty {
             return .unchanged(function)
         }
-        return .unchanged(function)
+
+        var newOperations = function.operations
+        var opsToRemove = Set<Int>()
+        var changed = false
+
+        for pattern in geluPatterns {
+            guard !pattern.operationIndices.isEmpty else { continue }
+
+            let rootIdx = pattern.rootIndex
+            guard rootIdx < function.operations.count else { continue }
+
+            let rootOp = function.operations[rootIdx]
+
+            // Find the input to the GELU pattern (first operation's input)
+            let firstOpIdx = pattern.operationIndices.first!
+            guard firstOpIdx < function.operations.count else { continue }
+            let firstOp = function.operations[firstOpIdx]
+            guard !firstOp.operands.isEmpty else { continue }
+            let input = firstOp.operands[0]
+
+            // Determine if approximate GELU
+            let isApproximate = pattern.metadata.activation?.contains("approximate") ?? true
+
+            // Build backend config
+            let configDict: [String: Any] = ["approximate": isApproximate]
+            let backendConfig = (try? JSONSerialization.data(withJSONObject: configDict))
+                .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+
+            // Create custom_call attributes
+            var attrs = HLOAttributes()
+            attrs.callTargetName = FusedGeluHandler.targetName
+            attrs.backendConfig = backendConfig
+
+            // Create the fused operation
+            let fusedOp = HLOOperation(
+                result: rootOp.result,
+                kind: .customCall,
+                operands: [input],
+                resultType: rootOp.resultType,
+                attributes: attrs
+            )
+
+            // Replace the root operation with the fused one
+            newOperations[rootIdx] = fusedOp
+
+            // Mark all intermediate operations for removal (except root which is replaced)
+            for idx in pattern.operationIndices where idx != rootIdx {
+                opsToRemove.insert(idx)
+            }
+            changed = true
+        }
+
+        if !changed {
+            return .unchanged(function)
+        }
+
+        // Filter out removed operations
+        let filteredOps = newOperations.enumerated()
+            .filter { !opsToRemove.contains($0.offset) }
+            .map { $0.element }
+
+        let newFunction = HLOFunction(
+            name: function.name,
+            inputs: function.inputs,
+            outputTypes: function.outputTypes,
+            operations: filteredOps,
+            returnValues: function.returnValues
+        )
+
+        return PassResult(
+            function: newFunction,
+            changed: true,
+            stats: [
+                "operationsRemoved": opsToRemove.count,
+                "operationsFused": geluPatterns.count
+            ]
+        )
     }
 }
 
 /// MatMul + Bias + Activation fusion pass.
+///
+/// Detects patterns of matmul followed by bias add and optional activation,
+/// and replaces them with a single fused custom_call.
 final class MatMulBiasActFusionPass: OptimizationPass, @unchecked Sendable {
     let name = "matmul-bias-act-fusion"
     let invalidates: Set<AnalysisType> = [.lifetimes, .patterns]
@@ -609,7 +1036,120 @@ final class MatMulBiasActFusionPass: OptimizationPass, @unchecked Sendable {
         if patterns.isEmpty {
             return .unchanged(function)
         }
-        return .unchanged(function)
+
+        var newOperations = function.operations
+        var opsToRemove = Set<Int>()
+        var changed = false
+
+        // Build op index map
+        var opByResult: [TensorID: (op: HLOOperation, index: Int)] = [:]
+        for (index, op) in function.operations.enumerated() {
+            opByResult[op.result] = (op, index)
+        }
+
+        for pattern in patterns {
+            guard !pattern.operationIndices.isEmpty else { continue }
+
+            let rootIdx = pattern.rootIndex
+            guard rootIdx < function.operations.count else { continue }
+
+            let rootOp = function.operations[rootIdx]
+
+            // Find the matmul operation (first in pattern typically)
+            var matmulOp: HLOOperation?
+            var matmulIdx: Int?
+            for idx in pattern.operationIndices {
+                let op = function.operations[idx]
+                if op.kind == .dot || op.kind == .dotGeneral {
+                    matmulOp = op
+                    matmulIdx = idx
+                    break
+                }
+            }
+
+            guard let matmul = matmulOp, matmul.operands.count >= 2 else { continue }
+
+            let x = matmul.operands[0]  // input
+            let w = matmul.operands[1]  // weight
+
+            // Find bias from add operation
+            var bias: TensorID?
+            for idx in pattern.operationIndices {
+                let op = function.operations[idx]
+                if op.kind == .add && op.operands.count >= 2 {
+                    // The non-matmul operand is likely the bias
+                    if let defOp = opByResult[op.operands[0]], defOp.op.kind == .dot || defOp.op.kind == .dotGeneral {
+                        bias = op.operands[1]
+                    } else if let defOp = opByResult[op.operands[1]], defOp.op.kind == .dot || defOp.op.kind == .dotGeneral {
+                        bias = op.operands[0]
+                    }
+                    break
+                }
+            }
+
+            guard let biasId = bias else { continue }
+
+            // Get activation type from metadata
+            let activation = pattern.metadata.activation ?? "none"
+
+            // Build backend config
+            let configDict: [String: Any] = [
+                "activation": activation,
+                "trans_a": false,
+                "trans_b": false
+            ]
+            let backendConfig = (try? JSONSerialization.data(withJSONObject: configDict))
+                .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+
+            // Create custom_call attributes
+            var attrs = HLOAttributes()
+            attrs.callTargetName = FusedMatMulBiasActivationHandler.targetName
+            attrs.backendConfig = backendConfig
+
+            // Create the fused operation
+            let fusedOp = HLOOperation(
+                result: rootOp.result,
+                kind: .customCall,
+                operands: [x, w, biasId],
+                resultType: rootOp.resultType,
+                attributes: attrs
+            )
+
+            // Replace the root operation
+            newOperations[rootIdx] = fusedOp
+
+            // Mark intermediate operations for removal
+            for idx in pattern.operationIndices where idx != rootIdx {
+                opsToRemove.insert(idx)
+            }
+            changed = true
+        }
+
+        if !changed {
+            return .unchanged(function)
+        }
+
+        // Filter out removed operations
+        let filteredOps = newOperations.enumerated()
+            .filter { !opsToRemove.contains($0.offset) }
+            .map { $0.element }
+
+        let newFunction = HLOFunction(
+            name: function.name,
+            inputs: function.inputs,
+            outputTypes: function.outputTypes,
+            operations: filteredOps,
+            returnValues: function.returnValues
+        )
+
+        return PassResult(
+            function: newFunction,
+            changed: true,
+            stats: [
+                "operationsRemoved": opsToRemove.count,
+                "operationsFused": patterns.count
+            ]
+        )
     }
 }
 

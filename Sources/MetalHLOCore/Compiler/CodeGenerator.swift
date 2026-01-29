@@ -1115,21 +1115,80 @@ public final class CodeGenerator: @unchecked Sendable {
     }
 
     /// Generates elementwise chain source.
+    ///
+    /// Handles both unary and binary operations. For binary ops, consumes inputs in order.
+    /// Example: ops = [add, multiply] with inputs [a, b, c]
+    ///   x = a + b (consumes inputs 0 and 1)
+    ///   x = x * c (uses previous result and input 2)
     private func generateElementwiseChainSource(_ ops: [HLOOpKind], inputShapes: [[Int]]) -> (String, String, TuningConfig?) {
-        var code = "float x = input[tid];\n"
+        // Count required inputs based on operations
+        var inputsNeeded = 0
+        var hasCurrentValue = false
 
         for op in ops {
-            switch op {
-            case .negate: code += "x = -x;\n"
-            case .abs: code += "x = abs(x);\n"
-            case .exponential: code += "x = exp(x);\n"
-            case .log: code += "x = log(x);\n"
-            case .sqrt: code += "x = sqrt(x);\n"
-            case .rsqrt: code += "x = rsqrt(x);\n"
-            case .tanh: code += "x = tanh(x);\n"
-            case .logistic: code += "x = 1.0f / (1.0f + exp(-x));\n"
-            default: break
+            if isBinaryOp(op) {
+                if hasCurrentValue {
+                    inputsNeeded += 1  // Need one more for the right operand
+                } else {
+                    inputsNeeded += 2  // Need two for first binary op
+                }
+            } else {
+                if !hasCurrentValue {
+                    inputsNeeded += 1  // Need one input for unary if no current value
+                }
             }
+            hasCurrentValue = true
+        }
+
+        // Ensure at least 1 input
+        inputsNeeded = max(inputsNeeded, 1)
+
+        // Generate kernel parameters for all inputs
+        var inputParams: [String] = []
+        for i in 0..<inputsNeeded {
+            inputParams.append("device const float* input\(i) [[buffer(\(i))]]")
+        }
+
+        // Output buffer comes after inputs
+        let outputBufferIndex = inputsNeeded
+
+        // Generate the operation code
+        var code = ""
+        var inputIndex = 0
+        var hasX = false
+
+        for op in ops {
+            if isBinaryOp(op) {
+                let left: String
+                let right: String
+
+                if hasX {
+                    left = "x"
+                    right = "input\(inputIndex)[tid]"
+                    inputIndex += 1
+                } else {
+                    left = "input\(inputIndex)[tid]"
+                    inputIndex += 1
+                    right = "input\(inputIndex)[tid]"
+                    inputIndex += 1
+                }
+
+                code += generateBinaryOpCode(op, left: left, right: right, declareX: !hasX)
+                hasX = true
+            } else {
+                // Unary operation
+                if !hasX {
+                    code += "float x = input\(inputIndex)[tid];\n"
+                    inputIndex += 1
+                    hasX = true
+                }
+                code += generateUnaryOpCode(op)
+            }
+        }
+
+        // If no operations, just copy input
+        if !hasX && inputsNeeded > 0 {
+            code = "float x = input0[tid];\n"
         }
 
         let source = """
@@ -1137,9 +1196,9 @@ public final class CodeGenerator: @unchecked Sendable {
         using namespace metal;
 
         kernel void kernel_elementwise_chain(
-            device const float* input [[buffer(0)]],
-            device float* output [[buffer(1)]],
-            constant uint& count [[buffer(2)]],
+            \(inputParams.joined(separator: ",\n            ")),
+            device float* output [[buffer(\(outputBufferIndex))]],
+            constant uint& count [[buffer(\(outputBufferIndex + 1))]],
             uint tid [[thread_position_in_grid]])
         {
             if (tid >= count) return;
@@ -1149,6 +1208,58 @@ public final class CodeGenerator: @unchecked Sendable {
         """
 
         return (source, "kernel_elementwise_chain", nil)
+    }
+
+    /// Checks if an operation is binary.
+    private func isBinaryOp(_ op: HLOOpKind) -> Bool {
+        switch op {
+        case .add, .subtract, .multiply, .divide, .maximum, .minimum, .power, .and, .or, .xor:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Generates code for a binary operation.
+    private func generateBinaryOpCode(_ op: HLOOpKind, left: String, right: String, declareX: Bool) -> String {
+        let prefix = declareX ? "float x = " : "x = "
+        switch op {
+        case .add:
+            return "\(prefix)\(left) + \(right);\n"
+        case .subtract:
+            return "\(prefix)\(left) - \(right);\n"
+        case .multiply:
+            return "\(prefix)\(left) * \(right);\n"
+        case .divide:
+            return "\(prefix)\(left) / \(right);\n"
+        case .maximum:
+            return "\(prefix)max(\(left), \(right));\n"
+        case .minimum:
+            return "\(prefix)min(\(left), \(right));\n"
+        case .power:
+            return "\(prefix)pow(\(left), \(right));\n"
+        default:
+            return "\(prefix)\(left);\n"  // Fallback
+        }
+    }
+
+    /// Generates code for a unary operation.
+    private func generateUnaryOpCode(_ op: HLOOpKind) -> String {
+        switch op {
+        case .negate: return "x = -x;\n"
+        case .abs: return "x = abs(x);\n"
+        case .exponential: return "x = exp(x);\n"
+        case .log: return "x = log(x);\n"
+        case .sqrt: return "x = sqrt(x);\n"
+        case .rsqrt: return "x = rsqrt(x);\n"
+        case .tanh: return "x = tanh(x);\n"
+        case .logistic: return "x = 1.0f / (1.0f + exp(-x));\n"
+        case .sine: return "x = sin(x);\n"
+        case .cosine: return "x = cos(x);\n"
+        case .floor: return "x = floor(x);\n"
+        case .ceil: return "x = ceil(x);\n"
+        default: return ""
+        }
     }
 
     /// Generates FFN source.

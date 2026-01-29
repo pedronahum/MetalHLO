@@ -98,7 +98,7 @@ struct ConstantHandlingTests {
         #expect(compiled.constantBuffers.count == 2, "Expected 2 constant buffers, got \(compiled.constantBuffers.count)")
 
         // Actually execute and check results
-        let executor = IntegratedExecutor(device: device, executable: compiled)
+        let executor = try IntegratedExecutor(device: device, executable: compiled)
         let result = try executor.execute(inputs: [:])
 
         print("\n=== DEBUG: Execution Result ===")
@@ -133,7 +133,7 @@ struct ConstantHandlingTests {
             }
         }
 
-        let executorO1 = IntegratedExecutor(device: device, executable: compiledO1)
+        let executorO1 = try IntegratedExecutor(device: device, executable: compiledO1)
         let resultO1 = try executorO1.execute(inputs: [:])
 
         print("\n=== DEBUG: O1 Execution Result ===")
@@ -194,7 +194,7 @@ struct ConstantHandlingTests {
 
             // Try to execute and see what happens
             do {
-                let executorO2 = IntegratedExecutor(device: device, executable: compiledO2)
+                let executorO2 = try IntegratedExecutor(device: device, executable: compiledO2)
                 let resultO2 = try executorO2.execute(inputs: [:])
                 print("\n=== DEBUG: O2 Execution Result ===")
                 for (name, buffer) in resultO2.outputs {

@@ -422,11 +422,132 @@ public struct FusedOp: Sendable {
     /// Creates a FusedOp from an original HLO operation.
     public init(from operation: HLOOperation) {
         self.id = operation.result
-        self.type = .original(operation.kind)
         self.inputs = operation.operands
         self.outputs = [TensorInfo(id: operation.result, type: operation.resultType)]
         self.originalOps = nil
         self.attributes = operation.attributes
+
+        // Handle custom_call operations by mapping to appropriate FusedOpType
+        if operation.kind == .customCall, let targetName = operation.attributes.callTargetName {
+            self.type = FusedOp.fusedOpTypeFromCustomCall(targetName: targetName, backendConfig: operation.attributes.backendConfig)
+        } else {
+            self.type = .original(operation.kind)
+        }
+    }
+
+    /// Maps a custom_call target name to a FusedOpType.
+    private static func fusedOpTypeFromCustomCall(targetName: String, backendConfig: String?) -> FusedOpType {
+        // Parse backend config if available
+        let config: [String: Any]
+        if let configStr = backendConfig,
+           let data = configStr.data(using: .utf8),
+           let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            config = parsed
+        } else {
+            config = [:]
+        }
+
+        switch targetName {
+        case FusedScaledDotProductAttentionHandler.targetName:
+            let scale = (config["scale"] as? NSNumber)?.floatValue
+            let isCausal = (config["is_causal"] as? Bool) ?? false
+            return .fusedAttention(AttentionConfig(
+                numHeads: (config["num_heads"] as? Int) ?? 1,
+                headDim: (config["head_dim"] as? Int) ?? 64,
+                scale: scale,
+                causalMask: isCausal
+            ))
+
+        case FusedLayerNormHandler.targetName:
+            let eps = (config["eps"] as? NSNumber)?.floatValue ?? 1e-5
+            return .fusedLayerNorm(NormConfig(epsilon: eps, axis: -1))
+
+        case FusedRMSNormHandler.targetName:
+            let eps = (config["eps"] as? NSNumber)?.floatValue ?? 1e-5
+            return .fusedRMSNorm(NormConfig(epsilon: eps, axis: -1))
+
+        case FusedGeluHandler.targetName:
+            let approximate = (config["approximate"] as? Bool) ?? true
+            return .fusedGELU(approximate: approximate)
+
+        case FusedMatMulBiasActivationHandler.targetName:
+            let activationStr = config["activation"] as? String ?? "none"
+            let transA = (config["trans_a"] as? Bool) ?? false
+            let transB = (config["trans_b"] as? Bool) ?? false
+            let activation = ActivationType(rawValue: activationStr) ?? .none
+            return .fusedMatMulBiasAct(MatMulConfig(
+                transA: transA,
+                transB: transB,
+                hasBias: true,
+                activation: activation
+            ))
+
+        case "fused_elementwise":
+            // Parse the elementwise chain from config
+            // Support both "ops" and "operations" keys for compatibility
+            let opsArray: [String]? = (config["ops"] as? [String]) ?? (config["operations"] as? [String])
+            if let ops = opsArray {
+                let opKinds = ops.compactMap { HLOOpKind(rawValue: $0) }
+                if !opKinds.isEmpty {
+                    return .fusedElementwise(opKinds)
+                }
+            }
+            return .original(.customCall)
+
+        case FusedRoPEHandler.targetName:
+            let baseFreq = (config["base_freq"] as? NSNumber)?.floatValue ?? 10000.0
+            let dim = (config["dim"] as? Int) ?? 64
+            return .fusedRoPE(RoPEConfig(dim: dim, maxSeqLen: 4096, base: baseFreq))
+
+        case "fused_transformer_block":
+            // Parse transformer block configuration
+            let numHeads = (config["num_heads"] as? Int) ?? 8
+            let headDim = (config["head_dim"] as? Int) ?? 64
+            let hiddenDim = (config["hidden_dim"] as? Int) ?? numHeads * headDim
+            let intermediateDim = (config["intermediate_dim"] as? Int) ?? hiddenDim * 4
+            let preNorm = (config["pre_norm"] as? Bool) ?? true
+            let normTypeStr = (config["norm_type"] as? String) ?? "rmsNorm"
+            let normType: TransformerBlockConfig.NormType = normTypeStr == "layerNorm" ? .layerNorm : .rmsNorm
+
+            let attentionConfig = MultiHeadAttentionConfig(
+                numHeads: numHeads,
+                headDim: headDim,
+                hiddenDim: hiddenDim,
+                causalMask: (config["causal_mask"] as? Bool) ?? false
+            )
+            let ffnConfig = FFNConfig(
+                hiddenDim: hiddenDim,
+                intermediateDim: intermediateDim,
+                activation: .gelu
+            )
+            return .fusedTransformerBlock(TransformerBlockConfig(
+                attention: attentionConfig,
+                ffn: ffnConfig,
+                preNorm: preNorm,
+                normType: normType
+            ))
+
+        case "fused_residual_chain":
+            // Residual chains are essentially elementwise adds
+            return .fusedElementwise([.add])
+
+        case FusedFFNHandler.targetName:
+            // Parse FFN configuration
+            let hiddenDim = (config["hidden_dim"] as? Int) ?? 0
+            let activationStr = (config["activation"] as? String) ?? "gelu"
+            let isGated = (config["is_gated"] as? Bool) ?? false
+            let activation = ActivationType(rawValue: activationStr) ?? .gelu
+            return .fusedFFN(FFNConfig(
+                hiddenDim: hiddenDim,
+                intermediateDim: hiddenDim * 4,  // Default intermediate ratio
+                activation: activation,
+                isGated: isGated
+            ))
+
+        default:
+            // Unknown custom call, keep as original
+            return .original(.customCall)
+        }
     }
 
     /// Primary output tensor ID.

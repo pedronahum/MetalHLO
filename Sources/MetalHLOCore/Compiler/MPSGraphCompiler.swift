@@ -283,13 +283,13 @@ public final class MPSGraphCompiler {
         case .rngBitGenerator:
             return try compileRngBitGenerator(op)
 
-        // Bitwise
+        // Bitwise - need special handling for boolean (int1) types
         case .and:
-            return try compileBinaryOp(op) { graph.bitwiseAND($0, $1, name: op.result) }
+            return try compileLogicalAnd(op)
         case .or:
-            return try compileBinaryOp(op) { graph.bitwiseOR($0, $1, name: op.result) }
+            return try compileLogicalOr(op)
         case .xor:
-            return try compileBinaryOp(op) { graph.bitwiseXOR($0, $1, name: op.result) }
+            return try compileLogicalXor(op)
 
         // Iota
         case .iota:
@@ -388,6 +388,73 @@ public final class MPSGraphCompiler {
         }
         let input = try getOperand(op.operands[0])
         return operation(input)
+    }
+
+    // MARK: - Logical/Bitwise Operations
+    // MPSGraph's bitwiseAND/OR/XOR don't support boolean (int1) tensors.
+    // For booleans, we use logical operations instead.
+
+    private func compileLogicalAnd(_ op: HLOOperation) throws -> MPSGraphTensor {
+        guard op.operands.count == 2 else {
+            throw CompilationError.wrongOperandCount(expected: 2, got: op.operands.count)
+        }
+        let lhs = try getOperand(op.operands[0])
+        let rhs = try getOperand(op.operands[1])
+
+        // Check if operands are boolean (int1) type
+        if op.resultType.elementType == .int1 {
+            // For booleans: AND is equivalent to multiplication (0*0=0, 0*1=0, 1*0=0, 1*1=1)
+            // Cast to int32, multiply, then cast back to bool
+            let lhsInt = graph.cast(lhs, to: .int32, name: nil)
+            let rhsInt = graph.cast(rhs, to: .int32, name: nil)
+            let result = graph.multiplication(lhsInt, rhsInt, name: nil)
+            return graph.cast(result, to: .bool, name: op.result)
+        } else {
+            // For integers, use bitwise AND
+            return graph.bitwiseAND(lhs, rhs, name: op.result)
+        }
+    }
+
+    private func compileLogicalOr(_ op: HLOOperation) throws -> MPSGraphTensor {
+        guard op.operands.count == 2 else {
+            throw CompilationError.wrongOperandCount(expected: 2, got: op.operands.count)
+        }
+        let lhs = try getOperand(op.operands[0])
+        let rhs = try getOperand(op.operands[1])
+
+        // Check if operands are boolean (int1) type
+        if op.resultType.elementType == .int1 {
+            // For booleans: OR can be computed as max(a, b) or (a + b) > 0
+            // Using max is simpler and avoids overflow concerns
+            let lhsInt = graph.cast(lhs, to: .int32, name: nil)
+            let rhsInt = graph.cast(rhs, to: .int32, name: nil)
+            let result = graph.maximum(lhsInt, rhsInt, name: nil)
+            return graph.cast(result, to: .bool, name: op.result)
+        } else {
+            // For integers, use bitwise OR
+            return graph.bitwiseOR(lhs, rhs, name: op.result)
+        }
+    }
+
+    private func compileLogicalXor(_ op: HLOOperation) throws -> MPSGraphTensor {
+        guard op.operands.count == 2 else {
+            throw CompilationError.wrongOperandCount(expected: 2, got: op.operands.count)
+        }
+        let lhs = try getOperand(op.operands[0])
+        let rhs = try getOperand(op.operands[1])
+
+        // Check if operands are boolean (int1) type
+        if op.resultType.elementType == .int1 {
+            // For booleans: XOR is equivalent to notEqual
+            // Cast to int32, compute (a - b) != 0, which gives XOR behavior
+            let lhsInt = graph.cast(lhs, to: .int32, name: nil)
+            let rhsInt = graph.cast(rhs, to: .int32, name: nil)
+            let result = graph.notEqual(lhsInt, rhsInt, name: nil)
+            return graph.cast(result, to: .bool, name: op.result)
+        } else {
+            // For integers, use bitwise XOR
+            return graph.bitwiseXOR(lhs, rhs, name: op.result)
+        }
     }
 
     private func compileConvert(_ op: HLOOperation) throws -> MPSGraphTensor {
@@ -568,18 +635,25 @@ public final class MPSGraphCompiler {
         let axes = op.attributes.dimensions ?? []
         let axesNS = axes.map { NSNumber(value: $0) }
 
+        // MPSGraph reduction operations keep reduced dimensions with size 1 (like keepdims=True),
+        // but StableHLO semantics expect reduced dimensions to be completely removed.
+        // We perform the reduction first, then reshape to the expected output shape.
+        let reduced: MPSGraphTensor
         switch op.attributes.reductionKind {
         case .sum:
-            return graph.reductionSum(with: input, axes: axesNS, name: op.result)
+            reduced = graph.reductionSum(with: input, axes: axesNS, name: nil)
         case .max:
-            return graph.reductionMaximum(with: input, axes: axesNS, name: op.result)
+            reduced = graph.reductionMaximum(with: input, axes: axesNS, name: nil)
         case .min:
-            return graph.reductionMinimum(with: input, axes: axesNS, name: op.result)
+            reduced = graph.reductionMinimum(with: input, axes: axesNS, name: nil)
         case .mean:
-            return graph.mean(of: input, axes: axesNS, name: op.result)
+            reduced = graph.mean(of: input, axes: axesNS, name: nil)
         case .none:
             throw CompilationError.missingAttribute("reductionKind", operation: "reduce")
         }
+
+        // Reshape to expected output shape (removes the reduced dimensions)
+        return graph.reshape(reduced, shape: op.resultType.mpsShape, name: op.result)
     }
 
     private func compileCompare(_ op: HLOOperation) throws -> MPSGraphTensor {

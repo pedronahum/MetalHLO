@@ -110,9 +110,28 @@ public final class Client: @unchecked Sendable {
     /// - Throws: `MetalHLOError.parseFailed` or `MetalHLOError.compilationFailed`.
     /// - Returns: A compiled `Executable` ready for execution.
     public func compile(_ mlir: String, config: CompilationConfig) throws -> Executable {
+        // Map optimization level to appropriate pass set if user hasn't specified
+        let effectiveEnabledPasses: Set<String>?
+        if let userPasses = config.enabledPasses {
+            // User explicitly specified passes, use those
+            effectiveEnabledPasses = userPasses
+        } else {
+            // Map optimization level to pass set
+            switch config.optimizationLevel {
+            case .O0:
+                effectiveEnabledPasses = Set()  // No passes
+            case .O1:
+                effectiveEnabledPasses = OptimizationPass.basicPasses
+            case .O2:
+                effectiveEnabledPasses = OptimizationPass.standardPasses
+            case .O3:
+                effectiveEnabledPasses = nil  // All passes (aggressive)
+            }
+        }
+
         // Convert public config to internal compiler config
         let passManagerConfig = PassManager.Config(
-            enabledPasses: config.enabledPasses,
+            enabledPasses: effectiveEnabledPasses,
             disabledPasses: config.disabledPasses
         )
 
@@ -135,7 +154,12 @@ public final class Client: @unchecked Sendable {
         }
 
         // Create integrated executor for the compiled executable
-        let integratedExecutor = IntegratedExecutor(device: device, executable: compiled)
+        let integratedExecutor: IntegratedExecutor
+        do {
+            integratedExecutor = try IntegratedExecutor(device: device, executable: compiled)
+        } catch let error as IntegratedExecutorError {
+            throw Self.convertExecutorError(error)
+        }
 
         return Executable(compiled: compiled, executor: integratedExecutor)
     }
@@ -156,6 +180,33 @@ public final class Client: @unchecked Sendable {
             return .compilationFailed("Compilation timeout")
         case .invalidInput(let reason):
             return .compilationFailed("Invalid input: \(reason)")
+        }
+    }
+
+    private static func convertExecutorError(_ error: IntegratedExecutorError) -> MetalHLOError {
+        switch error {
+        case .commandQueueCreationFailed:
+            return .executionFailed("Failed to create Metal command queue")
+        case .bufferAllocationFailed(let size):
+            return .bufferCreationFailed("Failed to allocate buffer of size \(size) bytes")
+        case .commandBufferCreationFailed:
+            return .executionFailed("Failed to create command buffer")
+        case .encoderCreationFailed:
+            return .executionFailed("Failed to create command encoder")
+        case .missingPipeline(let opID):
+            return .executionFailed("Missing pipeline for operation: \(opID)")
+        case .missingDispatch(let opID):
+            return .executionFailed("Missing dispatch for operation: \(opID)")
+        case .missingBindings(let opID):
+            return .executionFailed("Missing bindings for operation: \(opID)")
+        case .missingInput(let name):
+            return .executionFailed("Missing input: \(name)")
+        case .missingConstant(let id):
+            return .executionFailed("Missing constant: \(id)")
+        case .invalidBinding(let reason):
+            return .executionFailed("Invalid binding: \(reason)")
+        case .executionFailed(let reason):
+            return .executionFailed(reason)
         }
     }
 

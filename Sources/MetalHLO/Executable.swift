@@ -220,6 +220,7 @@ public final class Executable: @unchecked Sendable {
     private func buildMetalInputs(_ inputs: [Buffer], executable: CompiledExecutable, device: MTLDevice) -> [String: MTLBuffer] {
         var metalInputs: [String: MTLBuffer] = [:]
         let inputNames = Array(executable.inputSpecs.keys).sorted()
+
         for (index, name) in inputNames.enumerated() where index < inputs.count {
             // Create Metal buffer from storage data
             let storage = inputs[index].storage
@@ -284,10 +285,14 @@ public final class Executable: @unchecked Sendable {
 
     private static func convertIntegratedError(_ error: IntegratedExecutorError) -> MetalHLOError {
         switch error {
+        case .commandQueueCreationFailed:
+            return .executionFailed("Command queue creation failed")
         case .commandBufferCreationFailed:
             return .executionFailed("Command buffer creation failed")
         case .encoderCreationFailed:
             return .executionFailed("Command encoder creation failed")
+        case .bufferAllocationFailed(let size):
+            return .bufferCreationFailed("Failed to allocate buffer of size \(size) bytes")
         case .missingPipeline(let opID):
             return .executionFailed("Missing pipeline for operation: \(opID)")
         case .missingDispatch(let opID):

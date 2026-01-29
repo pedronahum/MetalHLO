@@ -236,27 +236,24 @@ public final class MetalHLOCompiler: @unchecked Sendable {
     }
 
     /// Optimizes the function based on optimization level.
+    ///
+    /// Pass selection is controlled by the PassManager configuration set in Client.swift:
+    /// - O0: No passes (enabledPasses = empty set)
+    /// - O1: Basic passes (constant-folding, algebraic-simplifier, dead-code-elimination)
+    /// - O2: Standard passes (basic + CSE, canonicalizers, producer-consumer fusion)
+    /// - O3: All passes with multiple iterations
     private func optimize(_ function: HLOFunction, analysis: AnalysisResults) -> OptimizedModule {
         switch config.optimizationLevel {
         case .O0:
-            // No optimization
+            // No optimization - just convert to module
             return OptimizedModule.from(function)
 
-        case .O1:
-            // Basic optimization: just simplification
-            let (simplified, _) = passManager.runToConvergence(
-                on: function,
-                analysis: analysis,
-                passes: ["algebraic-simplifier", "dead-code-elimination"]
-            )
-            return OptimizedModule.from(simplified)
-
-        case .O2:
-            // Standard optimization: all passes
+        case .O1, .O2:
+            // Run configured passes (controlled by PassManager.Config.enabledPasses)
             return passManager.runAllPasses(module: function, analysis: analysis)
 
         case .O3:
-            // Aggressive optimization: multiple iterations
+            // Aggressive optimization: multiple iterations until convergence
             var currentFunction = function
             var currentAnalysis = analysis
 

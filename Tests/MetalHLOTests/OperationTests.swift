@@ -830,4 +830,47 @@ struct ReductionOperationTests {
         #expect(abs(result[1] - 5.0) < 0.01, "Expected 5, got \(result[1])")
         #expect(abs(result[2] - 6.0) < 0.01, "Expected 6, got \(result[2])")
     }
+
+    @Test("Reduce sum followed by divide (LayerNorm mean pattern)")
+    func reduceThenDivide() throws {
+        let client = try Client.create()
+        // This pattern is used in LayerNorm: reduce to get sum, then divide to get mean
+        let mlir = """
+        module @reduce_then_divide {
+          func.func @main(%arg0: tensor<2x3x4xf32>, %arg1: tensor<2x3xf32>) -> (tensor<2x3xf32>) {
+            %init = stablehlo.constant dense<0.0> : tensor<f32>
+            %sum = stablehlo.reduce(%arg0 init: %init) applies stablehlo.add across dimensions = [2] : (tensor<2x3x4xf32>, tensor<f32>) -> tensor<2x3xf32>
+            %mean = stablehlo.divide %sum, %arg1 : tensor<2x3xf32>
+            return %mean : tensor<2x3xf32>
+          }
+        }
+        """
+        let executable = try client.compile(mlir)
+
+        // Input: 2x3x4 tensor with values 1-24
+        // After reduce sum along dim 2: each 2x3 element is sum of 4 values
+        // Row 0: [1+2+3+4, 5+6+7+8, 9+10+11+12] = [10, 26, 42]
+        // Row 1: [13+14+15+16, ...] = [58, 74, 90]
+        var inputData: [Float] = []
+        for i in 1...24 {
+            inputData.append(Float(i))
+        }
+        let input = try client.createBuffer(inputData, shape: [2, 3, 4], elementType: .float32)
+
+        // Divisor: 2x3 tensor of 4s (to divide by the reduction size)
+        let divisor = try client.createBuffer([Float](repeating: 4.0, count: 6), shape: [2, 3], elementType: .float32)
+
+        let outputs = try executable.execute([input, divisor])
+        let result = try outputs[0].toFloatArray()
+
+        print("reduce_then_divide result: \(result)")
+        #expect(result.count == 6, "Expected 6 elements, got \(result.count)")
+        // Expected means: [10/4, 26/4, 42/4, 58/4, 74/4, 90/4] = [2.5, 6.5, 10.5, 14.5, 18.5, 22.5]
+        #expect(abs(result[0] - 2.5) < 0.01, "Expected 2.5, got \(result[0])")
+        #expect(abs(result[1] - 6.5) < 0.01, "Expected 6.5, got \(result[1])")
+        #expect(abs(result[2] - 10.5) < 0.01, "Expected 10.5, got \(result[2])")
+        #expect(abs(result[3] - 14.5) < 0.01, "Expected 14.5, got \(result[3])")
+        #expect(abs(result[4] - 18.5) < 0.01, "Expected 18.5, got \(result[4])")
+        #expect(abs(result[5] - 22.5) < 0.01, "Expected 22.5, got \(result[5])")
+    }
 }

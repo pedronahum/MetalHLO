@@ -81,6 +81,8 @@ public final class CustomCallRegistry: @unchecked Sendable {
         register(FusedSoftmaxHandler())
         register(FusedGeluHandler())
         register(FusedRoPEHandler())
+        register(FusedFFNHandler())
+        register(FusedElementwiseHandler())
     }
 
     /// List of supported targets
@@ -168,6 +170,9 @@ public enum BackendConfigParser {
 ///
 /// Implements: softmax(Q @ K^T * scale) @ V
 /// With optional causal masking
+///
+/// On macOS 15+ / iOS 18+, uses the native MPSGraph SDPA operation for optimal performance.
+/// Falls back to manual implementation on older systems.
 public final class FusedScaledDotProductAttentionHandler: CustomCallHandler {
 
     public static let targetName = "fused_scaled_dot_product_attention"
@@ -189,9 +194,51 @@ public final class FusedScaledDotProductAttentionHandler: CustomCallHandler {
         let v = inputs[2]  // [batch, heads, seq_k, head_dim]
 
         let scale = BackendConfigParser.getFloat(config, key: "scale", default: 1.0)
-        let isCausal = BackendConfigParser.getBool(config, key: "is_causal", default: false)
         let hasMask = BackendConfigParser.getBool(config, key: "has_mask", default: false)
 
+        // Get optional mask tensor
+        let mask: MPSGraphTensor? = (hasMask && inputs.count > 3) ? inputs[3] : nil
+
+        // Try to use native MPSGraph SDPA (available on macOS 15+ / iOS 18+)
+        if #available(macOS 15.0, iOS 18.0, *) {
+            return try emitNativeSDPA(graph: graph, q: q, k: k, v: v, mask: mask, scale: scale)
+        } else {
+            return try emitManualSDPA(graph: graph, q: q, k: k, v: v, mask: mask, scale: scale)
+        }
+    }
+
+    /// Uses native MPSGraph scaledDotProductAttention (macOS 15+ / iOS 18+)
+    @available(macOS 15.0, iOS 18.0, *)
+    private func emitNativeSDPA(
+        graph: MPSGraph,
+        q: MPSGraphTensor,
+        k: MPSGraphTensor,
+        v: MPSGraphTensor,
+        mask: MPSGraphTensor?,
+        scale: Float
+    ) throws -> [MPSGraphTensor] {
+        // Use native SDPA - much more efficient as it runs as a fused kernel
+        let output = graph.scaledDotProductAttention(
+            query: q,
+            key: k,
+            value: v,
+            mask: mask,
+            scale: scale,
+            name: "native_sdpa"
+        )
+
+        return [output]
+    }
+
+    /// Manual SDPA implementation for older systems
+    private func emitManualSDPA(
+        graph: MPSGraph,
+        q: MPSGraphTensor,
+        k: MPSGraphTensor,
+        v: MPSGraphTensor,
+        mask: MPSGraphTensor?,
+        scale: Float
+    ) throws -> [MPSGraphTensor] {
         // Transpose K for matmul: [batch, heads, head_dim, seq_k]
         let kT = graph.transposeTensor(k, dimension: 2, withDimension: 3, name: nil)
 
@@ -209,16 +256,8 @@ public final class FusedScaledDotProductAttentionHandler: CustomCallHandler {
         }
 
         // Apply mask if provided
-        if hasMask && inputs.count > 3 {
-            let mask = inputs[3]
+        if let mask = mask {
             scores = graph.addition(scores, mask, name: "masked_scores")
-        }
-
-        // Causal mask (if requested and no explicit mask)
-        if isCausal && !hasMask {
-            // Create causal mask: upper triangular with -inf
-            // This is handled internally by creating a large negative value for masked positions
-            // For simplicity, we skip this for now - in production, create proper causal mask
         }
 
         // Softmax along last dimension (seq_k)
@@ -664,6 +703,235 @@ public final class FusedRoPEHandler: CustomCallHandler {
         let output = graph.concatTensors([out1, out2], dimension: rank - 1, name: "rope_output")
 
         return [output]
+    }
+}
+
+// MARK: - Fused FFN Handler
+
+/// Handles fused Feed-Forward Network (up_proj → activation → down_proj)
+public final class FusedFFNHandler: CustomCallHandler {
+
+    public static let targetName = "fused_ffn"
+
+    public init() {}
+
+    public func emit(
+        operation: HLOOperation,
+        graph: MPSGraph,
+        inputs: [MPSGraphTensor],
+        config: [String: Any]
+    ) throws -> [MPSGraphTensor] {
+        // Inputs: [input, up_weight, down_weight]
+        guard inputs.count >= 3 else {
+            throw CustomCallError.invalidInputCount(expected: 3, got: inputs.count)
+        }
+
+        let x = inputs[0]           // input tensor
+        let upWeight = inputs[1]    // up projection weight
+        let downWeight = inputs[2]  // down projection weight
+
+        let activation = BackendConfigParser.getString(config, key: "activation", default: "gelu")
+        let _ = BackendConfigParser.getBool(config, key: "is_gated", default: false)  // Reserved for gated FFN
+
+        // Up projection: x @ up_weight
+        var hidden = graph.matrixMultiplication(primary: x, secondary: upWeight, name: "ffn_up_proj")
+
+        // Apply activation
+        hidden = applyActivation(hidden, activation: activation, graph: graph)
+
+        // Down projection: hidden @ down_weight
+        let output = graph.matrixMultiplication(primary: hidden, secondary: downWeight, name: "ffn_down_proj")
+
+        return [output]
+    }
+
+    private func applyActivation(_ tensor: MPSGraphTensor, activation: String, graph: MPSGraph) -> MPSGraphTensor {
+        switch activation {
+        case "relu":
+            return graph.reLU(with: tensor, name: "ffn_relu")
+        case "gelu":
+            return applyGelu(tensor, approximate: true, graph: graph)
+        case "gelu_approximate", "geluApproximate":
+            return applyGelu(tensor, approximate: true, graph: graph)
+        case "gelu_exact":
+            return applyGelu(tensor, approximate: false, graph: graph)
+        case "sigmoid":
+            return graph.sigmoid(with: tensor, name: "ffn_sigmoid")
+        case "tanh":
+            return graph.tanh(with: tensor, name: "ffn_tanh")
+        case "silu", "swish":
+            // SiLU/Swish: x * sigmoid(x)
+            let sig = graph.sigmoid(with: tensor, name: "ffn_silu_sig")
+            return graph.multiplication(tensor, sig, name: "ffn_silu")
+        default:
+            return tensor  // No activation
+        }
+    }
+
+    private func applyGelu(_ tensor: MPSGraphTensor, approximate: Bool, graph: MPSGraph) -> MPSGraphTensor {
+        // Approximate GELU: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+        let half = graph.constant(0.5, dataType: tensor.dataType)
+        let one = graph.constant(1.0, dataType: tensor.dataType)
+        let sqrtTwoPi = graph.constant(0.7978845608, dataType: tensor.dataType)
+        let coeff = graph.constant(0.044715, dataType: tensor.dataType)
+
+        let x3 = graph.multiplication(tensor, graph.multiplication(tensor, tensor, name: nil), name: nil)
+        let inner = graph.addition(tensor, graph.multiplication(coeff, x3, name: nil), name: nil)
+        let tanhArg = graph.multiplication(sqrtTwoPi, inner, name: nil)
+        let tanhVal = graph.tanh(with: tanhArg, name: nil)
+        let onePlusTanh = graph.addition(one, tanhVal, name: nil)
+        return graph.multiplication(half, graph.multiplication(tensor, onePlusTanh, name: nil), name: "ffn_gelu")
+    }
+}
+
+// MARK: - Fused Elementwise Handler
+
+/// Handles fused elementwise operation chains (e.g., add -> multiply)
+public final class FusedElementwiseHandler: CustomCallHandler {
+
+    public static let targetName = "fused_elementwise"
+
+    public init() {}
+
+    public func emit(
+        operation: HLOOperation,
+        graph: MPSGraph,
+        inputs: [MPSGraphTensor],
+        config: [String: Any]
+    ) throws -> [MPSGraphTensor] {
+        // Parse the operations from config
+        // Support both "ops" and "operations" keys for compatibility
+        guard let opsArray = (config["ops"] as? [String]) ?? (config["operations"] as? [String]) else {
+            throw CustomCallError.invalidConfig("Missing 'ops' or 'operations' in fused_elementwise config")
+        }
+
+        guard !inputs.isEmpty else {
+            throw CustomCallError.invalidInputCount(expected: 1, got: 0)
+        }
+
+        // For the add-multiply chain with 3 inputs (arg0, arg1, arg2):
+        // ops = ["add", "multiply"]
+        // %0 = add(arg0, arg1)
+        // %1 = multiply(%0, arg2)
+        //
+        // We need to apply each operation in sequence, consuming inputs as needed
+
+        var currentResult: MPSGraphTensor? = nil
+        var inputIndex = 0
+
+        for (opIndex, opName) in opsArray.enumerated() {
+            // Determine left operand: either previous result or next input
+            let left: MPSGraphTensor
+            if let prev = currentResult {
+                left = prev
+            } else if inputIndex < inputs.count {
+                left = inputs[inputIndex]
+                inputIndex += 1
+            } else {
+                throw CustomCallError.invalidConfig("Not enough inputs for operation \(opIndex)")
+            }
+
+            // Determine right operand (for binary ops)
+            let result: MPSGraphTensor
+            switch opName {
+            // Binary operations
+            case "add":
+                guard inputIndex < inputs.count else {
+                    throw CustomCallError.invalidConfig("Not enough inputs for add operation")
+                }
+                let right = inputs[inputIndex]
+                inputIndex += 1
+                result = graph.addition(left, right, name: "fused_add_\(opIndex)")
+
+            case "subtract":
+                guard inputIndex < inputs.count else {
+                    throw CustomCallError.invalidConfig("Not enough inputs for subtract operation")
+                }
+                let right = inputs[inputIndex]
+                inputIndex += 1
+                result = graph.subtraction(left, right, name: "fused_sub_\(opIndex)")
+
+            case "multiply":
+                guard inputIndex < inputs.count else {
+                    throw CustomCallError.invalidConfig("Not enough inputs for multiply operation")
+                }
+                let right = inputs[inputIndex]
+                inputIndex += 1
+                result = graph.multiplication(left, right, name: "fused_mul_\(opIndex)")
+
+            case "divide":
+                guard inputIndex < inputs.count else {
+                    throw CustomCallError.invalidConfig("Not enough inputs for divide operation")
+                }
+                let right = inputs[inputIndex]
+                inputIndex += 1
+                result = graph.division(left, right, name: "fused_div_\(opIndex)")
+
+            case "maximum":
+                guard inputIndex < inputs.count else {
+                    throw CustomCallError.invalidConfig("Not enough inputs for maximum operation")
+                }
+                let right = inputs[inputIndex]
+                inputIndex += 1
+                result = graph.maximum(left, right, name: "fused_max_\(opIndex)")
+
+            case "minimum":
+                guard inputIndex < inputs.count else {
+                    throw CustomCallError.invalidConfig("Not enough inputs for minimum operation")
+                }
+                let right = inputs[inputIndex]
+                inputIndex += 1
+                result = graph.minimum(left, right, name: "fused_min_\(opIndex)")
+
+            // Unary operations
+            case "negate":
+                result = graph.negative(with: left, name: "fused_neg_\(opIndex)")
+
+            case "abs":
+                result = graph.absolute(with: left, name: "fused_abs_\(opIndex)")
+
+            case "exponential":
+                result = graph.exponent(with: left, name: "fused_exp_\(opIndex)")
+
+            case "log":
+                result = graph.logarithm(with: left, name: "fused_log_\(opIndex)")
+
+            case "sqrt":
+                result = graph.squareRoot(with: left, name: "fused_sqrt_\(opIndex)")
+
+            case "rsqrt":
+                result = graph.reverseSquareRoot(with: left, name: "fused_rsqrt_\(opIndex)")
+
+            case "tanh":
+                result = graph.tanh(with: left, name: "fused_tanh_\(opIndex)")
+
+            case "logistic":
+                result = graph.sigmoid(with: left, name: "fused_sigmoid_\(opIndex)")
+
+            case "sine":
+                result = graph.sin(with: left, name: "fused_sin_\(opIndex)")
+
+            case "cosine":
+                result = graph.cos(with: left, name: "fused_cos_\(opIndex)")
+
+            case "floor":
+                result = graph.floor(with: left, name: "fused_floor_\(opIndex)")
+
+            case "ceil":
+                result = graph.ceil(with: left, name: "fused_ceil_\(opIndex)")
+
+            default:
+                throw CustomCallError.invalidConfig("Unsupported operation in fused chain: \(opName)")
+            }
+
+            currentResult = result
+        }
+
+        guard let finalResult = currentResult else {
+            throw CustomCallError.invalidConfig("No operations to fuse")
+        }
+
+        return [finalResult]
     }
 }
 

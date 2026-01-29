@@ -83,9 +83,15 @@ public final class IntegratedExecutor: @unchecked Sendable {
     // MARK: - Initialization
 
     /// Creates an executor for a compiled executable.
-    public init(device: MTLDevice, executable: CompiledExecutable, config: Config = .default) {
+    /// - Throws: `IntegratedExecutorError.commandQueueCreationFailed` or `IntegratedExecutorError.bufferAllocationFailed`
+    public init(device: MTLDevice, executable: CompiledExecutable, config: Config = .default) throws {
         self.device = device
-        self.commandQueue = device.makeCommandQueue()!
+
+        guard let commandQueue = device.makeCommandQueue() else {
+            throw IntegratedExecutorError.commandQueueCreationFailed
+        }
+        self.commandQueue = commandQueue
+
         self.executable = executable
         self.config = config
         self.statistics = ExecutionStatistics()
@@ -93,10 +99,13 @@ public final class IntegratedExecutor: @unchecked Sendable {
 
         // Pre-allocate unified buffer for ALL intermediate tensors
         let bufferSize = max(executable.memoryPlan.totalBytes, 256)
-        self.unifiedBuffer = device.makeBuffer(
+        guard let unifiedBuffer = device.makeBuffer(
             length: bufferSize,
             options: .storageModeShared
-        )!
+        ) else {
+            throw IntegratedExecutorError.bufferAllocationFailed(size: bufferSize)
+        }
+        self.unifiedBuffer = unifiedBuffer
 
         if let label = config.debugLabel {
             self.unifiedBuffer.label = "\(label)_unified"
@@ -155,7 +164,7 @@ public final class IntegratedExecutor: @unchecked Sendable {
         }
 
         // Extract outputs
-        let outputs = extractOutputs(inputs: inputs)
+        let outputs = try extractOutputs(inputs: inputs)
 
         let executionTimeMs = Double(DispatchTime.now().uptimeNanoseconds - startTime.uptimeNanoseconds) / 1_000_000
 
@@ -223,20 +232,24 @@ public final class IntegratedExecutor: @unchecked Sendable {
                 return
             }
 
-            let outputs = self.extractOutputs(inputs: inputs)
-            let executionTimeMs = Double(DispatchTime.now().uptimeNanoseconds - startTime.uptimeNanoseconds) / 1_000_000
+            do {
+                let outputs = try self.extractOutputs(inputs: inputs)
+                let executionTimeMs = Double(DispatchTime.now().uptimeNanoseconds - startTime.uptimeNanoseconds) / 1_000_000
 
-            self.statistics.executionCount += 1
-            self.statistics.totalExecutionTimeMs += executionTimeMs
-            self.statistics.lastExecutionTimeMs = executionTimeMs
+                self.statistics.executionCount += 1
+                self.statistics.totalExecutionTimeMs += executionTimeMs
+                self.statistics.lastExecutionTimeMs = executionTimeMs
 
-            let result = ExecutionResult(
-                outputs: outputs,
-                executionTimeMs: executionTimeMs,
-                kernelTimings: kernelTimings
-            )
+                let result = ExecutionResult(
+                    outputs: outputs,
+                    executionTimeMs: executionTimeMs,
+                    kernelTimings: kernelTimings
+                )
 
-            completion(.success(result))
+                completion(.success(result))
+            } catch {
+                completion(.failure(error))
+            }
         }
 
         commandBuffer.commit()
@@ -354,17 +367,19 @@ public final class IntegratedExecutor: @unchecked Sendable {
     }
 
     /// Extracts output buffers from the unified buffer.
-    private func extractOutputs(inputs: [String: MTLBuffer]) -> [String: MTLBuffer] {
+    private func extractOutputs(inputs: [String: MTLBuffer]) throws -> [String: MTLBuffer] {
         var outputs: [String: MTLBuffer] = [:]
 
         for (name, spec) in executable.outputSpecs {
             // Check if output is in memory plan
             if let offset = executable.memoryPlan.tensorOffsets[name] {
                 // Create output buffer and copy data
-                let outputBuffer = device.makeBuffer(
+                guard let outputBuffer = device.makeBuffer(
                     length: spec.byteSize,
                     options: .storageModeShared
-                )!
+                ) else {
+                    throw IntegratedExecutorError.bufferAllocationFailed(size: spec.byteSize)
+                }
 
                 if let label = config.debugLabel {
                     outputBuffer.label = "\(label)_output_\(name)"
@@ -436,8 +451,10 @@ public struct ExecutionStatistics: Sendable {
 
 /// Errors that can occur during execution.
 public enum IntegratedExecutorError: Error, Sendable {
+    case commandQueueCreationFailed
     case commandBufferCreationFailed
     case encoderCreationFailed
+    case bufferAllocationFailed(size: Int)
     case missingPipeline(OpID)
     case missingDispatch(OpID)
     case missingBindings(OpID)
@@ -471,19 +488,30 @@ public final class BatchExecutor: @unchecked Sendable {
         }
     }
 
-    public init(device: MTLDevice, executable: CompiledExecutable, config: Config = Config()) {
+    /// Creates a batch executor.
+    /// - Throws: `IntegratedExecutorError.commandQueueCreationFailed` or `IntegratedExecutorError.bufferAllocationFailed`
+    public init(device: MTLDevice, executable: CompiledExecutable, config: Config = Config()) throws {
         self.device = device
-        self.commandQueue = device.makeCommandQueue()!
+
+        guard let commandQueue = device.makeCommandQueue() else {
+            throw IntegratedExecutorError.commandQueueCreationFailed
+        }
+        self.commandQueue = commandQueue
+
         self.executable = executable
         self.config = config
 
         // Create multiple unified buffers for overlapped execution
         let bufferSize = max(executable.memoryPlan.totalBytes, 256)
-        self.unifiedBuffers = (0..<config.bufferCount).map { i in
-            let buffer = device.makeBuffer(length: bufferSize, options: .storageModeShared)!
+        var buffers: [MTLBuffer] = []
+        for i in 0..<config.bufferCount {
+            guard let buffer = device.makeBuffer(length: bufferSize, options: .storageModeShared) else {
+                throw IntegratedExecutorError.bufferAllocationFailed(size: bufferSize)
+            }
             buffer.label = "unified_buffer_\(i)"
-            return buffer
+            buffers.append(buffer)
         }
+        self.unifiedBuffers = buffers
     }
 
     /// Executes multiple batches with overlapped execution.

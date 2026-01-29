@@ -225,13 +225,28 @@ public final class MetalExecutor: @unchecked Sendable {
 
         let encodeEndTime = CFAbsoluteTimeGetCurrent()
 
-        // Execute using the graph's run method with command queue
-        let results = compiled.graph.run(
-            with: commandQueue,
-            feeds: inputDict,
-            targetTensors: compiled.outputTensors,
-            targetOperations: nil
-        )
+        // Execute using the executable's runAsync method for better GPU utilization
+        // runAsync allows better pipelining than graph.run() which is synchronous
+        let inputDataArray = compiled.inputTensors.compactMap { inputDict[$0] }
+
+        let results: [MPSGraphTensor: MPSGraphTensorData]
+        do {
+            // Use synchronous run() to ensure GPU work completes before reading results.
+            // runAsync returns immediately with placeholder data, causing reads to return zeros.
+            let outputDataArray = compiled.executable.run(
+                with: commandQueue,
+                inputs: inputDataArray,
+                results: nil,
+                executionDescriptor: nil
+            )
+
+            // Map outputs back to tensor dictionary
+            var resultDict: [MPSGraphTensor: MPSGraphTensorData] = [:]
+            for (tensor, data) in zip(compiled.outputTensors, outputDataArray) {
+                resultDict[tensor] = data
+            }
+            results = resultDict
+        }
 
         let gpuEndTime = CFAbsoluteTimeGetCurrent()
 

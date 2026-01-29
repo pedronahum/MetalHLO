@@ -19,6 +19,16 @@ let package = Package(
             type: .dynamic,
             targets: ["CMetalHLO"]
         ),
+        // Benchmark library
+        .library(
+            name: "MetalHLOBenchmarks",
+            targets: ["MetalHLOBenchmarks"]
+        ),
+        // Benchmark runner executable
+        .executable(
+            name: "benchmark-runner",
+            targets: ["BenchmarkRunner"]
+        ),
     ],
     targets: [
         // MARK: - Public Swift API
@@ -45,6 +55,18 @@ let package = Package(
             dependencies: ["MetalHLO"],
             path: "Sources/CMetalHLO",
             publicHeadersPath: "include"
+        ),
+
+        // MARK: - Benchmarks
+        .target(
+            name: "MetalHLOBenchmarks",
+            dependencies: ["MetalHLO"],
+            path: "Sources/MetalHLOBenchmarks"
+        ),
+        .executableTarget(
+            name: "BenchmarkRunner",
+            dependencies: ["MetalHLOBenchmarks"],
+            path: "Sources/BenchmarkRunner"
         ),
 
         // MARK: - Tests
