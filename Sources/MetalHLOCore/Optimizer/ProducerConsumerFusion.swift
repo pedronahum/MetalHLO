@@ -194,12 +194,18 @@ public final class ProducerConsumerFusion: @unchecked Sendable {
             function: function
         )
 
+        // Only emit as custom_call if all operations are supported by FusedElementwiseHandler
+        // Shape ops like reshape, transpose, broadcastInDim are "fusible" for producer-consumer
+        // analysis but are NOT supported as fused_elementwise custom_calls
+        let canEmitAsCustomCall = emitCustomCalls && orderedOps.count > 1 &&
+            orderedOps.allSatisfy { isElementwiseOp($0.kind) }
+
         return FusionRegion(
             operations: orderedOps,
             indices: regionIndices,
             rootOperation: rootOp,
             inputs: sortedInputs,
-            shouldEmitAsCustomCall: emitCustomCalls && orderedOps.count > 1
+            shouldEmitAsCustomCall: canEmitAsCustomCall
         )
     }
 
@@ -354,6 +360,31 @@ public final class ProducerConsumerFusion: @unchecked Sendable {
         case .negate, .abs, .not:
             return true
 
+        default:
+            return false
+        }
+    }
+
+    /// Operations that are true elementwise operations supported by FusedElementwiseHandler.
+    /// This is more restrictive than isFusibleOp - it excludes shape ops like reshape,
+    /// transpose, and broadcastInDim which are fusible for analysis but not supported
+    /// as fused_elementwise custom_calls.
+    private func isElementwiseOp(_ kind: HLOOpKind) -> Bool {
+        switch kind {
+        // Binary elementwise operations
+        case .add, .subtract, .multiply, .divide, .maximum, .minimum:
+            return true
+
+        // Unary elementwise operations
+        case .negate, .abs, .exponential, .log, .sqrt, .rsqrt,
+             .tanh, .logistic, .sine, .cosine, .floor, .ceil:
+            return true
+
+        // Shape operations are NOT elementwise - they should not be in fused_elementwise
+        case .reshape, .transpose, .broadcastInDim:
+            return false
+
+        // Everything else is not supported by FusedElementwiseHandler
         default:
             return false
         }
