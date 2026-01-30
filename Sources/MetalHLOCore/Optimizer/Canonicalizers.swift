@@ -358,12 +358,36 @@ public final class BroadcastCanonicalizer: OptimizationPass, @unchecked Sendable
             if let inputDef = definingOps[op.operands[0]],
                inputDef.op.kind == .broadcastInDim {
                 // Fold: broadcast(broadcast(x)) -> broadcast(x) with combined dimensions
+                // Compose dimensions: for input dim i, the combined dimension is outerDims[innerDims[i]]
+                let innerDims = inputDef.op.attributes.dimensions ?? []
+                let outerDims = op.attributes.dimensions ?? []
+
+                // Compose the dimensions correctly
+                var combinedDims: [Int] = []
+                for innerDim in innerDims {
+                    if innerDim >= 0 && innerDim < outerDims.count {
+                        combinedDims.append(outerDims[innerDim])
+                    } else {
+                        // Invalid dimension mapping - skip folding this pair
+                        continue
+                    }
+                }
+
+                // Only fold if we successfully composed all dimensions
+                guard combinedDims.count == innerDims.count else {
+                    continue
+                }
+
+                // Create new attributes with combined dimensions
+                var newAttributes = op.attributes
+                newAttributes.dimensions = combinedDims
+
                 let newOp = HLOOperation(
                     result: op.result,
                     kind: op.kind,
                     operands: inputDef.op.operands,
                     resultType: op.resultType,
-                    attributes: op.attributes
+                    attributes: newAttributes
                 )
                 operations[index] = newOp
 
