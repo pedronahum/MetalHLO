@@ -532,17 +532,10 @@ public final class Analyzer: @unchecked Sendable {
                 }
             }
 
-            // Detect manual GELU: x * 0.5 * (1 + tanh(...))
-            // This is a simplified check
+            // Detect manual GELU pattern: 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
             if op.kind == .multiply {
-                if let tanhDef = definingOps[op.operands[1]],
-                   tanhDef.op.kind == .tanh {
-                    patterns.append(DetectedPattern(
-                        type: .gelu,
-                        operationIndices: [tanhDef.index, index],
-                        rootIndex: index,
-                        metadata: PatternMetadata(activation: "gelu_approximate")
-                    ))
+                if let geluMatch = detectFullGELUPattern(rootOp: op, rootIndex: index, definingOps: definingOps) {
+                    patterns.append(geluMatch)
                 }
             }
 
@@ -562,6 +555,397 @@ public final class Analyzer: @unchecked Sendable {
         }
 
         return patterns
+    }
+
+    // MARK: - GELU Pattern Detection
+
+    /// GELU constants with tolerance for floating-point comparison
+    private static let geluHalf: Double = 0.5
+    private static let geluSqrt2OverPi: Double = 0.7978845608028654  // sqrt(2/π)
+    private static let geluCoefficient: Double = 0.044715
+    private static let geluTolerance: Double = 0.01
+
+    /// Detects the full GELU pattern: 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
+    ///
+    /// The pattern can appear in different forms depending on how the compiler arranges operations:
+    /// - multiply(0.5, multiply(x, add(1, tanh(...))))
+    /// - multiply(multiply(0.5, x), add(1, tanh(...)))
+    /// - Other equivalent orderings
+    private func detectFullGELUPattern(
+        rootOp: HLOOperation,
+        rootIndex: Int,
+        definingOps: [TensorID: (op: HLOOperation, index: Int)]
+    ) -> DetectedPattern? {
+        guard rootOp.kind == .multiply else { return nil }
+
+        var matchedIndices: Set<Int> = [rootIndex]
+        var inputTensorID: TensorID?
+
+        // Try to find GELU pattern starting from the root multiply
+        // We need to find: 0.5 constant, x input, and (1 + tanh(...)) expression
+
+        // Check both orderings of multiply operands
+        for (i, operand) in rootOp.operands.enumerated() {
+            let otherOperand = rootOp.operands[1 - i]
+
+            // Case 1: This operand is 0.5 constant, other is x * (1 + tanh(...))
+            if let constVal = getConstantValue(operand, definingOps: definingOps),
+               abs(constVal - Self.geluHalf) < Self.geluTolerance {
+                // Mark constant as matched
+                if let constDef = definingOps[operand] {
+                    matchedIndices.insert(constDef.index)
+                }
+
+                // Other operand should be x * (1 + tanh(...))
+                if let xTimesTanhResult = detectXTimesTanhPlusOne(
+                    operand: otherOperand,
+                    definingOps: definingOps,
+                    matchedIndices: &matchedIndices
+                ) {
+                    inputTensorID = xTimesTanhResult.inputX
+                    return createGELUPattern(
+                        rootIndex: rootIndex,
+                        matchedIndices: matchedIndices,
+                        inputTensorID: inputTensorID
+                    )
+                }
+            }
+
+            // Case 2: This operand is x * (1 + tanh(...)), need to find 0.5 elsewhere
+            if let mulDef = definingOps[operand],
+               mulDef.op.kind == .multiply {
+                // Check if this is the x * (1 + tanh(...)) part
+                if let xTimesTanhResult = detectXTimesTanhPlusOne(
+                    operand: operand,
+                    definingOps: definingOps,
+                    matchedIndices: &matchedIndices
+                ) {
+                    // Other operand should be 0.5 or involve 0.5
+                    if let constVal = getConstantValue(otherOperand, definingOps: definingOps),
+                       abs(constVal - Self.geluHalf) < Self.geluTolerance {
+                        if let constDef = definingOps[otherOperand] {
+                            matchedIndices.insert(constDef.index)
+                        }
+                        inputTensorID = xTimesTanhResult.inputX
+                        return createGELUPattern(
+                            rootIndex: rootIndex,
+                            matchedIndices: matchedIndices,
+                            inputTensorID: inputTensorID
+                        )
+                    }
+                }
+            }
+        }
+
+        return nil
+    }
+
+    /// Result of detecting x * (1 + tanh(...)) pattern
+    private struct XTimesTanhResult {
+        let inputX: TensorID
+    }
+
+    /// Detects the x * (1 + tanh(...)) portion of GELU
+    private func detectXTimesTanhPlusOne(
+        operand: TensorID,
+        definingOps: [TensorID: (op: HLOOperation, index: Int)],
+        matchedIndices: inout Set<Int>
+    ) -> XTimesTanhResult? {
+        guard let mulDef = definingOps[operand],
+              mulDef.op.kind == .multiply else { return nil }
+
+        matchedIndices.insert(mulDef.index)
+
+        // Check both orderings: x * (1 + tanh) or (1 + tanh) * x
+        for (i, subOperand) in mulDef.op.operands.enumerated() {
+            let otherSubOperand = mulDef.op.operands[1 - i]
+
+            // Check if subOperand is the (1 + tanh(...)) part
+            if let addDef = definingOps[subOperand],
+               addDef.op.kind == .add {
+                matchedIndices.insert(addDef.index)
+
+                // Check for add(1, tanh(...)) or add(tanh(...), 1)
+                for (j, addOperand) in addDef.op.operands.enumerated() {
+                    let otherAddOperand = addDef.op.operands[1 - j]
+
+                    if let constVal = getConstantValue(addOperand, definingOps: definingOps),
+                       abs(constVal - 1.0) < Self.geluTolerance {
+                        // Mark constant
+                        if let constDef = definingOps[addOperand] {
+                            matchedIndices.insert(constDef.index)
+                        }
+
+                        // Other operand should be tanh(...)
+                        if let tanhDef = definingOps[otherAddOperand],
+                           tanhDef.op.kind == .tanh {
+                            matchedIndices.insert(tanhDef.index)
+
+                            // Validate tanh input has the polynomial structure
+                            if let inputX = detectTanhPolynomialInput(
+                                tanhOp: tanhDef.op,
+                                definingOps: definingOps,
+                                matchedIndices: &matchedIndices,
+                                candidateX: otherSubOperand
+                            ) {
+                                // Verify x is consistent (otherSubOperand should be x or derived from same input)
+                                return XTimesTanhResult(inputX: inputX)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return nil
+    }
+
+    /// Detects the polynomial input to tanh: sqrt(2/π) * (x + 0.044715 * x³)
+    private func detectTanhPolynomialInput(
+        tanhOp: HLOOperation,
+        definingOps: [TensorID: (op: HLOOperation, index: Int)],
+        matchedIndices: inout Set<Int>,
+        candidateX: TensorID
+    ) -> TensorID? {
+        guard tanhOp.operands.count > 0,
+              let tanhInputDef = definingOps[tanhOp.operands[0]] else { return nil }
+
+        // tanh input should be multiply(sqrt(2/π), polynomial) or the polynomial directly
+        if tanhInputDef.op.kind == .multiply {
+            matchedIndices.insert(tanhInputDef.index)
+
+            // Check for sqrt(2/π) constant
+            for (i, operand) in tanhInputDef.op.operands.enumerated() {
+                let otherOperand = tanhInputDef.op.operands[1 - i]
+
+                if let constVal = getConstantValue(operand, definingOps: definingOps),
+                   abs(constVal - Self.geluSqrt2OverPi) < Self.geluTolerance {
+                    if let constDef = definingOps[operand] {
+                        matchedIndices.insert(constDef.index)
+                    }
+
+                    // Other operand should be (x + 0.044715 * x³)
+                    if let inputX = detectPolynomial(
+                        operand: otherOperand,
+                        definingOps: definingOps,
+                        matchedIndices: &matchedIndices,
+                        candidateX: candidateX
+                    ) {
+                        return inputX
+                    }
+                }
+            }
+        }
+
+        // Fallback: maybe sqrt(2/π) is baked into other constants
+        // Try to detect polynomial directly
+        if let inputX = detectPolynomial(
+            operand: tanhOp.operands[0],
+            definingOps: definingOps,
+            matchedIndices: &matchedIndices,
+            candidateX: candidateX
+        ) {
+            return inputX
+        }
+
+        // Even more relaxed: just check for tanh with some computational chain
+        // that involves the candidate x - this catches variants where constants are different
+        if hasOperandInChain(tanhOp.operands[0], target: candidateX, definingOps: definingOps, maxDepth: 6) {
+            return candidateX
+        }
+
+        return nil
+    }
+
+    /// Detects the polynomial: x + 0.044715 * x³
+    private func detectPolynomial(
+        operand: TensorID,
+        definingOps: [TensorID: (op: HLOOperation, index: Int)],
+        matchedIndices: inout Set<Int>,
+        candidateX: TensorID
+    ) -> TensorID? {
+        guard let addDef = definingOps[operand],
+              addDef.op.kind == .add else { return nil }
+
+        matchedIndices.insert(addDef.index)
+
+        // Look for x + (0.044715 * x³) pattern
+        for (i, addOperand) in addDef.op.operands.enumerated() {
+            let otherAddOperand = addDef.op.operands[1 - i]
+
+            // Check if this operand is x (or matches candidateX)
+            let isX = (addOperand == candidateX) ||
+                      (!definingOps.keys.contains(addOperand))  // Input tensor
+
+            if isX {
+                // Other operand should be 0.044715 * x³
+                if detectCubicTerm(
+                    operand: otherAddOperand,
+                    definingOps: definingOps,
+                    matchedIndices: &matchedIndices,
+                    candidateX: addOperand
+                ) {
+                    return addOperand
+                }
+            }
+        }
+
+        return nil
+    }
+
+    /// Detects the cubic term: 0.044715 * x³
+    private func detectCubicTerm(
+        operand: TensorID,
+        definingOps: [TensorID: (op: HLOOperation, index: Int)],
+        matchedIndices: inout Set<Int>,
+        candidateX: TensorID
+    ) -> Bool {
+        guard let mulDef = definingOps[operand],
+              mulDef.op.kind == .multiply else { return false }
+
+        matchedIndices.insert(mulDef.index)
+
+        for (i, mulOperand) in mulDef.op.operands.enumerated() {
+            let otherMulOperand = mulDef.op.operands[1 - i]
+
+            // Check for 0.044715 constant
+            if let constVal = getConstantValue(mulOperand, definingOps: definingOps),
+               abs(constVal - Self.geluCoefficient) < Self.geluTolerance {
+                if let constDef = definingOps[mulOperand] {
+                    matchedIndices.insert(constDef.index)
+                }
+
+                // Other operand should be x³ (power or multiply chain)
+                if detectXCubed(
+                    operand: otherMulOperand,
+                    definingOps: definingOps,
+                    matchedIndices: &matchedIndices,
+                    candidateX: candidateX
+                ) {
+                    return true
+                }
+            }
+        }
+
+        return false
+    }
+
+    /// Detects x³ as either power(x, 3) or x * x * x
+    private func detectXCubed(
+        operand: TensorID,
+        definingOps: [TensorID: (op: HLOOperation, index: Int)],
+        matchedIndices: inout Set<Int>,
+        candidateX: TensorID
+    ) -> Bool {
+        // Check for power operation
+        if let powerDef = definingOps[operand],
+           powerDef.op.kind == .power {
+            matchedIndices.insert(powerDef.index)
+
+            // Check if exponent is 3
+            if powerDef.op.operands.count >= 2,
+               let expVal = getConstantValue(powerDef.op.operands[1], definingOps: definingOps),
+               abs(expVal - 3.0) < Self.geluTolerance {
+                if let expDef = definingOps[powerDef.op.operands[1]] {
+                    matchedIndices.insert(expDef.index)
+                }
+                // Base should be x
+                return powerDef.op.operands[0] == candidateX ||
+                       hasOperandInChain(powerDef.op.operands[0], target: candidateX, definingOps: definingOps, maxDepth: 2)
+            }
+        }
+
+        // Check for multiply chain: x * x * x or (x * x) * x
+        if let mulDef = definingOps[operand],
+           mulDef.op.kind == .multiply {
+            matchedIndices.insert(mulDef.index)
+
+            // Check for x * (x * x) pattern
+            for (i, mulOperand) in mulDef.op.operands.enumerated() {
+                let otherMulOperand = mulDef.op.operands[1 - i]
+
+                let operandIsX = (mulOperand == candidateX) ||
+                                 hasOperandInChain(mulOperand, target: candidateX, definingOps: definingOps, maxDepth: 1)
+
+                if operandIsX {
+                    // Other should be x * x
+                    if let xSquaredDef = definingOps[otherMulOperand],
+                       xSquaredDef.op.kind == .multiply {
+                        matchedIndices.insert(xSquaredDef.index)
+
+                        let op0IsX = xSquaredDef.op.operands[0] == candidateX ||
+                                     hasOperandInChain(xSquaredDef.op.operands[0], target: candidateX, definingOps: definingOps, maxDepth: 1)
+                        let op1IsX = xSquaredDef.op.operands[1] == candidateX ||
+                                     hasOperandInChain(xSquaredDef.op.operands[1], target: candidateX, definingOps: definingOps, maxDepth: 1)
+
+                        if op0IsX && op1IsX {
+                            return true
+                        }
+                    }
+                }
+            }
+        }
+
+        // Direct x³ reference (operand is x and we're looking for cubic - fallback)
+        return operand == candidateX
+
+    }
+
+    /// Checks if a target operand appears in the computation chain
+    private func hasOperandInChain(
+        _ operand: TensorID,
+        target: TensorID,
+        definingOps: [TensorID: (op: HLOOperation, index: Int)],
+        maxDepth: Int
+    ) -> Bool {
+        if operand == target { return true }
+        if maxDepth <= 0 { return false }
+
+        guard let def = definingOps[operand] else { return false }
+
+        for subOperand in def.op.operands {
+            if hasOperandInChain(subOperand, target: target, definingOps: definingOps, maxDepth: maxDepth - 1) {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    /// Extracts constant value from a tensor ID (handles both direct constants and constant ops)
+    private func getConstantValue(_ tensorID: TensorID, definingOps: [TensorID: (op: HLOOperation, index: Int)]) -> Double? {
+        guard let def = definingOps[tensorID],
+              def.op.kind == .constant,
+              let constVal = def.op.attributes.constantValue else {
+            return nil
+        }
+
+        switch constVal {
+        case .scalar(let v):
+            return v
+        case .splat(let v, _):
+            return v
+        case .dense(let values, _):
+            // For dense, return first value if it's a single-element tensor
+            return values.first
+        }
+    }
+
+    /// Creates a GELU pattern from matched indices
+    private func createGELUPattern(
+        rootIndex: Int,
+        matchedIndices: Set<Int>,
+        inputTensorID: TensorID?
+    ) -> DetectedPattern {
+        var metadata = PatternMetadata()
+        metadata.activation = "gelu_approximate"
+
+        return DetectedPattern(
+            type: .gelu,
+            operationIndices: matchedIndices.sorted(),
+            rootIndex: rootIndex,
+            metadata: metadata
+        )
     }
 
     /// Detects FFN patterns.

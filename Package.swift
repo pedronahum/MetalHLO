@@ -24,11 +24,25 @@ let package = Package(
             name: "MetalHLOBenchmarks",
             targets: ["MetalHLOBenchmarks"]
         ),
+        // MLX comparison benchmarks
+        .library(
+            name: "MLXBenchmarks",
+            targets: ["MLXBenchmarks"]
+        ),
         // Benchmark runner executable
         .executable(
             name: "benchmark-runner",
             targets: ["BenchmarkRunner"]
         ),
+        // MLX comparison runner executable
+        .executable(
+            name: "mlx-comparison",
+            targets: ["MLXComparison"]
+        ),
+    ],
+    dependencies: [
+        // MLX Swift for comparison benchmarks
+        .package(url: "https://github.com/ml-explore/mlx-swift", from: "0.21.0"),
     ],
     targets: [
         // MARK: - Public Swift API
@@ -67,6 +81,22 @@ let package = Package(
             name: "BenchmarkRunner",
             dependencies: ["MetalHLOBenchmarks"],
             path: "Sources/BenchmarkRunner"
+        ),
+
+        // MARK: - MLX Comparison Benchmarks
+        .target(
+            name: "MLXBenchmarks",
+            dependencies: [
+                "MetalHLOBenchmarks",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXRandom", package: "mlx-swift"),
+            ],
+            path: "Sources/MLXBenchmarks"
+        ),
+        .executableTarget(
+            name: "MLXComparison",
+            dependencies: ["MLXBenchmarks", "MetalHLOBenchmarks"],
+            path: "Sources/MLXComparison"
         ),
 
         // MARK: - Tests

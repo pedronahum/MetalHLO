@@ -211,7 +211,7 @@ public final class Executable: @unchecked Sendable {
         let buffers = buildOutputBuffers(from: result, executor: executor)
         let timing = ExecutionTiming(
             encodeTime: 0,  // Not separately tracked in integrated executor
-            gpuTime: result.executionTimeMs / 1000.0,
+            gpuTime: result.gpuTimeMs / 1000.0,  // GPU-only time (excludes output extraction)
             totalTime: result.executionTimeMs / 1000.0
         )
         return (buffers, timing)

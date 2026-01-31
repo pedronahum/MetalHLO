@@ -159,15 +159,19 @@ public final class IntegratedExecutor: @unchecked Sendable {
         // Execute
         commandBuffer.commit()
 
+        var gpuTimeMs: Double = 0
         if config.synchronous {
             commandBuffer.waitUntilCompleted()
+
+            // Measure GPU time immediately after completion (before output extraction)
+            gpuTimeMs = Double(DispatchTime.now().uptimeNanoseconds - startTime.uptimeNanoseconds) / 1_000_000
 
             if let error = commandBuffer.error {
                 throw IntegratedExecutorError.executionFailed(error.localizedDescription)
             }
         }
 
-        // Extract outputs
+        // Extract outputs (this adds overhead that shouldn't be counted in GPU time)
         let outputs = try extractOutputs(inputs: inputs)
 
         let executionTimeMs = Double(DispatchTime.now().uptimeNanoseconds - startTime.uptimeNanoseconds) / 1_000_000
@@ -180,6 +184,7 @@ public final class IntegratedExecutor: @unchecked Sendable {
         return ExecutionResult(
             outputs: outputs,
             executionTimeMs: executionTimeMs,
+            gpuTimeMs: gpuTimeMs,
             kernelTimings: kernelTimings
         )
     }

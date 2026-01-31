@@ -422,8 +422,12 @@ public struct ExecutionResult: Sendable {
     /// Output buffers.
     public let outputs: [String: MTLBuffer]
 
-    /// Execution time in milliseconds.
+    /// Total execution time in milliseconds (includes output extraction).
     public let executionTimeMs: Double
+
+    /// GPU-only execution time in milliseconds (excludes output buffer allocation and copy).
+    /// This is the time from command buffer commit to GPU completion.
+    public let gpuTimeMs: Double
 
     /// Per-kernel timing (if profiling enabled).
     public let kernelTimings: [OpID: Double]?
@@ -431,10 +435,12 @@ public struct ExecutionResult: Sendable {
     public init(
         outputs: [String: MTLBuffer],
         executionTimeMs: Double,
+        gpuTimeMs: Double? = nil,
         kernelTimings: [OpID: Double]? = nil
     ) {
         self.outputs = outputs
         self.executionTimeMs = executionTimeMs
+        self.gpuTimeMs = gpuTimeMs ?? executionTimeMs
         self.kernelTimings = kernelTimings
     }
 }

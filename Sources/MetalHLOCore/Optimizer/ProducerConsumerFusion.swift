@@ -194,11 +194,15 @@ public final class ProducerConsumerFusion: @unchecked Sendable {
             function: function
         )
 
-        // Only emit as custom_call if all operations are supported by FusedElementwiseHandler
+        // Only emit as custom_call if:
+        // 1. All operations are supported by FusedElementwiseHandler
+        // 2. Data flow is linear (each external input used exactly once, in order)
         // Shape ops like reshape, transpose, broadcastInDim are "fusible" for producer-consumer
         // analysis but are NOT supported as fused_elementwise custom_calls
+        let allElementwise = orderedOps.allSatisfy { isElementwiseOp($0.kind) }
+        let linearDataFlow = hasLinearDataFlow(operations: orderedOps, externalInputs: sortedInputs)
         let canEmitAsCustomCall = emitCustomCalls && orderedOps.count > 1 &&
-            orderedOps.allSatisfy { isElementwiseOp($0.kind) }
+            allElementwise && linearDataFlow
 
         return FusionRegion(
             operations: orderedOps,
@@ -385,6 +389,133 @@ public final class ProducerConsumerFusion: @unchecked Sendable {
             return false
 
         // Everything else is not supported by FusedElementwiseHandler
+        default:
+            return false
+        }
+    }
+
+    /// Checks if the data flow is linear enough for fused_elementwise custom_call.
+    ///
+    /// The code generator for fused_elementwise assumes a simple linear chain:
+    /// - First binary op: consumes input0 and input1
+    /// - Subsequent binary ops: use previous result and next input
+    /// - Unary ops: apply to previous result
+    ///
+    /// This doesn't work for complex data flows like GELU where:
+    /// - The same input (e.g., arg0) is used multiple times at different points
+    /// - Inputs are not consumed in strict order
+    ///
+    /// Returns true only if the data flow matches the expected linear pattern.
+    private func hasLinearDataFlow(operations: [HLOOperation], externalInputs: [String]) -> Bool {
+        // Build a map of results produced within the region
+        let regionResults = Set(operations.map { $0.result })
+
+        // Track which external inputs have been "consumed" in our expected order
+        var expectedInputIndex = 0
+        var previousResult: String? = nil
+
+        for op in operations {
+            let isBinary = isBinaryElementwiseOp(op.kind)
+
+            if isBinary {
+                // Binary op: should use (prev, external) or (external, external) for first op
+                var externalOperands: [String] = []
+                var usesPrevious = false
+
+                for operand in op.operands {
+                    if !regionResults.contains(operand) && !externalInputs.contains(operand) {
+                        // Operand not in region and not in external inputs - function arg
+                        // Treat as external input
+                        externalOperands.append(operand)
+                    } else if regionResults.contains(operand) {
+                        // Uses a result from within the region (could be previous result)
+                        if operand == previousResult {
+                            usesPrevious = true
+                        } else {
+                            // Uses a non-previous region result - complex data flow
+                            return false
+                        }
+                    } else {
+                        // Uses an external input
+                        externalOperands.append(operand)
+                    }
+                }
+
+                // Check the pattern
+                if previousResult == nil {
+                    // First operation: should consume 2 external inputs
+                    if externalOperands.count != 2 {
+                        return false
+                    }
+                    // Check they are the expected inputs (or same input twice like x*x)
+                    if externalOperands[0] == externalOperands[1] {
+                        // Same input used twice (like x*x) - OK if it's the first input
+                        if expectedInputIndex < externalInputs.count &&
+                           externalOperands[0] == externalInputs[expectedInputIndex] {
+                            expectedInputIndex += 1
+                        } else {
+                            return false
+                        }
+                    } else {
+                        // Two different inputs - must be in order
+                        for ext in externalOperands {
+                            if expectedInputIndex < externalInputs.count &&
+                               ext == externalInputs[expectedInputIndex] {
+                                expectedInputIndex += 1
+                            } else {
+                                return false
+                            }
+                        }
+                    }
+                } else {
+                    // Subsequent operation: should use previous + 1 external input
+                    if !usesPrevious || externalOperands.count != 1 {
+                        return false
+                    }
+                    // Check the external input is the next expected one
+                    if expectedInputIndex < externalInputs.count &&
+                       externalOperands[0] == externalInputs[expectedInputIndex] {
+                        expectedInputIndex += 1
+                    } else {
+                        return false
+                    }
+                }
+            } else {
+                // Unary op: should use previous result only
+                if previousResult == nil {
+                    // First op is unary - should use one external input
+                    if op.operands.count != 1 {
+                        return false
+                    }
+                    let operand = op.operands[0]
+                    if !regionResults.contains(operand) {
+                        // External input
+                        if expectedInputIndex < externalInputs.count &&
+                           operand == externalInputs[expectedInputIndex] {
+                            expectedInputIndex += 1
+                        } else {
+                            return false
+                        }
+                    }
+                } else {
+                    // Subsequent unary op - should use previous result
+                    if op.operands.count != 1 || op.operands[0] != previousResult {
+                        return false
+                    }
+                }
+            }
+
+            previousResult = op.result
+        }
+
+        return true
+    }
+
+    /// Checks if an operation is a binary elementwise operation.
+    private func isBinaryElementwiseOp(_ kind: HLOOpKind) -> Bool {
+        switch kind {
+        case .add, .subtract, .multiply, .divide, .maximum, .minimum:
+            return true
         default:
             return false
         }
