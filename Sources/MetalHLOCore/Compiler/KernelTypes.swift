@@ -242,6 +242,9 @@ public struct KernelSpec: Sendable {
     /// Shared memory size required.
     public let sharedMemorySize: Int
 
+    /// Number of threadgroup memory buffers (default 1, matmul uses 2).
+    public let threadgroupBufferCount: Int
+
     /// Input tensor shapes (for validation).
     public let inputShapes: [[Int]]
 
@@ -256,6 +259,7 @@ public struct KernelSpec: Sendable {
         bindings: [BufferBinding],
         tuning: TuningConfig? = nil,
         sharedMemorySize: Int = 0,
+        threadgroupBufferCount: Int = 1,
         inputShapes: [[Int]] = [],
         outputShapes: [[Int]] = []
     ) {
@@ -266,6 +270,7 @@ public struct KernelSpec: Sendable {
         self.bindings = bindings
         self.tuning = tuning
         self.sharedMemorySize = sharedMemorySize
+        self.threadgroupBufferCount = threadgroupBufferCount
         self.inputShapes = inputShapes
         self.outputShapes = outputShapes
     }
@@ -325,6 +330,10 @@ public final class CompiledExecutable: @unchecked Sendable {
     /// Shared (threadgroup) memory sizes for each operation.
     public let sharedMemorySizes: [OpID: Int]
 
+    /// Number of threadgroup memory buffers for each operation.
+    /// Most operations use 1 buffer, but matmul uses 2 (tileA and tileB).
+    public let threadgroupBufferCounts: [OpID: Int]
+
     /// Memory plan for the unified buffer.
     public let memoryPlan: MemoryPlan
 
@@ -354,6 +363,7 @@ public final class CompiledExecutable: @unchecked Sendable {
         dispatches: [OpID: DispatchConfig],
         bindings: [OpID: [BufferBinding]],
         sharedMemorySizes: [OpID: Int] = [:],
+        threadgroupBufferCounts: [OpID: Int] = [:],
         memoryPlan: MemoryPlan,
         inputSpecs: [String: TensorSpec],
         outputSpecs: [String: TensorSpec],
@@ -363,6 +373,7 @@ public final class CompiledExecutable: @unchecked Sendable {
         self.dispatches = dispatches
         self.bindings = bindings
         self.sharedMemorySizes = sharedMemorySizes
+        self.threadgroupBufferCounts = threadgroupBufferCounts
         self.memoryPlan = memoryPlan
         self.inputSpecs = inputSpecs
         self.outputSpecs = outputSpecs

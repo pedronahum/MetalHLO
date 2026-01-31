@@ -309,12 +309,18 @@ public final class IntegratedExecutor: @unchecked Sendable {
             }
         }
 
-        // Set threadgroup memory if needed (for operations like matmul that use shared memory)
+        // Set threadgroup memory if needed (for operations like matmul and transpose)
         if let sharedMemSize = executable.sharedMemorySizes[opID], sharedMemSize > 0 {
-            // For matmul, we need two tile buffers: tileA at index 0, tileB at index 1
-            let tileSize = sharedMemSize / 2
-            encoder.setThreadgroupMemoryLength(tileSize, index: 0)  // tileA
-            encoder.setThreadgroupMemoryLength(tileSize, index: 1)  // tileB
+            let bufferCount = executable.threadgroupBufferCounts[opID] ?? 1
+            if bufferCount == 2 {
+                // Two buffers (e.g., matmul with tileA and tileB)
+                let tileSize = sharedMemSize / 2
+                encoder.setThreadgroupMemoryLength(tileSize, index: 0)
+                encoder.setThreadgroupMemoryLength(tileSize, index: 1)
+            } else {
+                // Single buffer (e.g., transpose)
+                encoder.setThreadgroupMemoryLength(sharedMemSize, index: 0)
+            }
         }
 
         // Dispatch

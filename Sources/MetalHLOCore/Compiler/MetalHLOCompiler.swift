@@ -365,12 +365,14 @@ public final class MetalHLOCompiler: @unchecked Sendable {
         var dispatches: [OpID: DispatchConfig] = [:]
         var bindings: [OpID: [BufferBinding]] = [:]
         var sharedMemorySizes: [OpID: Int] = [:]
+        var threadgroupBufferCounts: [OpID: Int] = [:]
 
         for (opID, spec) in kernelSpecs {
             dispatches[opID] = spec.dispatch
             bindings[opID] = spec.bindings
             if spec.sharedMemorySize > 0 {
                 sharedMemorySizes[opID] = spec.sharedMemorySize
+                threadgroupBufferCounts[opID] = spec.threadgroupBufferCount
             }
         }
 
@@ -395,6 +397,7 @@ public final class MetalHLOCompiler: @unchecked Sendable {
             dispatches: dispatches,
             bindings: bindings,
             sharedMemorySizes: sharedMemorySizes,
+            threadgroupBufferCounts: threadgroupBufferCounts,
             memoryPlan: memoryPlan,
             inputSpecs: inputSpecs,
             outputSpecs: outputSpecs,

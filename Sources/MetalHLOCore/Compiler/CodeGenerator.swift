@@ -174,8 +174,9 @@ public final class CodeGenerator: @unchecked Sendable {
             constantIDs: constantIDs
         )
 
-        // Calculate shared memory size
+        // Calculate shared memory size and buffer count
         let sharedMemorySize = calculateSharedMemorySize(type: op.type, tuning: tuning, elementType: elementType)
+        let threadgroupBufferCount = calculateThreadgroupBufferCount(type: op.type, elementType: elementType)
 
         return KernelSpec(
             opID: op.id,
@@ -185,6 +186,7 @@ public final class CodeGenerator: @unchecked Sendable {
             bindings: bindings,
             tuning: tuning,
             sharedMemorySize: sharedMemorySize,
+            threadgroupBufferCount: threadgroupBufferCount,
             inputShapes: inputShapes,
             outputShapes: outputShapes
         )
@@ -410,7 +412,58 @@ public final class CodeGenerator: @unchecked Sendable {
     }
 
     /// Generates a unary kernel with configurable element type.
+    /// Uses float4 vectorization for float types for better memory bandwidth.
     private func generateUnaryKernel(entryPoint: String, operation: String, metalType: String = "float") -> String {
+        // Use vectorized kernel for float types
+        if metalType == "float" {
+            // Convert operation to work with float4
+            // Replace 'x' with 'x4' for the vectorized version
+            let vec4Operation = operation
+                .replacingOccurrences(of: "exp(x)", with: "exp(x4)")
+                .replacingOccurrences(of: "log(x)", with: "log(x4)")
+                .replacingOccurrences(of: "sqrt(x)", with: "sqrt(x4)")
+                .replacingOccurrences(of: "rsqrt(x)", with: "rsqrt(x4)")
+                .replacingOccurrences(of: "sin(x)", with: "sin(x4)")
+                .replacingOccurrences(of: "cos(x)", with: "cos(x4)")
+                .replacingOccurrences(of: "tanh(x)", with: "tanh(x4)")
+                .replacingOccurrences(of: "abs(x)", with: "abs(x4)")
+                .replacingOccurrences(of: "floor(x)", with: "floor(x4)")
+                .replacingOccurrences(of: "ceil(x)", with: "ceil(x4)")
+                .replacingOccurrences(of: "sign(x)", with: "sign(x4)")
+                .replacingOccurrences(of: "-x", with: "-x4")
+                .replacingOccurrences(of: "(x)", with: "(x4)")
+                .replacingOccurrences(of: " x ", with: " x4 ")
+                .replacingOccurrences(of: " x)", with: " x4)")
+                .replacingOccurrences(of: "(x ", with: "(x4 ")
+
+            return """
+            kernel void \(entryPoint)(
+                device const float* input [[buffer(0)]],
+                device float* output [[buffer(1)]],
+                constant uint& count [[buffer(2)]],
+                uint tid [[thread_position_in_grid]])
+            {
+                // Process 4 elements at a time using float4 vectorization
+                uint idx4 = tid * 4;
+                uint count4 = count / 4;
+
+                if (tid < count4) {
+                    // Vectorized path: process 4 elements
+                    float4 x4 = reinterpret_cast<device const float4*>(input)[tid];
+                    reinterpret_cast<device float4*>(output)[tid] = \(vec4Operation);
+                }
+                else if (tid == count4) {
+                    // Handle remainder (up to 3 elements)
+                    for (uint i = idx4; i < count; i++) {
+                        float x = input[i];
+                        output[i] = \(operation);
+                    }
+                }
+            }
+            """
+        }
+
+        // Non-float types use scalar kernel
         return """
         kernel void \(entryPoint)(
             device const \(metalType)* input [[buffer(0)]],
@@ -426,7 +479,51 @@ public final class CodeGenerator: @unchecked Sendable {
     }
 
     /// Generates a binary kernel with configurable element type.
+    /// Uses float4 vectorization for float types for better memory bandwidth.
     private func generateBinaryKernel(entryPoint: String, operation: String, metalType: String = "float") -> String {
+        // Use vectorized kernel for float types
+        if metalType == "float" {
+            // Convert operation to work with float4
+            let vec4Operation = operation
+                .replacingOccurrences(of: "max(a, b)", with: "max(a4, b4)")
+                .replacingOccurrences(of: "min(a, b)", with: "min(a4, b4)")
+                .replacingOccurrences(of: "pow(a, b)", with: "pow(a4, b4)")
+                .replacingOccurrences(of: "a + b", with: "a4 + b4")
+                .replacingOccurrences(of: "a - b", with: "a4 - b4")
+                .replacingOccurrences(of: "a * b", with: "a4 * b4")
+                .replacingOccurrences(of: "a / b", with: "a4 / b4")
+
+            return """
+            kernel void \(entryPoint)(
+                device const float* inputA [[buffer(0)]],
+                device const float* inputB [[buffer(1)]],
+                device float* output [[buffer(2)]],
+                constant uint& count [[buffer(3)]],
+                uint tid [[thread_position_in_grid]])
+            {
+                // Process 4 elements at a time using float4 vectorization
+                uint idx4 = tid * 4;
+                uint count4 = count / 4;
+
+                if (tid < count4) {
+                    // Vectorized path: process 4 elements
+                    float4 a4 = reinterpret_cast<device const float4*>(inputA)[tid];
+                    float4 b4 = reinterpret_cast<device const float4*>(inputB)[tid];
+                    reinterpret_cast<device float4*>(output)[tid] = \(vec4Operation);
+                }
+                else if (tid == count4) {
+                    // Handle remainder (up to 3 elements)
+                    for (uint i = idx4; i < count; i++) {
+                        float a = inputA[i];
+                        float b = inputB[i];
+                        output[i] = \(operation);
+                    }
+                }
+            }
+            """
+        }
+
+        // Non-float types use scalar kernel
         return """
         kernel void \(entryPoint)(
             device const \(metalType)* inputA [[buffer(0)]],
@@ -477,6 +574,156 @@ public final class CodeGenerator: @unchecked Sendable {
             return generateCopyKernel(entryPoint: entryPoint, metalType: metalType)
         }
 
+        // Check for simple 2D matrix transpose [M, N] -> [N, M]
+        // This is the most common case and can be heavily optimized with tiled shared memory
+        if inputShape.count == 2 && permutation == [1, 0] {
+            return generateTiled2DTransposeKernel(
+                entryPoint: entryPoint,
+                rows: inputShape[0],
+                cols: inputShape[1],
+                metalType: metalType
+            )
+        }
+
+        // Check for 3D transpose that swaps last two dimensions [B, M, N] -> [B, N, M]
+        // This is common for attention mechanisms
+        if inputShape.count == 3 && permutation == [0, 2, 1] {
+            return generateBatched2DTransposeKernel(
+                entryPoint: entryPoint,
+                batch: inputShape[0],
+                rows: inputShape[1],
+                cols: inputShape[2],
+                metalType: metalType
+            )
+        }
+
+        // For other cases, use the general transpose kernel
+        return generateGeneralTransposeKernel(
+            entryPoint: entryPoint,
+            inputShape: inputShape,
+            outputShape: outputShape,
+            permutation: permutation,
+            metalType: metalType
+        )
+    }
+
+    /// Generates an optimized tiled 2D transpose kernel using shared memory.
+    /// Uses 32x32 tiles with padding to avoid bank conflicts.
+    private func generateTiled2DTransposeKernel(
+        entryPoint: String,
+        rows: Int,
+        cols: Int,
+        metalType: String = "float"
+    ) -> String {
+        let tileSize = 32
+        let tilePadding = 1  // Padding to avoid bank conflicts
+
+        return """
+        // Optimized tiled 2D transpose with shared memory
+        // Input: [\(rows), \(cols)] -> Output: [\(cols), \(rows)]
+        // Uses \(tileSize)x\(tileSize) tiles with +\(tilePadding) padding to avoid bank conflicts
+        kernel void \(entryPoint)(
+            device const \(metalType)* input [[buffer(0)]],
+            device \(metalType)* output [[buffer(1)]],
+            constant uint& count [[buffer(2)]],
+            threadgroup \(metalType)* tile [[threadgroup(0)]],
+            uint2 tid [[thread_position_in_threadgroup]],
+            uint2 gid [[threadgroup_position_in_grid]],
+            uint2 threads_per_tg [[threads_per_threadgroup]])
+        {
+            const uint TILE_DIM = \(tileSize);
+            const uint TILE_PADDED = \(tileSize + tilePadding);
+            const uint rows = \(rows);
+            const uint cols = \(cols);
+
+            // Input tile position
+            uint x_in = gid.x * TILE_DIM + tid.x;
+            uint y_in = gid.y * TILE_DIM + tid.y;
+
+            // Load tile from input into shared memory with coalesced reads
+            // Each thread loads one element
+            if (x_in < cols && y_in < rows) {
+                tile[tid.y * TILE_PADDED + tid.x] = input[y_in * cols + x_in];
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Output tile position - note the transposed tile indices
+            // We write to (gid.y, gid.x) in the output, not (gid.x, gid.y)
+            uint x_out = gid.y * TILE_DIM + tid.x;
+            uint y_out = gid.x * TILE_DIM + tid.y;
+
+            // Write transposed tile to output with coalesced writes
+            // Note: we read from [tid.x, tid.y] in the tile (transposed)
+            if (x_out < rows && y_out < cols) {
+                output[y_out * rows + x_out] = tile[tid.x * TILE_PADDED + tid.y];
+            }
+        }
+        """
+    }
+
+    /// Generates an optimized batched 2D transpose kernel for 3D tensors [B, M, N] -> [B, N, M].
+    private func generateBatched2DTransposeKernel(
+        entryPoint: String,
+        batch: Int,
+        rows: Int,
+        cols: Int,
+        metalType: String = "float"
+    ) -> String {
+        let tileSize = 32
+        let tilePadding = 1
+
+        return """
+        // Optimized batched 2D transpose with shared memory
+        // Input: [\(batch), \(rows), \(cols)] -> Output: [\(batch), \(cols), \(rows)]
+        kernel void \(entryPoint)(
+            device const \(metalType)* input [[buffer(0)]],
+            device \(metalType)* output [[buffer(1)]],
+            constant uint& count [[buffer(2)]],
+            threadgroup \(metalType)* tile [[threadgroup(0)]],
+            uint3 tid [[thread_position_in_threadgroup]],
+            uint3 gid [[threadgroup_position_in_grid]])
+        {
+            const uint TILE_DIM = \(tileSize);
+            const uint TILE_PADDED = \(tileSize + tilePadding);
+            const uint rows = \(rows);
+            const uint cols = \(cols);
+            const uint batch_stride = rows * cols;
+
+            uint b = gid.z;  // Batch index
+
+            // Input tile position within batch slice
+            uint x_in = gid.x * TILE_DIM + tid.x;
+            uint y_in = gid.y * TILE_DIM + tid.y;
+
+            // Load tile from input into shared memory
+            if (x_in < cols && y_in < rows) {
+                tile[tid.y * TILE_PADDED + tid.x] = input[b * batch_stride + y_in * cols + x_in];
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Output position - transposed tile
+            uint x_out = gid.y * TILE_DIM + tid.x;
+            uint y_out = gid.x * TILE_DIM + tid.y;
+
+            // Write transposed tile to output
+            if (x_out < rows && y_out < cols) {
+                output[b * batch_stride + y_out * rows + x_out] = tile[tid.x * TILE_PADDED + tid.y];
+            }
+        }
+        """
+    }
+
+    /// Generates a general transpose kernel for arbitrary dimension permutations.
+    /// Falls back to element-wise approach but with better memory access patterns.
+    private func generateGeneralTransposeKernel(
+        entryPoint: String,
+        inputShape: [Int],
+        outputShape: [Int],
+        permutation: [Int],
+        metalType: String = "float"
+    ) -> String {
         let rank = inputShape.count
 
         // Calculate input strides (row-major)
@@ -499,20 +746,16 @@ public final class CodeGenerator: @unchecked Sendable {
         }
 
         // Generate code to compute input linear index from permuted coordinates
-        // output[coord0, coord1, ...] = input[coord_perm[0], coord_perm[1], ...]
-        // So for input index, we use coord[permutation[i]] for each input dimension i
         var inputIndexCode = "uint inputIdx = "
         var terms: [String] = []
         for i in 0..<rank {
-            let outputDim = permutation[i]  // Which output coordinate maps to input dim i
+            let outputDim = permutation[i]
             if inputStrides[i] != 0 {
                 terms.append("coord\(outputDim) * \(inputStrides[i])")
             }
         }
         inputIndexCode += terms.isEmpty ? "0" : terms.joined(separator: " + ")
         inputIndexCode += ";"
-
-        let totalElements = outputShape.reduce(1, *)
 
         return """
         kernel void \(entryPoint)(
@@ -1077,32 +1320,41 @@ public final class CodeGenerator: @unchecked Sendable {
 
         // Determine reduction operation based on reductionKind
         let reductionKind = attributes.reductionKind ?? .sum
-        let (accumOp, initComment): (String, String)
+        let (accumOp, reduceOp, initValue): (String, String, String)
         switch reductionKind {
         case .sum:
-            accumOp = "accum += input[inputIdx];"
-            initComment = "// Start with init value (typically 0 for sum)"
+            accumOp = "accum += val;"
+            reduceOp = "a + b"
+            initValue = "0.0f"
         case .max:
-            accumOp = "accum = max(accum, input[inputIdx]);"
-            initComment = "// Start with init value (typically -FLT_MAX for max)"
+            accumOp = "accum = max(accum, val);"
+            reduceOp = "max(a, b)"
+            initValue = "-INFINITY"
         case .min:
-            accumOp = "accum = min(accum, input[inputIdx]);"
-            initComment = "// Start with init value (typically FLT_MAX for min)"
+            accumOp = "accum = min(accum, val);"
+            reduceOp = "min(a, b)"
+            initValue = "INFINITY"
         case .mean:
             // Mean reduction: sum then divide by count (handled as sum here, divide done separately)
-            accumOp = "accum += input[inputIdx];"
-            initComment = "// Start with init value (0 for mean accumulation)"
+            accumOp = "accum += val;"
+            reduceOp = "a + b"
+            initValue = "0.0f"
         }
 
         // NOTE: reduce operation has two inputs: data (buffer 0) and init value (buffer 1)
         // Output is at buffer 2, followed by scalar parameters
 
+        // Use parallel tree reduction with shared memory for better performance
+        // Each threadgroup cooperatively reduces one output element
+        let blockSize = 256  // Threads per threadgroup
+
         let source = """
         #include <metal_stdlib>
         using namespace metal;
 
-        // Reduction kernel: each thread handles one output element
-        // and sequentially reduces over the reduction dimension
+        // Optimized parallel tree reduction kernel
+        // Each threadgroup handles one output element
+        // Threads cooperatively reduce using shared memory
         // Reduction type: \(reductionKind)
         kernel void kernel_reduce(
             device const float* input [[buffer(0)]],
@@ -1111,30 +1363,55 @@ public final class CodeGenerator: @unchecked Sendable {
             constant uint& outputCount [[buffer(3)]],
             constant uint& reduceSize [[buffer(4)]],
             constant uint& innerSize [[buffer(5)]],
-            uint tid [[thread_position_in_grid]])
+            threadgroup float* shared [[threadgroup(0)]],
+            uint tid [[thread_position_in_threadgroup]],
+            uint tgid [[threadgroup_position_in_grid]],
+            uint tgSize [[threads_per_threadgroup]])
         {
-            if (tid >= outputCount) return;
+            // Each threadgroup handles one output element
+            if (tgid >= outputCount) return;
 
-            // Compute which output element this thread handles
-            // output layout: [outer..., inner...]
-            // input layout: [outer..., reduce, inner...]
-            uint outerIdx = tid / innerSize;
-            uint innerIdx = tid % innerSize;
+            // Compute output coordinates
+            uint outerIdx = tgid / innerSize;
+            uint innerIdx = tgid % innerSize;
+            uint baseInputIdx = outerIdx * reduceSize * innerSize + innerIdx;
 
-            \(initComment)
-            float accum = initValue[0];
+            // Phase 1: Each thread reduces its assigned chunk of the reduction dimension
+            float accum = \(initValue);
 
-            // Reduce over the reduction dimension
-            for (uint r = 0; r < reduceSize; r++) {
-                uint inputIdx = outerIdx * reduceSize * innerSize + r * innerSize + innerIdx;
+            // Stride through reduction dimension, each thread handles multiple elements
+            for (uint r = tid; r < reduceSize; r += tgSize) {
+                uint inputIdx = baseInputIdx + r * innerSize;
+                float val = input[inputIdx];
                 \(accumOp)
             }
 
-            output[tid] = accum;
+            // Store partial result in shared memory
+            shared[tid] = accum;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Phase 2: Parallel tree reduction in shared memory
+            // Reduce 256 -> 128 -> 64 -> 32 -> 16 -> 8 -> 4 -> 2 -> 1
+            for (uint stride = tgSize / 2; stride > 0; stride >>= 1) {
+                if (tid < stride) {
+                    float a = shared[tid];
+                    float b = shared[tid + stride];
+                    shared[tid] = \(reduceOp);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            // Thread 0 writes the final result
+            if (tid == 0) {
+                // Apply the user-provided init value as well
+                float a = shared[0];
+                float b = initValue[0];
+                output[tgid] = \(reduceOp);
+            }
         }
         """
 
-        return (source, "kernel_reduce", TuningConfig(blockSize: 256))
+        return (source, "kernel_reduce", TuningConfig(blockSize: blockSize))
     }
 
     /// Generates attention source.
@@ -1917,6 +2194,46 @@ public final class CodeGenerator: @unchecked Sendable {
                     }
                 }
             case .reduce:
+                // Each threadgroup handles one output element
+                // Threads within threadgroup cooperatively reduce using tree reduction
+                let blockSize = 256
+                let numThreadgroups = totalElements  // One threadgroup per output element
+                return DispatchConfig(
+                    gridSize: MTLSize(width: numThreadgroups, height: 1, depth: 1),
+                    threadgroupSize: MTLSize(width: blockSize, height: 1, depth: 1)
+                )
+            case .transpose:
+                // Use tiled dispatch for 2D and 3D transpose
+                // The kernel uses 32x32 tiles with shared memory
+                // Grid dimensions must match input shape since kernel iterates over input tiles
+                // For transpose [M, N] -> [N, M]: gid.x covers input cols (N), gid.y covers input rows (M)
+                let tileSize = 32
+                if outputShape.count == 2 {
+                    // 2D transpose: input was [M, N], output is [N, M]
+                    // output_rows = N (input cols), output_cols = M (input rows)
+                    let inputCols = outputShape[0]  // N = output rows = input cols
+                    let inputRows = outputShape[1]  // M = output cols = input rows
+                    // Grid covers input tiles: gid.x over cols, gid.y over rows
+                    let gridWidth = (inputCols + tileSize - 1) / tileSize
+                    let gridHeight = (inputRows + tileSize - 1) / tileSize
+                    return DispatchConfig(
+                        gridSize: MTLSize(width: gridWidth, height: gridHeight, depth: 1),
+                        threadgroupSize: MTLSize(width: tileSize, height: tileSize, depth: 1)
+                    )
+                } else if outputShape.count == 3 {
+                    // 3D transpose [B, M, N] -> [B, N, M]
+                    // output is [B, N, M]: outputShape[1] = N (input cols), outputShape[2] = M (input rows)
+                    let batch = outputShape[0]
+                    let inputCols = outputShape[1]  // N = output rows = input cols per batch
+                    let inputRows = outputShape[2]  // M = output cols = input rows per batch
+                    let gridWidth = (inputCols + tileSize - 1) / tileSize
+                    let gridHeight = (inputRows + tileSize - 1) / tileSize
+                    return DispatchConfig(
+                        gridSize: MTLSize(width: gridWidth, height: gridHeight, depth: batch),
+                        threadgroupSize: MTLSize(width: tileSize, height: tileSize, depth: 1)
+                    )
+                }
+                // Fall back to 1D for higher dimensions
                 return DispatchConfig.dispatch1D(elements: totalElements, threadgroupSize: 256)
             default:
                 break
@@ -1951,6 +2268,13 @@ public final class CodeGenerator: @unchecked Sendable {
 
         default:
             break
+        }
+
+        // For float elementwise operations, use vectorized dispatch (4 elements per thread)
+        // Add 1 to handle remainder elements
+        if elementType == .float32 {
+            let vectorizedCount = (totalElements + 3) / 4 + 1
+            return DispatchConfig.dispatch1D(elements: vectorizedCount, threadgroupSize: 256)
         }
 
         return DispatchConfig.dispatch1D(elements: totalElements)
@@ -2223,7 +2547,18 @@ public final class CodeGenerator: @unchecked Sendable {
                 let tileSize = tuning?.tileM ?? 32
                 return 2 * tileSize * tileSize * elemSize
             }
-            // Reduce kernel uses simple sequential reduction per thread, no shared memory needed
+            if opKind == .transpose {
+                // Tiled transpose uses 32x32 tile with +1 padding to avoid bank conflicts
+                // Total: 32 * 33 * elemSize = 1056 * elemSize
+                let tileSize = 32
+                let tilePadded = tileSize + 1
+                return tileSize * tilePadded * elemSize
+            }
+            if opKind == .reduce {
+                // Parallel tree reduction uses shared memory for 256 threads
+                let blockSize = 256
+                return blockSize * elemSize
+            }
         case .fusedMatMulBiasAct:
             // For now, fusedMatMulBiasAct uses basic tiled approach
             let tileSize = tuning?.tileM ?? 32
@@ -2233,5 +2568,34 @@ public final class CodeGenerator: @unchecked Sendable {
         }
 
         return 0
+    }
+
+    /// Calculates the number of threadgroup memory buffers for an operation.
+    private func calculateThreadgroupBufferCount(type: FusedOpType, elementType: ElementType = .float32) -> Int {
+        switch type {
+        case .original(let opKind):
+            if opKind == .dot || opKind == .dotGeneral {
+                // Simdgroup kernels (float types) don't use threadgroup memory
+                if isFloatType(elementType) {
+                    return 0
+                }
+                // Basic tiled matmul needs 2 buffers (tileA and tileB)
+                return 2
+            }
+            if opKind == .transpose {
+                // Tiled transpose uses 1 buffer (tile)
+                return 1
+            }
+            if opKind == .reduce {
+                // Parallel tree reduction uses 1 buffer (shared accumulator)
+                return 1
+            }
+        case .fusedMatMulBiasAct:
+            // Uses 2 buffers (tileA and tileB)
+            return 2
+        default:
+            break
+        }
+        return 1
     }
 }
