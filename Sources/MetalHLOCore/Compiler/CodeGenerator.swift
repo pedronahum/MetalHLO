@@ -6,6 +6,31 @@
 import Foundation
 import Metal
 
+// MARK: - Generation Result
+
+/// Result of code generation including both kernel specs and view mappings.
+public struct CodeGenerationResult: Sendable {
+    /// Kernel specifications for operations that require GPU execution.
+    public let kernelSpecs: [OpID: KernelSpec]
+
+    /// View mappings for operations that are zero-copy views.
+    /// Key is the output tensor ID, value is the view definition.
+    public let viewMappings: [TensorID: StridedTensorView]
+
+    /// Operation IDs that are view operations (no kernel needed).
+    public let viewOperations: Set<OpID>
+
+    public init(
+        kernelSpecs: [OpID: KernelSpec],
+        viewMappings: [TensorID: StridedTensorView] = [:],
+        viewOperations: Set<OpID> = []
+    ) {
+        self.kernelSpecs = kernelSpecs
+        self.viewMappings = viewMappings
+        self.viewOperations = viewOperations
+    }
+}
+
 // MARK: - Code Generator
 
 /// Generates Metal kernel specifications for an optimized module.
@@ -68,14 +93,30 @@ public final class CodeGenerator: @unchecked Sendable {
     // MARK: - Generation
 
     /// Generates kernel specifications for all operations in the module.
+    /// Returns only the kernel specs for backwards compatibility.
     public func generate(module: OptimizedModule, memoryPlan: MemoryPlan) -> [OpID: KernelSpec] {
+        return generateWithViews(module: module, memoryPlan: memoryPlan).kernelSpecs
+    }
+
+    /// Generates kernel specifications and view mappings for all operations.
+    /// View operations (transpose, reshape) are converted to zero-copy views.
+    public func generateWithViews(module: OptimizedModule, memoryPlan: MemoryPlan) -> CodeGenerationResult {
         var specs: [OpID: KernelSpec] = [:]
+        var viewMappings: [TensorID: StridedTensorView] = [:]
+        var viewOperations: Set<OpID> = []
 
         // Track function input names for proper binding generation
         let inputNames = Set(module.inputs.map { $0.name })
 
         // Track constant tensor IDs
         let constantIDs = Set(module.constants.keys)
+
+        // Build a view registry that tracks tensor views
+        // Start with contiguous views for all inputs
+        for input in module.inputs {
+            let inputInfo = TensorInfo(id: input.name, type: input.type)
+            viewMappings[input.name] = StridedTensorView.from(inputInfo)
+        }
 
         for opID in memoryPlan.executionOrder {
             // opID is an integer index into the operations array
@@ -87,20 +128,122 @@ public final class CodeGenerator: @unchecked Sendable {
                 continue
             }
 
+            // Check if this is a view operation
+            if let viewResult = tryGenerateViewOperation(
+                op: op,
+                tensors: module.tensors,
+                viewMappings: viewMappings
+            ) {
+                // This is a view operation - store the view mapping
+                viewMappings[viewResult.outputID] = viewResult.view
+                viewOperations.insert(String(opID))
+                continue
+            }
+
+            // Generate kernel for non-view operations
             let spec = generateKernel(
                 op: op,
                 tensors: module.tensors,
                 layouts: module.layouts,
                 memoryPlan: memoryPlan,
                 inputNames: inputNames,
-                constantIDs: constantIDs
+                constantIDs: constantIDs,
+                viewMappings: viewMappings
             )
 
             // Use string-converted integer as key to match executionOrder format
             specs[String(opID)] = spec
+
+            // Create contiguous view for this operation's output
+            for output in op.outputs {
+                viewMappings[output.id] = StridedTensorView.from(output)
+            }
         }
 
-        return specs
+        return CodeGenerationResult(
+            kernelSpecs: specs,
+            viewMappings: viewMappings,
+            viewOperations: viewOperations
+        )
+    }
+
+    // MARK: - View Operation Detection
+
+    /// Result of attempting to generate a view operation.
+    private struct ViewResult {
+        let outputID: TensorID
+        let view: StridedTensorView
+    }
+
+    /// Attempts to convert an operation to a view operation.
+    /// Returns nil if the operation requires a kernel.
+    ///
+    /// Currently only reshape is supported as a view operation because:
+    /// - Reshape of contiguous data produces contiguous output (same strides)
+    /// - Transpose produces non-contiguous views requiring strided access in downstream ops
+    /// - Full transpose-as-view support requires strided kernel generation (future work)
+    private func tryGenerateViewOperation(
+        op: FusedOp,
+        tensors: [TensorID: TensorInfo],
+        viewMappings: [TensorID: StridedTensorView]
+    ) -> ViewResult? {
+        guard case .original(let opKind) = op.type else {
+            return nil
+        }
+
+        switch opKind {
+        // Reshape is safe as a view - maintains contiguous layout
+        case .reshape:
+            return tryGenerateReshapeView(op: op, tensors: tensors, viewMappings: viewMappings)
+
+        // Transpose requires strided access patterns in downstream kernels
+        // For now, keep as a kernel until strided kernel generation is implemented
+        // case .transpose:
+        //     return tryGenerateTransposeView(op: op, tensors: tensors, viewMappings: viewMappings)
+
+        default:
+            return nil
+        }
+    }
+
+    /// Attempts to convert a transpose to a view.
+    private func tryGenerateTransposeView(
+        op: FusedOp,
+        tensors: [TensorID: TensorInfo],
+        viewMappings: [TensorID: StridedTensorView]
+    ) -> ViewResult? {
+        guard let inputID = op.inputs.first,
+              let inputView = viewMappings[inputID],
+              let permutation = op.attributes.dimensions,
+              let outputInfo = op.outputs.first else {
+            return nil
+        }
+
+        // Create transposed view
+        let transposedView = inputView.transposed(permutation: permutation)
+
+        return ViewResult(outputID: outputInfo.id, view: transposedView)
+    }
+
+    /// Attempts to convert a reshape to a view.
+    private func tryGenerateReshapeView(
+        op: FusedOp,
+        tensors: [TensorID: TensorInfo],
+        viewMappings: [TensorID: StridedTensorView]
+    ) -> ViewResult? {
+        guard let inputID = op.inputs.first,
+              let inputView = viewMappings[inputID],
+              let outputInfo = op.outputs.first else {
+            return nil
+        }
+
+        // Try to reshape without copy
+        guard let reshapedView = inputView.reshaped(to: outputInfo.shape) else {
+            // Reshape requires copy (input is non-contiguous)
+            return nil
+        }
+
+        return ViewResult(outputID: outputInfo.id, view: reshapedView)
     }
 
     // MARK: - Type Mapping
@@ -141,7 +284,8 @@ public final class CodeGenerator: @unchecked Sendable {
         layouts: [TensorID: TensorLayout],
         memoryPlan: MemoryPlan,
         inputNames: Set<String>,
-        constantIDs: Set<TensorID>
+        constantIDs: Set<TensorID>,
+        viewMappings: [TensorID: StridedTensorView] = [:]
     ) -> KernelSpec {
         // Get shapes and element type
         let inputShapes = op.inputs.compactMap { tensors[$0]?.shape }
@@ -165,13 +309,14 @@ public final class CodeGenerator: @unchecked Sendable {
             elementType: elementType
         )
 
-        // Build buffer bindings
+        // Build buffer bindings (with view resolution)
         let bindings = buildBindings(
             op: op,
             tensors: tensors,
             memoryPlan: memoryPlan,
             inputNames: inputNames,
-            constantIDs: constantIDs
+            constantIDs: constantIDs,
+            viewMappings: viewMappings
         )
 
         // Calculate shared memory size and buffer count
@@ -2342,30 +2487,51 @@ public final class CodeGenerator: @unchecked Sendable {
     // MARK: - Buffer Bindings
 
     /// Builds buffer bindings for an operation.
+    /// Resolves view tensors to their base tensor's memory location.
     private func buildBindings(
         op: FusedOp,
         tensors: [TensorID: TensorInfo],
         memoryPlan: MemoryPlan,
         inputNames: Set<String>,
-        constantIDs: Set<TensorID>
+        constantIDs: Set<TensorID>,
+        viewMappings: [TensorID: StridedTensorView] = [:]
     ) -> [BufferBinding] {
         var bindings: [BufferBinding] = []
         var index = 0
+
+        // Helper to resolve view chain and get base tensor ID and byte offset
+        func resolveViewChain(_ tensorID: TensorID) -> (baseTensorID: TensorID, byteOffset: Int) {
+            var currentID = tensorID
+            var totalOffset = 0
+
+            while let view = viewMappings[currentID] {
+                totalOffset += view.byteOffset
+                currentID = view.baseTensorID
+            }
+
+            return (currentID, totalOffset)
+        }
 
         // Input bindings
         for inputID in op.inputs {
             let source: BufferSource
             let size = tensors[inputID]?.byteSize ?? 0
 
+            // Resolve view chain to get base tensor
+            let (baseTensorID, viewOffset) = resolveViewChain(inputID)
+
             // Check if this is a constant (pre-materialized into constant buffer)
-            if constantIDs.contains(inputID) {
-                source = .constant(id: inputID)
+            if constantIDs.contains(baseTensorID) {
+                source = .constant(id: baseTensorID)
             }
             // Check if this is a function input (comes from external buffer)
-            else if inputNames.contains(inputID) {
-                source = .input(name: inputID)
+            else if inputNames.contains(baseTensorID) {
+                source = .input(name: baseTensorID)
+            } else if let offset = memoryPlan.tensorOffsets[baseTensorID] {
+                // Intermediate result in the unified buffer (include view offset)
+                source = .unified(offset: offset + viewOffset)
             } else if let offset = memoryPlan.tensorOffsets[inputID] {
-                // Intermediate result in the unified buffer
+                // Fallback: try original tensor ID
                 source = .unified(offset: offset)
             } else {
                 // Fallback: treat as input (shouldn't happen normally)

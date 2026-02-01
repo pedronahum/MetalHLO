@@ -412,22 +412,43 @@ public final class IntegratedExecutor: @unchecked Sendable {
     }
 
     /// Resolves a buffer binding to an actual buffer and offset.
+    /// Handles view resolution - if a tensor is a view of another tensor,
+    /// resolves to the base tensor's memory location with appropriate offset.
     private func resolveBinding(
         _ binding: BufferBinding,
         inputs: [String: MTLBuffer]
     ) throws -> (MTLBuffer, Int) {
         switch binding.source {
         case .input(let name):
+            // Check if this input is actually a view of another tensor
+            let (baseTensorID, viewOffset) = executable.resolveViewChain(name)
+
+            // Try to get from inputs first (for direct inputs)
+            if let buffer = inputs[baseTensorID] {
+                return (buffer, binding.offset + viewOffset)
+            }
+
+            // Original input lookup
             guard let buffer = inputs[name] else {
                 throw IntegratedExecutorError.missingInput(name)
             }
             return (buffer, binding.offset)
 
         case .output(let name):
+            // Resolve view chain to get base tensor and offset
+            let (baseTensorID, viewOffset) = executable.resolveViewChain(name)
+
             // Outputs come from the unified buffer
+            // First try the base tensor's offset (for views)
+            if let outputOffset = executable.memoryPlan.tensorOffsets[baseTensorID] {
+                return (unifiedBuffer, outputOffset + binding.offset + viewOffset)
+            }
+
+            // Fall back to original name lookup
             if let outputOffset = executable.memoryPlan.tensorOffsets[name] {
                 return (unifiedBuffer, outputOffset + binding.offset)
             }
+
             // If not in memory plan, it's a direct output
             guard let buffer = inputs[name] else {
                 // Output will be extracted later from unified buffer
@@ -455,12 +476,16 @@ public final class IntegratedExecutor: @unchecked Sendable {
     }
 
     /// Extracts output buffers from the unified buffer.
+    /// Handles views - if an output is a view, extracts from the base tensor location.
     private func extractOutputs(inputs: [String: MTLBuffer]) throws -> [String: MTLBuffer] {
         var outputs: [String: MTLBuffer] = [:]
 
         for (name, spec) in executable.outputSpecs {
-            // Check if output is in memory plan
-            if let offset = executable.memoryPlan.tensorOffsets[name] {
+            // Resolve view chain to get base tensor and offset
+            let (baseTensorID, viewOffset) = executable.resolveViewChain(name)
+
+            // First try base tensor's offset (for views)
+            if let offset = executable.memoryPlan.tensorOffsets[baseTensorID] {
                 // Get output buffer from pool or allocate new one
                 let outputBuffer: MTLBuffer
                 if let pool = outputBufferPool, let pooled = pool.acquire(name) {
@@ -479,7 +504,32 @@ public final class IntegratedExecutor: @unchecked Sendable {
                     outputBuffer = newBuffer
                 }
 
-                // Copy data from unified buffer
+                // Copy data from unified buffer (including view offset)
+                memcpy(
+                    outputBuffer.contents(),
+                    unifiedBuffer.contents().advanced(by: offset + viewOffset),
+                    spec.byteSize
+                )
+
+                outputs[name] = outputBuffer
+            } else if let offset = executable.memoryPlan.tensorOffsets[name] {
+                // Fall back to direct name lookup (non-view case)
+                let outputBuffer: MTLBuffer
+                if let pool = outputBufferPool, let pooled = pool.acquire(name) {
+                    outputBuffer = pooled
+                } else {
+                    guard let newBuffer = device.makeBuffer(
+                        length: spec.byteSize,
+                        options: .storageModeShared
+                    ) else {
+                        throw IntegratedExecutorError.bufferAllocationFailed(size: spec.byteSize)
+                    }
+                    if let label = config.debugLabel {
+                        newBuffer.label = "\(label)_output_\(name)"
+                    }
+                    outputBuffer = newBuffer
+                }
+
                 memcpy(
                     outputBuffer.contents(),
                     unifiedBuffer.contents().advanced(by: offset),

@@ -356,7 +356,11 @@ public final class CompiledExecutable: @unchecked Sendable {
     /// Constant buffers (pre-created).
     public let constantBuffers: [String: MTLBuffer]
 
-    /// Execution order (excludes constant operations which don't have pipelines).
+    /// View mappings for zero-copy operations (transpose, reshape).
+    /// Maps output tensor ID to its view definition pointing to base tensor.
+    public let viewMappings: [TensorID: StridedTensorView]
+
+    /// Execution order (excludes constant and view operations which don't have pipelines).
     public var executionOrder: [OpID] {
         memoryPlan.executionOrder
             .map { String($0) }
@@ -377,7 +381,8 @@ public final class CompiledExecutable: @unchecked Sendable {
         memoryPlan: MemoryPlan,
         inputSpecs: [String: TensorSpec],
         outputSpecs: [String: TensorSpec],
-        constantBuffers: [String: MTLBuffer] = [:]
+        constantBuffers: [String: MTLBuffer] = [:],
+        viewMappings: [TensorID: StridedTensorView] = [:]
     ) {
         self.pipelines = pipelines
         self.dispatches = dispatches
@@ -388,6 +393,21 @@ public final class CompiledExecutable: @unchecked Sendable {
         self.inputSpecs = inputSpecs
         self.outputSpecs = outputSpecs
         self.constantBuffers = constantBuffers
+        self.viewMappings = viewMappings
+    }
+
+    /// Resolves a tensor ID through view chain to find the ultimate base tensor.
+    /// Returns the base tensor ID and total byte offset.
+    public func resolveViewChain(_ tensorID: TensorID) -> (baseTensorID: TensorID, byteOffset: Int) {
+        var currentID = tensorID
+        var totalOffset = 0
+
+        while let view = viewMappings[currentID] {
+            totalOffset += view.byteOffset
+            currentID = view.baseTensorID
+        }
+
+        return (currentID, totalOffset)
     }
 
     /// Validates that the provided inputs match the expected specs.

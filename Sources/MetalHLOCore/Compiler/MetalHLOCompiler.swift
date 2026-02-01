@@ -179,23 +179,24 @@ public final class MetalHLOCompiler: @unchecked Sendable {
         let memoryPlan = planMemory(optimized)
 
         // ═══════════════════════════════════════════════════════════════
-        // STAGE 5: GENERATE KERNELS
+        // STAGE 5: GENERATE KERNELS (with view detection)
         // ═══════════════════════════════════════════════════════════════
-        let kernelSpecs = codeGenerator.generate(module: optimized, memoryPlan: memoryPlan)
+        let codeGenResult = codeGenerator.generateWithViews(module: optimized, memoryPlan: memoryPlan)
 
         // ═══════════════════════════════════════════════════════════════
         // STAGE 6: COMPILE METAL
         // ═══════════════════════════════════════════════════════════════
-        let pipelines = try compileKernels(kernelSpecs)
+        let pipelines = try compileKernels(codeGenResult.kernelSpecs)
 
         // ═══════════════════════════════════════════════════════════════
         // STAGE 7: PACKAGE
         // ═══════════════════════════════════════════════════════════════
         let executable = packageExecutable(
             pipelines: pipelines,
-            kernelSpecs: kernelSpecs,
+            kernelSpecs: codeGenResult.kernelSpecs,
             memoryPlan: memoryPlan,
-            optimized: optimized
+            optimized: optimized,
+            viewMappings: codeGenResult.viewMappings
         )
 
         // Cache the result
@@ -211,14 +212,15 @@ public final class MetalHLOCompiler: @unchecked Sendable {
         let analysis = analyzer.analyze(function)
         let optimized = optimize(function, analysis: analysis)
         let memoryPlan = planMemory(optimized)
-        let kernelSpecs = codeGenerator.generate(module: optimized, memoryPlan: memoryPlan)
-        let pipelines = try compileKernels(kernelSpecs)
+        let codeGenResult = codeGenerator.generateWithViews(module: optimized, memoryPlan: memoryPlan)
+        let pipelines = try compileKernels(codeGenResult.kernelSpecs)
 
         return packageExecutable(
             pipelines: pipelines,
-            kernelSpecs: kernelSpecs,
+            kernelSpecs: codeGenResult.kernelSpecs,
             memoryPlan: memoryPlan,
-            optimized: optimized
+            optimized: optimized,
+            viewMappings: codeGenResult.viewMappings
         )
     }
 
@@ -359,7 +361,8 @@ public final class MetalHLOCompiler: @unchecked Sendable {
         pipelines: [OpID: MTLComputePipelineState],
         kernelSpecs: [OpID: KernelSpec],
         memoryPlan: MemoryPlan,
-        optimized: OptimizedModule
+        optimized: OptimizedModule,
+        viewMappings: [TensorID: StridedTensorView] = [:]
     ) -> CompiledExecutable {
         // Build dispatch configs and shared memory sizes
         var dispatches: [OpID: DispatchConfig] = [:]
@@ -401,7 +404,8 @@ public final class MetalHLOCompiler: @unchecked Sendable {
             memoryPlan: memoryPlan,
             inputSpecs: inputSpecs,
             outputSpecs: outputSpecs,
-            constantBuffers: constantBuffers
+            constantBuffers: constantBuffers,
+            viewMappings: viewMappings
         )
     }
 
