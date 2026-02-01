@@ -161,6 +161,47 @@ public enum OperationBenchmarks {
             }
         ))
 
+        // Reshape benchmarks
+        benchmarks.append(SimpleBenchmark(
+            id: "MAT-RSH-001",
+            name: "Reshape Flatten 1024x1024",
+            category: "matrix",
+            operation: "reshape",
+            configuration: ["from": "1024x1024", "to": "1048576", "dtype": "f32"],
+            mlirProgram: """
+            module @reshape_flatten {
+              func.func @main(%arg0: tensor<1024x1024xf32>) -> (tensor<1048576xf32>) {
+                %0 = stablehlo.reshape %arg0 : (tensor<1024x1024xf32>) -> tensor<1048576xf32>
+                return %0 : tensor<1048576xf32>
+              }
+            }
+            """,
+            inputGenerator: { client in
+                let gen = TestDataGenerator(seed: 42)
+                return [try gen.createUniformFloat32Buffer(client: client, shape: [1024, 1024])]
+            }
+        ))
+
+        benchmarks.append(SimpleBenchmark(
+            id: "MAT-RSH-002",
+            name: "Reshape Batch Preserve 32x64x128",
+            category: "matrix",
+            operation: "reshape",
+            configuration: ["from": "32x64x128", "to": "32x8192", "dtype": "f32"],
+            mlirProgram: """
+            module @reshape_batch_preserve {
+              func.func @main(%arg0: tensor<32x64x128xf32>) -> (tensor<32x8192xf32>) {
+                %0 = stablehlo.reshape %arg0 : (tensor<32x64x128xf32>) -> tensor<32x8192xf32>
+                return %0 : tensor<32x8192xf32>
+              }
+            }
+            """,
+            inputGenerator: { client in
+                let gen = TestDataGenerator(seed: 42)
+                return [try gen.createUniformFloat32Buffer(client: client, shape: [32, 64, 128])]
+            }
+        ))
+
         return benchmarks
     }
 
@@ -315,10 +356,12 @@ public enum OperationBenchmarks {
         let binaryConfigs: [(id: String, op: String, stablehloOp: String, shape: [Int])] = [
             ("ARITH-B-001", "add", "add", [1024, 1024]),
             ("ARITH-B-002", "add", "add", [4096, 4096]),
-            ("ARITH-B-003", "multiply", "multiply", [1024, 1024]),
-            ("ARITH-B-004", "multiply", "multiply", [4096, 4096]),
-            ("ARITH-B-005", "divide", "divide", [1024, 1024]),
-            ("ARITH-B-006", "maximum", "maximum", [4096, 4096]),
+            ("ARITH-B-003", "add", "add", [16384, 16384]),  // Large add
+            ("ARITH-B-004", "multiply", "multiply", [1024, 1024]),
+            ("ARITH-B-005", "multiply", "multiply", [4096, 4096]),
+            ("ARITH-B-006", "divide", "divide", [1024, 1024]),
+            ("ARITH-B-007", "power", "power", [1024, 1024]),
+            ("ARITH-B-008", "maximum", "maximum", [4096, 4096]),
         ]
 
         for config in binaryConfigs {
@@ -448,6 +491,30 @@ public enum OperationBenchmarks {
                 let gen = TestDataGenerator(seed: 42)
                 let a = try gen.createUniformFloat32Buffer(client: client, shape: [1024, 1024])
                 let b = try client.createBuffer([1.5], shape: [1])
+                return [a, b]
+            }
+        ))
+
+        // ARITH-BC-003: Last dimension broadcast (common in layer norm, attention)
+        benchmarks.append(SimpleBenchmark(
+            id: "ARITH-BC-003",
+            name: "Multiply with Last Dim Broadcast",
+            category: "arithmetic",
+            operation: "multiply_broadcast",
+            configuration: ["shapes": "32x64x128 * 128", "dtype": "f32"],
+            mlirProgram: """
+            module @multiply_last_dim_broadcast {
+              func.func @main(%arg0: tensor<32x64x128xf32>, %arg1: tensor<128xf32>) -> (tensor<32x64x128xf32>) {
+                %0 = stablehlo.broadcast_in_dim %arg1, dims = [2] : (tensor<128xf32>) -> tensor<32x64x128xf32>
+                %1 = stablehlo.multiply %arg0, %0 : tensor<32x64x128xf32>
+                return %1 : tensor<32x64x128xf32>
+              }
+            }
+            """,
+            inputGenerator: { client in
+                let gen = TestDataGenerator(seed: 42)
+                let a = try gen.createUniformFloat32Buffer(client: client, shape: [32, 64, 128])
+                let b = try gen.createUniformFloat32Buffer(client: client, shape: [128])
                 return [a, b]
             }
         ))

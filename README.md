@@ -739,6 +739,155 @@ The following test categories are skipped due to fundamental MPS/Metal limitatio
 4. **Enable caching** — Repeated compilations of the same MLIR return cached results
 5. **Profile with timing** — Use `executeWithTiming()` to identify bottlenecks
 
+## Benchmarks
+
+MetalHLO includes a comprehensive benchmarking framework for measuring performance and comparing against MLX.
+
+### Benchmark Categories
+
+| Category | Benchmarks | Description |
+|----------|------------|-------------|
+| **Matrix Operations** | MAT-DOT-001 to MAT-DOT-008, MAT-BATCH-001 to MAT-BATCH-004, MAT-TR-*, MAT-RSH-* | GEMM, batched GEMM, transpose, reshape |
+| **Arithmetic** | ARITH-B-001 to ARITH-B-008, ARITH-BC-*, ARITH-U-* | Binary, broadcast, and unary operations |
+| **Reduction** | RED-001 to RED-009 | Sum, max, mean, pooling operations |
+| **Convolution** | CONV-001 to CONV-007 | Standard conv2d patterns (ResNet, VGG) |
+| **Normalization** | NORM-BN-*, NORM-LN-* | Batch norm, layer norm |
+| **Control Flow** | CF-001 to CF-005 | While loops, conditionals |
+| **Indexing** | IDX-001 to IDX-007 | Slice, gather, scatter, pad |
+| **Model Inference** | MLP-INF-*, CNN-INF-*, XFMR-INF-* | MLP, CNN, Transformer components |
+| **Training** | TRAIN-001 to TRAIN-003 | Forward + backward pass benchmarks |
+| **Compiler Analysis** | COMP-001 to COMP-005 | Compilation time for various program sizes |
+| **Fusion Analysis** | FUSION-001 to FUSION-004 | Fused vs naive execution comparison |
+| **Memory** | MEM-001 to MEM-003 | Peak allocation, buffer reuse |
+| **Power Efficiency** | PWR-001 to PWR-003 | Throughput per watt estimates |
+
+### Performance Comparison: MetalHLO vs MLX
+
+Benchmark results on Apple M1 (8GB):
+
+#### Matrix Operations
+| Benchmark | MetalHLO | MLX | Speedup |
+|-----------|----------|-----|---------|
+| MAT-DOT-001 (128×128) | 0.20ms | 0.28ms | 1.4x |
+| MAT-DOT-002 (512×512) | 0.51ms | 0.46ms | 0.9x |
+| MAT-DOT-003 (1024×1024) | 2.51ms | 1.36ms | 0.5x |
+| MAT-DOT-004 (2048×2048) | 18.9ms | 10.2ms | 0.5x |
+| MAT-BATCH-001 (8×512×512) | 2.80ms | 1.36ms | 0.5x |
+| MAT-BATCH-004 (12×64×512) | 0.30ms | 0.37ms | **1.2x** |
+
+#### Normalization (MetalHLO Strength)
+| Benchmark | MetalHLO | MLX | Speedup |
+|-----------|----------|-----|---------|
+| NORM-LN-001 (single) | 0.32ms | 0.68ms | **2.2x** |
+| NORM-LN-003 (BERT-large) | 0.60ms | 0.88ms | **1.5x** |
+
+#### Convolution
+| Benchmark | MetalHLO | MLX | Speedup |
+|-----------|----------|-----|---------|
+| CONV-002 (56×56, 3×3) | 0.20ms | 0.46ms | **2.4x** |
+| CONV-004 (14×14, 3×3) | 0.25ms | 0.59ms | **2.4x** |
+| CONV-006 (1×1 pointwise) | 0.21ms | 0.35ms | **1.6x** |
+
+#### Where Each Framework Excels
+
+**MetalHLO performs better on:**
+- Layer normalization (custom fused kernels)
+- Small to medium convolutions
+- Scalar broadcast operations
+- Some gather/scatter patterns
+- Multi-head attention batch configurations
+
+**MLX performs better on:**
+- Large matrix multiplications (>1024×1024)
+- Simple elementwise operations
+- Transpose operations (lazy evaluation)
+- Large batch reductions
+
+### Running Benchmarks
+
+```bash
+# Build the benchmark tools
+swift build --target BenchmarkRunner
+swift build --target MLXComparison
+
+# Run MetalHLO-only benchmarks
+.build/debug/benchmark-runner --category matrix
+.build/debug/benchmark-runner --category reduction
+.build/debug/benchmark-runner --all
+
+# Run MLX comparison (requires MLX to be available)
+.build/debug/mlx-comparison --quick              # 3 warmup, 10 iterations
+.build/debug/mlx-comparison                       # 10 warmup, 50 iterations
+.build/debug/mlx-comparison --category matrix    # Filter by category
+
+# Filter by benchmark ID
+.build/debug/mlx-comparison --filter "MAT-DOT"
+```
+
+### Benchmark Framework Features
+
+The benchmark framework provides:
+
+- **Timing Statistics**: Mean, std dev, min, max, p95, p99
+- **GPU Synchronization**: Accurate timing with Metal command buffer completion
+- **Warmup Support**: Configurable warmup iterations to avoid cold-start effects
+- **Reproducibility**: Seeded random data generators
+- **Multiple Output Formats**: Console, JSON, CSV
+
+```swift
+// Running benchmarks programmatically
+import MetalHLOBenchmarks
+
+let config = BenchmarkConfig(warmupIterations: 10, measurementIterations: 50)
+let runner = try BenchmarkRunner(config: config)
+
+// Run all matrix benchmarks
+let results = try runner.run(OperationBenchmarks.matrixBenchmarks())
+
+// Access timing statistics
+for result in results {
+    print("\(result.id): \(result.timing.mean * 1000)ms ± \(result.timing.stdDev * 1000)ms")
+}
+```
+
+### GPU Utilization Metrics
+
+The framework includes utilities for measuring GPU efficiency:
+
+```swift
+import MetalHLOBenchmarks
+
+// Detect hardware and calculate utilization
+let calculator = GPUMetricsCalculator()
+
+// After running a 1024x1024 matmul in 2.5ms
+let metrics = calculator.calculateMatMulMetrics(
+    m: 1024, n: 1024, k: 1024,
+    executionTimeSeconds: 0.0025
+)
+
+print(metrics.formatted())
+// Hardware: Apple M1
+// Compute: 0.86 / 2.60 TFLOPS (33.1% utilization)
+// Memory BW: 6.7 / 68.25 GB/s (9.8% utilization)
+```
+
+### Fusion Effectiveness Analysis
+
+Measure the benefit of operation fusion:
+
+```swift
+import MetalHLOBenchmarks
+
+let runner = FusionAnalysisRunner()
+let results = try runner.runAll()
+
+for result in results {
+    print(result.formatted())
+    // FUSION-001: Fused=1.23ms, Naive=3.45ms, Speedup=2.80x (expected: 2-3x)
+}
+```
+
 ## License
 
 Apache License 2.0 - see [LICENSE](LICENSE) for details.

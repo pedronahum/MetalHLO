@@ -209,6 +209,45 @@ public struct TransposeBenchmark: MLXBenchmark {
     }
 }
 
+/// Reshape benchmark.
+public struct ReshapeBenchmark: MLXBenchmark {
+    public let id: String
+    public let name: String
+    public let category: String = "matrix"
+    public let operation: String = "reshape"
+    public let inputShape: [Int]
+    public let outputShape: [Int]
+
+    public init(id: String, name: String, inputShape: [Int], outputShape: [Int]) {
+        self.id = id
+        self.name = name
+        self.inputShape = inputShape
+        self.outputShape = outputShape
+    }
+
+    public func run(iterations: Int, warmup: Int) -> MLXBenchmarkResult {
+        let a = MLXRandom.normal(inputShape)
+        eval(a)
+
+        for _ in 0..<warmup {
+            let c = a.reshaped(outputShape)
+            eval(c)
+        }
+
+        var times: [Double] = []
+        for _ in 0..<iterations {
+            let start = CFAbsoluteTimeGetCurrent()
+            let c = a.reshaped(outputShape)
+            eval(c)
+            Stream.gpu.synchronize()
+            let end = CFAbsoluteTimeGetCurrent()
+            times.append(end - start)
+        }
+
+        return computeResult(id: id, name: name, category: category, operation: operation, times: times, iterations: iterations)
+    }
+}
+
 // MARK: - Arithmetic Benchmarks
 
 /// Broadcast binary operation benchmark.
@@ -216,20 +255,27 @@ public struct BroadcastBinaryOpBenchmark: MLXBenchmark {
     public enum BroadcastType: String, Sendable {
         case row      // [M, N] + [1, N]
         case scalar   // [M, N] + scalar
+        case lastDim  // [B, M, N] * [N] - last dimension broadcast (common in normalization)
+    }
+
+    public enum OpKind: String, Sendable {
+        case add, multiply
     }
 
     public let id: String
     public let name: String
     public let category: String = "arithmetic"
-    public let operation: String = "broadcast_add"
+    public let operation: String = "broadcast"
     public let shape: [Int]
     public let broadcastType: BroadcastType
+    public let opKind: OpKind
 
-    public init(id: String, name: String, shape: [Int], broadcastType: BroadcastType) {
+    public init(id: String, name: String, shape: [Int], broadcastType: BroadcastType, opKind: OpKind = .add) {
         self.id = id
         self.name = name
         self.shape = shape
         self.broadcastType = broadcastType
+        self.opKind = opKind
     }
 
     public func run(iterations: Int, warmup: Int) -> MLXBenchmarkResult {
@@ -240,18 +286,27 @@ public struct BroadcastBinaryOpBenchmark: MLXBenchmark {
             b = MLXRandom.normal([1, shape[1]])
         case .scalar:
             b = MLXArray(2.0)
+        case .lastDim:
+            b = MLXRandom.normal([shape[shape.count - 1]])
         }
         eval(a, b)
 
+        func doOp() -> MLXArray {
+            switch opKind {
+            case .add: return a + b
+            case .multiply: return a * b
+            }
+        }
+
         for _ in 0..<warmup {
-            let c = a + b
+            let c = doOp()
             eval(c)
         }
 
         var times: [Double] = []
         for _ in 0..<iterations {
             let start = CFAbsoluteTimeGetCurrent()
-            let c = a + b
+            let c = doOp()
             eval(c)
             Stream.gpu.synchronize()
             let end = CFAbsoluteTimeGetCurrent()
@@ -265,7 +320,7 @@ public struct BroadcastBinaryOpBenchmark: MLXBenchmark {
 /// Binary elementwise operation benchmark.
 public struct BinaryOpBenchmark: MLXBenchmark {
     public enum OpType: String, Sendable {
-        case add, multiply, divide, maximum
+        case add, multiply, divide, maximum, power
     }
 
     public let id: String
@@ -283,8 +338,8 @@ public struct BinaryOpBenchmark: MLXBenchmark {
     }
 
     public func run(iterations: Int, warmup: Int) -> MLXBenchmarkResult {
-        let a = MLXRandom.normal(shape)
-        let b = MLXRandom.normal(shape)
+        let a = MLXRandom.uniform(low: 0.1, high: 2.0, shape)  // Use positive values for power
+        let b = MLXRandom.uniform(low: 0.5, high: 2.0, shape)
         eval(a, b)
 
         func doOp() -> MLXArray {
@@ -293,6 +348,7 @@ public struct BinaryOpBenchmark: MLXBenchmark {
             case .multiply: return a * b
             case .divide: return a / b
             case .maximum: return maximum(a, b)
+            case .power: return MLX.pow(a, b)
             }
         }
 
@@ -1000,17 +1056,24 @@ public enum MLXBenchmarks {
         benchmarks.append(TransposeBenchmark(id: "MAT-TR-001", name: "MLX Transpose 1024x1024", shape: [1024, 1024]))
         benchmarks.append(TransposeBenchmark(id: "MAT-TR-002", name: "MLX Transpose 3D 32x128x64", shape: [32, 128, 64], axes: [0, 2, 1]))
 
+        // Reshape benchmarks
+        benchmarks.append(ReshapeBenchmark(id: "MAT-RSH-001", name: "MLX Reshape Flatten 1024x1024", inputShape: [1024, 1024], outputShape: [1048576]))
+        benchmarks.append(ReshapeBenchmark(id: "MAT-RSH-002", name: "MLX Reshape Batch Preserve 32x64x128", inputShape: [32, 64, 128], outputShape: [32, 8192]))
+
         // Arithmetic benchmarks - binary
         benchmarks.append(BinaryOpBenchmark(id: "ARITH-B-001", name: "MLX Add 1024x1024", shape: [1024, 1024], opType: .add))
         benchmarks.append(BinaryOpBenchmark(id: "ARITH-B-002", name: "MLX Add 4096x4096", shape: [4096, 4096], opType: .add))
-        benchmarks.append(BinaryOpBenchmark(id: "ARITH-B-003", name: "MLX Multiply 1024x1024", shape: [1024, 1024], opType: .multiply))
-        benchmarks.append(BinaryOpBenchmark(id: "ARITH-B-004", name: "MLX Multiply 4096x4096", shape: [4096, 4096], opType: .multiply))
-        benchmarks.append(BinaryOpBenchmark(id: "ARITH-B-005", name: "MLX Divide 1024x1024", shape: [1024, 1024], opType: .divide))
-        benchmarks.append(BinaryOpBenchmark(id: "ARITH-B-006", name: "MLX Maximum 4096x4096", shape: [4096, 4096], opType: .maximum))
+        benchmarks.append(BinaryOpBenchmark(id: "ARITH-B-003", name: "MLX Add 16384x16384", shape: [16384, 16384], opType: .add))
+        benchmarks.append(BinaryOpBenchmark(id: "ARITH-B-004", name: "MLX Multiply 1024x1024", shape: [1024, 1024], opType: .multiply))
+        benchmarks.append(BinaryOpBenchmark(id: "ARITH-B-005", name: "MLX Multiply 4096x4096", shape: [4096, 4096], opType: .multiply))
+        benchmarks.append(BinaryOpBenchmark(id: "ARITH-B-006", name: "MLX Divide 1024x1024", shape: [1024, 1024], opType: .divide))
+        benchmarks.append(BinaryOpBenchmark(id: "ARITH-B-007", name: "MLX Power 1024x1024", shape: [1024, 1024], opType: .power))
+        benchmarks.append(BinaryOpBenchmark(id: "ARITH-B-008", name: "MLX Maximum 4096x4096", shape: [4096, 4096], opType: .maximum))
 
         // Arithmetic benchmarks - broadcast
-        benchmarks.append(BroadcastBinaryOpBenchmark(id: "ARITH-BC-001", name: "MLX Add Row Broadcast 4096x4096", shape: [4096, 4096], broadcastType: .row))
-        benchmarks.append(BroadcastBinaryOpBenchmark(id: "ARITH-BC-002", name: "MLX Add Scalar Broadcast 4096x4096", shape: [4096, 4096], broadcastType: .scalar))
+        benchmarks.append(BroadcastBinaryOpBenchmark(id: "ARITH-BC-001", name: "MLX Add Row Broadcast 1024x1024", shape: [1024, 1024], broadcastType: .row))
+        benchmarks.append(BroadcastBinaryOpBenchmark(id: "ARITH-BC-002", name: "MLX Add Scalar Broadcast 1024x1024", shape: [1024, 1024], broadcastType: .scalar))
+        benchmarks.append(BroadcastBinaryOpBenchmark(id: "ARITH-BC-003", name: "MLX Multiply Last Dim Broadcast 32x64x128", shape: [32, 64, 128], broadcastType: .lastDim, opKind: .multiply))
 
         // Arithmetic benchmarks - unary
         benchmarks.append(UnaryOpBenchmark(id: "ARITH-U-001", name: "MLX Exp 1024x1024", shape: [1024, 1024], opType: .exp))
