@@ -170,6 +170,12 @@ public struct TuningConfig: Sendable, Hashable {
     /// Number of elements per thread.
     public var elementsPerThread: Int?
 
+    /// Use row reduction kernel (one thread per row, no threadgroup cooperation).
+    public var useRowReduction: Bool
+
+    /// Use column reduction kernel (one thread per column, no threadgroup cooperation).
+    public var useColumnReduction: Bool
+
     public init(
         tileM: Int? = nil,
         tileN: Int? = nil,
@@ -178,7 +184,9 @@ public struct TuningConfig: Sendable, Hashable {
         useSharedMemory: Bool = false,
         useSIMDGroups: Bool = false,
         unrollFactor: Int? = nil,
-        elementsPerThread: Int? = nil
+        elementsPerThread: Int? = nil,
+        useRowReduction: Bool = false,
+        useColumnReduction: Bool = false
     ) {
         self.tileM = tileM
         self.tileN = tileN
@@ -188,6 +196,8 @@ public struct TuningConfig: Sendable, Hashable {
         self.useSIMDGroups = useSIMDGroups
         self.unrollFactor = unrollFactor
         self.elementsPerThread = elementsPerThread
+        self.useRowReduction = useRowReduction
+        self.useColumnReduction = useColumnReduction
     }
 
     /// Default tuning for small operations.

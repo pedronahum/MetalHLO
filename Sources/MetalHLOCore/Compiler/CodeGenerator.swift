@@ -412,7 +412,7 @@ public final class CodeGenerator: @unchecked Sendable {
     }
 
     /// Generates a unary kernel with configurable element type.
-    /// Uses float4 vectorization for float types for better memory bandwidth.
+    /// Uses float8 vectorization (two float4 per thread) for better memory bandwidth.
     private func generateUnaryKernel(entryPoint: String, operation: String, metalType: String = "float") -> String {
         // Use vectorized kernel for float types
         if metalType == "float" {
@@ -443,18 +443,21 @@ public final class CodeGenerator: @unchecked Sendable {
                 constant uint& count [[buffer(2)]],
                 uint tid [[thread_position_in_grid]])
             {
-                // Process 4 elements at a time using float4 vectorization
-                uint idx4 = tid * 4;
-                uint count4 = count / 4;
+                // Process 8 elements at a time using float4x2 vectorization
+                uint idx8 = tid * 8;
+                uint count8 = count / 8;
 
-                if (tid < count4) {
-                    // Vectorized path: process 4 elements
-                    float4 x4 = reinterpret_cast<device const float4*>(input)[tid];
-                    reinterpret_cast<device float4*>(output)[tid] = \(vec4Operation);
+                if (tid < count8) {
+                    // Vectorized path: process 8 elements (two float4)
+                    uint base = tid * 2;
+                    float4 x4 = reinterpret_cast<device const float4*>(input)[base];
+                    reinterpret_cast<device float4*>(output)[base] = \(vec4Operation);
+                    x4 = reinterpret_cast<device const float4*>(input)[base + 1];
+                    reinterpret_cast<device float4*>(output)[base + 1] = \(vec4Operation);
                 }
-                else if (tid == count4) {
-                    // Handle remainder (up to 3 elements)
-                    for (uint i = idx4; i < count; i++) {
+                else if (tid == count8) {
+                    // Handle remainder (up to 7 elements)
+                    for (uint i = idx8; i < count; i++) {
                         float x = input[i];
                         output[i] = \(operation);
                     }
@@ -479,7 +482,7 @@ public final class CodeGenerator: @unchecked Sendable {
     }
 
     /// Generates a binary kernel with configurable element type.
-    /// Uses float4 vectorization for float types for better memory bandwidth.
+    /// Uses float8 vectorization (two float4 per thread) for better memory bandwidth.
     private func generateBinaryKernel(entryPoint: String, operation: String, metalType: String = "float") -> String {
         // Use vectorized kernel for float types
         if metalType == "float" {
@@ -501,19 +504,23 @@ public final class CodeGenerator: @unchecked Sendable {
                 constant uint& count [[buffer(3)]],
                 uint tid [[thread_position_in_grid]])
             {
-                // Process 4 elements at a time using float4 vectorization
-                uint idx4 = tid * 4;
-                uint count4 = count / 4;
+                // Process 8 elements at a time using float4x2 vectorization
+                uint idx8 = tid * 8;
+                uint count8 = count / 8;
 
-                if (tid < count4) {
-                    // Vectorized path: process 4 elements
-                    float4 a4 = reinterpret_cast<device const float4*>(inputA)[tid];
-                    float4 b4 = reinterpret_cast<device const float4*>(inputB)[tid];
-                    reinterpret_cast<device float4*>(output)[tid] = \(vec4Operation);
+                if (tid < count8) {
+                    // Vectorized path: process 8 elements (two float4)
+                    uint base = tid * 2;
+                    float4 a4 = reinterpret_cast<device const float4*>(inputA)[base];
+                    float4 b4 = reinterpret_cast<device const float4*>(inputB)[base];
+                    reinterpret_cast<device float4*>(output)[base] = \(vec4Operation);
+                    a4 = reinterpret_cast<device const float4*>(inputA)[base + 1];
+                    b4 = reinterpret_cast<device const float4*>(inputB)[base + 1];
+                    reinterpret_cast<device float4*>(output)[base + 1] = \(vec4Operation);
                 }
-                else if (tid == count4) {
-                    // Handle remainder (up to 3 elements)
-                    for (uint i = idx4; i < count; i++) {
+                else if (tid == count8) {
+                    // Handle remainder (up to 7 elements)
+                    for (uint i = idx8; i < count; i++) {
                         float a = inputA[i];
                         float b = inputB[i];
                         output[i] = \(operation);
@@ -1320,6 +1327,47 @@ public final class CodeGenerator: @unchecked Sendable {
 
         // Determine reduction operation based on reductionKind
         let reductionKind = attributes.reductionKind ?? .sum
+
+        // Map HLO reduction kind to ReductionKernelGenerator op
+        let reductionOp: ReductionKernelGenerator.ReductionOp
+        switch reductionKind {
+        case .sum: reductionOp = .sum
+        case .max: reductionOp = .max
+        case .min: reductionOp = .min
+        case .mean: reductionOp = .mean
+        }
+
+        // Analyze the reduction pattern and try to use specialized kernels
+        let pattern = ReductionKernelGenerator.analyzePattern(inputShape: inputShape, reduceDims: reduceDims)
+
+        // For row and column reductions, use optimized specialized kernels
+        switch pattern {
+        case .row:
+            // Row reduction: [M, N] -> [M], reduce over last axis
+            // Each thread handles one complete row
+            let source = ReductionKernelGenerator.generateRowReductionKernel(
+                op: reductionOp,
+                entryPoint: "kernel_reduce"  // Use same name for consistent dispatch
+            )
+            // TuningConfig blockSize signals to dispatch that this is a 1D dispatch
+            // Use 1024 threadgroup size for efficiency
+            return (source, "kernel_reduce", TuningConfig(blockSize: 1024, useRowReduction: true))
+
+        case .column:
+            // Column reduction: [M, N] -> [N], reduce over first axis
+            // Each thread handles one complete column
+            let source = ReductionKernelGenerator.generateColumnReductionKernel(
+                op: reductionOp,
+                entryPoint: "kernel_reduce"  // Use same name for consistent dispatch
+            )
+            return (source, "kernel_reduce", TuningConfig(blockSize: 1024, useColumnReduction: true))
+
+        case .global, .general:
+            // Fall back to the general tree reduction
+            break
+        }
+
+        // General reduction fallback with tree reduction
         let (accumOp, reduceOp, initValue): (String, String, String)
         switch reductionKind {
         case .sum:
@@ -1344,17 +1392,16 @@ public final class CodeGenerator: @unchecked Sendable {
         // NOTE: reduce operation has two inputs: data (buffer 0) and init value (buffer 1)
         // Output is at buffer 2, followed by scalar parameters
 
-        // Use parallel tree reduction with shared memory for better performance
-        // Each threadgroup cooperatively reduces one output element
-        let blockSize = 256  // Threads per threadgroup
+        // Use parallel tree reduction with SIMD intrinsics for better performance
+        let blockSize = 1024  // Increased from 256 for better occupancy
 
         let source = """
         #include <metal_stdlib>
         using namespace metal;
 
-        // Optimized parallel tree reduction kernel
+        // Optimized parallel tree reduction kernel with SIMD intrinsics
         // Each threadgroup handles one output element
-        // Threads cooperatively reduce using shared memory
+        // Threads cooperatively reduce using SIMD + shared memory
         // Reduction type: \(reductionKind)
         kernel void kernel_reduce(
             device const float* input [[buffer(0)]],
@@ -1363,11 +1410,15 @@ public final class CodeGenerator: @unchecked Sendable {
             constant uint& outputCount [[buffer(3)]],
             constant uint& reduceSize [[buffer(4)]],
             constant uint& innerSize [[buffer(5)]],
-            threadgroup float* shared [[threadgroup(0)]],
             uint tid [[thread_position_in_threadgroup]],
             uint tgid [[threadgroup_position_in_grid]],
-            uint tgSize [[threads_per_threadgroup]])
+            uint tgSize [[threads_per_threadgroup]],
+            uint simd_lane [[thread_index_in_simdgroup]],
+            uint simd_group [[simdgroup_index_in_threadgroup]])
         {
+            // Shared memory for inter-simdgroup reduction
+            threadgroup float shared[32];  // One per simdgroup
+
             // Each threadgroup handles one output element
             if (tgid >= outputCount) return;
 
@@ -1386,27 +1437,28 @@ public final class CodeGenerator: @unchecked Sendable {
                 \(accumOp)
             }
 
-            // Store partial result in shared memory
-            shared[tid] = accum;
+            // Phase 2: SIMD reduction within each simdgroup (32 threads)
+            accum = simd_\(reductionKind == .sum || reductionKind == .mean ? "sum" : reductionKind == .max ? "max" : "min")(accum);
+
+            // First lane of each simdgroup stores to shared memory
+            if (simd_lane == 0) {
+                shared[simd_group] = accum;
+            }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            // Phase 2: Parallel tree reduction in shared memory
-            // Reduce 256 -> 128 -> 64 -> 32 -> 16 -> 8 -> 4 -> 2 -> 1
-            for (uint stride = tgSize / 2; stride > 0; stride >>= 1) {
-                if (tid < stride) {
-                    float a = shared[tid];
-                    float b = shared[tid + stride];
-                    shared[tid] = \(reduceOp);
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
+            // Phase 3: First simdgroup reduces the partial results
+            if (tid < 32) {
+                uint numSimdGroups = (tgSize + 31) / 32;
+                float val = (tid < numSimdGroups) ? shared[tid] : \(initValue);
+                val = simd_\(reductionKind == .sum || reductionKind == .mean ? "sum" : reductionKind == .max ? "max" : "min")(val);
 
-            // Thread 0 writes the final result
-            if (tid == 0) {
-                // Apply the user-provided init value as well
-                float a = shared[0];
-                float b = initValue[0];
-                output[tgid] = \(reduceOp);
+                // Thread 0 writes the final result
+                if (tid == 0) {
+                    // Apply the user-provided init value as well
+                    float a = val;
+                    float b = initValue[0];
+                    output[tgid] = \(reduceOp);
+                }
             }
         }
         """
@@ -2194,9 +2246,17 @@ public final class CodeGenerator: @unchecked Sendable {
                     }
                 }
             case .reduce:
-                // Each threadgroup handles one output element
-                // Threads within threadgroup cooperatively reduce using tree reduction
-                let blockSize = 256
+                // Check for specialized reduction kernels
+                if let tuning = tuning, (tuning.useRowReduction || tuning.useColumnReduction) {
+                    // Specialized row/column reduction: one thread per output element
+                    // Uses 1D dispatch with threads processing entire rows/columns independently
+                    let blockSize = tuning.blockSize ?? 1024
+                    return DispatchConfig.dispatch1D(elements: totalElements, threadgroupSize: blockSize)
+                }
+
+                // General reduction: one threadgroup per output element
+                // Threads within threadgroup cooperatively reduce using tree reduction + SIMD
+                let blockSize = tuning?.blockSize ?? 1024
                 let numThreadgroups = totalElements  // One threadgroup per output element
                 return DispatchConfig(
                     gridSize: MTLSize(width: numThreadgroups, height: 1, depth: 1),
@@ -2234,7 +2294,7 @@ public final class CodeGenerator: @unchecked Sendable {
                     )
                 }
                 // Fall back to 1D for higher dimensions
-                return DispatchConfig.dispatch1D(elements: totalElements, threadgroupSize: 256)
+                return DispatchConfig.dispatch1D(elements: totalElements, threadgroupSize: 1024)
             default:
                 break
             }
@@ -2270,11 +2330,10 @@ public final class CodeGenerator: @unchecked Sendable {
             break
         }
 
-        // For float elementwise operations, use vectorized dispatch (4 elements per thread)
-        // Add 1 to handle remainder elements
+        // For float elementwise operations, use vectorized dispatch (8 elements per thread)
         if elementType == .float32 {
-            let vectorizedCount = (totalElements + 3) / 4 + 1
-            return DispatchConfig.dispatch1D(elements: vectorizedCount, threadgroupSize: 256)
+            let vectorizedCount = (totalElements + 7) / 8
+            return DispatchConfig.dispatch1D(elements: vectorizedCount, threadgroupSize: 1024)
         }
 
         return DispatchConfig.dispatch1D(elements: totalElements)
