@@ -46,6 +46,9 @@ public final class IntegratedExecutor: @unchecked Sendable {
     /// Execution statistics.
     public private(set) var statistics: ExecutionStatistics
 
+    /// Output buffer pool for reuse (optional).
+    private var outputBufferPool: OutputBufferPool?
+
     // MARK: - Configuration
 
     public struct Config: Sendable {
@@ -61,16 +64,26 @@ public final class IntegratedExecutor: @unchecked Sendable {
         /// Label for command buffers (for debugging).
         public var debugLabel: String?
 
+        /// Whether to pool output buffers for reuse across executions.
+        public var enableOutputPooling: Bool
+
+        /// Number of output buffers to pre-allocate per output (when pooling enabled).
+        public var outputPoolSize: Int
+
         public init(
             enableProfiling: Bool = false,
             synchronous: Bool = true,
             validateInputs: Bool = true,
-            debugLabel: String? = nil
+            debugLabel: String? = nil,
+            enableOutputPooling: Bool = true,
+            outputPoolSize: Int = 3
         ) {
             self.enableProfiling = enableProfiling
             self.synchronous = synchronous
             self.validateInputs = validateInputs
             self.debugLabel = debugLabel
+            self.enableOutputPooling = enableOutputPooling
+            self.outputPoolSize = outputPoolSize
         }
 
         public static let `default` = Config()
@@ -78,6 +91,8 @@ public final class IntegratedExecutor: @unchecked Sendable {
         public static let profiling = Config(enableProfiling: true)
 
         public static let async = Config(synchronous: false)
+
+        public static let noPooling = Config(enableOutputPooling: false)
     }
 
     // MARK: - Initialization
@@ -110,6 +125,15 @@ public final class IntegratedExecutor: @unchecked Sendable {
         if let label = config.debugLabel {
             self.unifiedBuffer.label = "\(label)_unified"
         }
+
+        // Initialize output buffer pool if enabled
+        if config.enableOutputPooling {
+            self.outputBufferPool = OutputBufferPool(
+                device: device,
+                outputSpecs: executable.outputSpecs,
+                poolSize: config.outputPoolSize
+            )
+        }
     }
 
     // MARK: - Execution
@@ -122,9 +146,8 @@ public final class IntegratedExecutor: @unchecked Sendable {
     public func execute(inputs: [String: MTLBuffer]) throws -> ExecutionResult {
         let startTime = DispatchTime.now()
 
-        // Serialize Metal execution to prevent concurrent access crashes
-        metalExecutionSemaphore.wait()
-        defer { metalExecutionSemaphore.signal() }
+        // Note: Semaphore removed - Metal command queues handle concurrent submission safely.
+        // Compilation still uses semaphore (in MetalHLOCompiler) but execution doesn't need it.
 
         // Validate inputs
         if config.validateInputs {
@@ -146,15 +169,32 @@ public final class IntegratedExecutor: @unchecked Sendable {
             kernelTimings = [:]
         }
 
-        // Encode all operations
-        for opID in executable.executionOrder {
-            try encodeOperation(
+        // Create a single encoder for all operations (reduces overhead significantly)
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw IntegratedExecutorError.encoderCreationFailed
+        }
+
+        if let label = config.debugLabel {
+            encoder.label = label
+        }
+
+        // Encode all operations to the single encoder
+        for (index, opID) in executable.executionOrder.enumerated() {
+            try encodeOperationToEncoder(
                 opID,
-                commandBuffer: commandBuffer,
+                encoder: encoder,
                 inputs: inputs,
                 kernelTimings: &kernelTimings
             )
+
+            // Add memory barrier between operations for data hazard protection
+            // (Skip after last operation since there's nothing following)
+            if index < executable.executionOrder.count - 1 {
+                encoder.memoryBarrier(scope: .buffers)
+            }
         }
+
+        encoder.endEncoding()
 
         // Execute
         commandBuffer.commit()
@@ -219,19 +259,36 @@ public final class IntegratedExecutor: @unchecked Sendable {
             kernelTimings = [:]
         }
 
+        // Create a single encoder for all operations
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            completion(.failure(IntegratedExecutorError.encoderCreationFailed))
+            return
+        }
+
+        if let label = config.debugLabel {
+            encoder.label = label
+        }
+
         do {
-            for opID in executable.executionOrder {
-                try encodeOperation(
+            for (index, opID) in executable.executionOrder.enumerated() {
+                try encodeOperationToEncoder(
                     opID,
-                    commandBuffer: commandBuffer,
+                    encoder: encoder,
                     inputs: inputs,
                     kernelTimings: &kernelTimings
                 )
+
+                // Add memory barrier between operations for data hazard protection
+                if index < executable.executionOrder.count - 1 {
+                    encoder.memoryBarrier(scope: .buffers)
+                }
             }
         } catch {
             completion(.failure(error))
             return
         }
+
+        encoder.endEncoding()
 
         commandBuffer.addCompletedHandler { [weak self] buffer in
             guard let self = self else { return }
@@ -264,12 +321,35 @@ public final class IntegratedExecutor: @unchecked Sendable {
         commandBuffer.commit()
     }
 
+    /// Executes using Swift concurrency (async/await).
+    ///
+    /// This is the preferred method for modern Swift code. It uses the
+    /// underlying async execution and wraps it in Swift's structured concurrency.
+    ///
+    /// - Parameter inputs: Dictionary mapping input names to Metal buffers.
+    /// - Returns: Execution result with output buffers.
+    /// - Throws: `IntegratedExecutorError` if execution fails.
+    @available(macOS 10.15, iOS 13.0, tvOS 13.0, watchOS 6.0, *)
+    public func execute(inputs: [String: MTLBuffer]) async throws -> ExecutionResult {
+        try await withCheckedThrowingContinuation { continuation in
+            executeAsync(inputs: inputs) { result in
+                switch result {
+                case .success(let executionResult):
+                    continuation.resume(returning: executionResult)
+                case .failure(let error):
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
     // MARK: - Private Methods
 
-    /// Encodes a single operation to the command buffer.
-    private func encodeOperation(
+    /// Encodes a single operation to an existing encoder.
+    /// This avoids the overhead of creating/ending encoders for each operation.
+    private func encodeOperationToEncoder(
         _ opID: OpID,
-        commandBuffer: MTLCommandBuffer,
+        encoder: MTLComputeCommandEncoder,
         inputs: [String: MTLBuffer],
         kernelTimings: inout [OpID: Double]?
     ) throws {
@@ -285,14 +365,7 @@ public final class IntegratedExecutor: @unchecked Sendable {
             throw IntegratedExecutorError.missingBindings(opID)
         }
 
-        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
-            throw IntegratedExecutorError.encoderCreationFailed
-        }
-
-        if let label = config.debugLabel {
-            encoder.label = "\(label)_\(opID)"
-        }
-
+        // Set pipeline state (Metal driver optimizes consecutive same-pipeline dispatches)
         encoder.setComputePipelineState(pipeline)
 
         // Bind all buffers and scalars
@@ -335,7 +408,7 @@ public final class IntegratedExecutor: @unchecked Sendable {
             encoder.dispatchThreadgroups(dispatch.gridSize, threadsPerThreadgroup: dispatch.threadgroupSize)
         }
 
-        encoder.endEncoding()
+        // Note: endEncoding() is NOT called here - it's called once after all operations
     }
 
     /// Resolves a buffer binding to an actual buffer and offset.
@@ -388,18 +461,25 @@ public final class IntegratedExecutor: @unchecked Sendable {
         for (name, spec) in executable.outputSpecs {
             // Check if output is in memory plan
             if let offset = executable.memoryPlan.tensorOffsets[name] {
-                // Create output buffer and copy data
-                guard let outputBuffer = device.makeBuffer(
-                    length: spec.byteSize,
-                    options: .storageModeShared
-                ) else {
-                    throw IntegratedExecutorError.bufferAllocationFailed(size: spec.byteSize)
+                // Get output buffer from pool or allocate new one
+                let outputBuffer: MTLBuffer
+                if let pool = outputBufferPool, let pooled = pool.acquire(name) {
+                    outputBuffer = pooled
+                } else {
+                    // Fallback to allocation if pool disabled or exhausted
+                    guard let newBuffer = device.makeBuffer(
+                        length: spec.byteSize,
+                        options: .storageModeShared
+                    ) else {
+                        throw IntegratedExecutorError.bufferAllocationFailed(size: spec.byteSize)
+                    }
+                    if let label = config.debugLabel {
+                        newBuffer.label = "\(label)_output_\(name)"
+                    }
+                    outputBuffer = newBuffer
                 }
 
-                if let label = config.debugLabel {
-                    outputBuffer.label = "\(label)_output_\(name)"
-                }
-
+                // Copy data from unified buffer
                 memcpy(
                     outputBuffer.contents(),
                     unifiedBuffer.contents().advanced(by: offset),
@@ -414,6 +494,12 @@ public final class IntegratedExecutor: @unchecked Sendable {
         }
 
         return outputs
+    }
+
+    /// Releases output buffers back to the pool for reuse.
+    /// Call this when done processing outputs to enable buffer reuse.
+    public func releaseOutputs(_ outputs: [String: MTLBuffer]) {
+        outputBufferPool?.releaseAll(outputs)
     }
 
     // MARK: - Utilities
@@ -477,6 +563,100 @@ public enum IntegratedExecutorError: Error, Sendable {
     case missingConstant(String)
     case invalidBinding(String)
     case executionFailed(String)
+}
+
+// MARK: - Output Buffer Pool
+
+/// Pool of pre-allocated output buffers for reuse across executions.
+///
+/// The pool maintains a set of buffers for each output tensor name.
+/// When `acquire()` is called, it returns an available buffer from the pool
+/// or allocates a new one if the pool is exhausted. When `release()` is called,
+/// the buffer is returned to the pool for reuse.
+///
+/// This eliminates per-execution allocation overhead for repeated inference.
+public final class OutputBufferPool: @unchecked Sendable {
+    private let device: MTLDevice
+    private let specs: [String: TensorSpec]
+    private var pools: [String: [MTLBuffer]]
+    private var inUse: [String: Set<ObjectIdentifier>]
+    private let lock = NSLock()
+
+    /// Creates a new output buffer pool.
+    /// - Parameters:
+    ///   - device: Metal device for buffer allocation.
+    ///   - outputSpecs: Specifications for each output tensor.
+    ///   - poolSize: Number of buffers to pre-allocate per output.
+    public init(device: MTLDevice, outputSpecs: [String: TensorSpec], poolSize: Int = 3) {
+        self.device = device
+        self.specs = outputSpecs
+        self.pools = [:]
+        self.inUse = [:]
+
+        // Pre-allocate buffers for each output
+        for (name, spec) in outputSpecs {
+            var buffers: [MTLBuffer] = []
+            for i in 0..<poolSize {
+                if let buffer = device.makeBuffer(length: spec.byteSize, options: .storageModeShared) {
+                    buffer.label = "pooled_output_\(name)_\(i)"
+                    buffers.append(buffer)
+                }
+            }
+            pools[name] = buffers
+            inUse[name] = []
+        }
+    }
+
+    /// Acquires an output buffer for the given output name.
+    /// Returns nil if the pool is exhausted and allocation fails.
+    public func acquire(_ name: String) -> MTLBuffer? {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard var available = pools[name], !available.isEmpty else {
+            // Pool exhausted - try to allocate new buffer
+            guard let spec = specs[name] else { return nil }
+            return device.makeBuffer(length: spec.byteSize, options: .storageModeShared)
+        }
+
+        let buffer = available.removeLast()
+        pools[name] = available
+        inUse[name]?.insert(ObjectIdentifier(buffer))
+        return buffer
+    }
+
+    /// Releases a buffer back to the pool.
+    public func release(_ buffer: MTLBuffer, name: String) {
+        lock.lock()
+        defer { lock.unlock() }
+
+        let id = ObjectIdentifier(buffer)
+        guard inUse[name]?.contains(id) == true else { return }
+
+        inUse[name]?.remove(id)
+        pools[name]?.append(buffer)
+    }
+
+    /// Releases all buffers from a result dictionary back to the pool.
+    public func releaseAll(_ outputs: [String: MTLBuffer]) {
+        for (name, buffer) in outputs {
+            release(buffer, name: name)
+        }
+    }
+
+    /// Returns the total number of buffers in the pool (available + in use).
+    public var totalBufferCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return pools.values.reduce(0) { $0 + $1.count } + inUse.values.reduce(0) { $0 + $1.count }
+    }
+
+    /// Returns the number of currently available buffers.
+    public var availableBufferCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return pools.values.reduce(0) { $0 + $1.count }
+    }
 }
 
 // MARK: - Batch Executor

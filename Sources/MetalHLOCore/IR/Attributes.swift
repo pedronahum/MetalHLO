@@ -25,6 +25,14 @@ public struct HLOAttributes: Sendable {
     /// Dot product dimension numbers for dot_general.
     public var dotDimensionNumbers: DotDimensionNumbers?
 
+    /// Whether to transpose the LHS matrix before matmul.
+    /// Used by transpose-matmul folding optimization.
+    public var lhsTranspose: Bool?
+
+    /// Whether to transpose the RHS matrix before matmul.
+    /// Used by transpose-matmul folding optimization.
+    public var rhsTranspose: Bool?
+
     // MARK: - Gather/Scatter Attributes
 
     /// Gather dimension numbers.

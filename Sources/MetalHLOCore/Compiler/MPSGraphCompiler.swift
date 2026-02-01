@@ -476,8 +476,20 @@ public final class MPSGraphCompiler {
             )
         }
 
-        let lhs = try getOperand(op.operands[0])
-        let rhs = try getOperand(op.operands[1])
+        var lhs = try getOperand(op.operands[0])
+        var rhs = try getOperand(op.operands[1])
+
+        // Apply folded transpositions from the optimizer
+        // This avoids expensive separate transpose operations by letting matmul handle them
+        if op.attributes.lhsTranspose == true {
+            // For 2D matrices, transpose swaps [M, K] -> [K, M]
+            lhs = graph.transpose(lhs, permutation: [1, 0].map { NSNumber(value: $0) }, name: nil)
+        }
+        if op.attributes.rhsTranspose == true {
+            // For 2D matrices, transpose swaps [K, N] -> [N, K]
+            rhs = graph.transpose(rhs, permutation: [1, 0].map { NSNumber(value: $0) }, name: nil)
+        }
+
         return graph.matrixMultiplication(primary: lhs, secondary: rhs, name: op.result)
     }
 

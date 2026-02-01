@@ -674,3 +674,143 @@ public final class CopyEliminationPass: OptimizationPass, @unchecked Sendable {
         }
     }
 }
+
+// MARK: - Transpose-Matmul Folding
+
+/// Folds transpose operations into their consuming matmul operations.
+///
+/// This pass detects patterns like:
+/// - transpose(A) @ B -> matmul(A, B, transA=true)
+/// - A @ transpose(B) -> matmul(A, B, transB=true)
+/// - transpose(A) @ transpose(B) -> matmul(A, B, transA=true, transB=true)
+///
+/// Instead of performing a physical transpose (expensive memory operation),
+/// the matmul operation can handle the transpose internally by adjusting
+/// how it reads the matrix. This is a major optimization for attention
+/// patterns where Q @ K^T is common.
+public final class TransposeMatmulFoldingPass: OptimizationPass, @unchecked Sendable {
+
+    public let name = "transpose-matmul-folding"
+    public let invalidates: Set<AnalysisType> = [.shapes, .lifetimes, .dependencies]
+
+    public init() {}
+
+    public func run(on function: HLOFunction, analysis: AnalysisResults) -> PassResult {
+        var operations = function.operations
+        var changed = false
+        var foldedCount = 0
+
+        // Build defining ops map
+        var definingOps: [TensorID: (op: HLOOperation, index: Int)] = [:]
+        for (index, op) in operations.enumerated() {
+            definingOps[op.result] = (op, index)
+        }
+
+        // Build use count map to check if transpose has single use
+        var useCount: [TensorID: Int] = [:]
+        for op in operations {
+            for operand in op.operands {
+                useCount[operand, default: 0] += 1
+            }
+        }
+        // Also count return values as uses
+        for retVal in function.returnValues {
+            useCount[retVal, default: 0] += 1
+        }
+
+        var indicesToRemove: Set<Int> = []
+
+        for (index, op) in operations.enumerated() {
+            // Look for dot or dotGeneral operations
+            guard op.kind == .dot || op.kind == .dotGeneral else { continue }
+
+            // Check if LHS or RHS comes from a transpose
+            var newOperands = op.operands
+            var newAttributes = op.attributes
+            var didFold = false
+
+            // Check LHS (operand 0)
+            if let lhsDef = definingOps[op.operands[0]],
+               lhsDef.op.kind == .transpose,
+               useCount[lhsDef.op.result] == 1 {
+                // Check if this is a simple 2D transpose (swap last two dims)
+                if let perm = lhsDef.op.attributes.dimensions,
+                   isMatrixTranspose(perm) {
+                    // Fold: use original input and set transA flag
+                    newOperands[0] = lhsDef.op.operands[0]
+                    newAttributes.lhsTranspose = true
+                    indicesToRemove.insert(lhsDef.index)
+                    didFold = true
+                }
+            }
+
+            // Check RHS (operand 1)
+            if let rhsDef = definingOps[op.operands[1]],
+               rhsDef.op.kind == .transpose,
+               useCount[rhsDef.op.result] == 1 {
+                // Check if this is a simple 2D transpose (swap last two dims)
+                if let perm = rhsDef.op.attributes.dimensions,
+                   isMatrixTranspose(perm) {
+                    // Fold: use original input and set transB flag
+                    newOperands[1] = rhsDef.op.operands[0]
+                    newAttributes.rhsTranspose = true
+                    indicesToRemove.insert(rhsDef.index)
+                    didFold = true
+                }
+            }
+
+            if didFold {
+                // Create new operation with folded transposes
+                let newOp = HLOOperation(
+                    result: op.result,
+                    kind: op.kind,
+                    operands: newOperands,
+                    resultType: op.resultType,
+                    attributes: newAttributes
+                )
+                operations[index] = newOp
+                changed = true
+                foldedCount += 1
+            }
+        }
+
+        // Remove folded transpose operations
+        if !indicesToRemove.isEmpty {
+            operations = operations.enumerated().compactMap { index, op in
+                indicesToRemove.contains(index) ? nil : op
+            }
+        }
+
+        let newFunction = HLOFunction(
+            name: function.name,
+            inputs: function.inputs,
+            outputTypes: function.outputTypes,
+            operations: operations,
+            returnValues: function.returnValues
+        )
+
+        return PassResult(
+            function: newFunction,
+            changed: changed,
+            stats: ["transposes_folded_into_matmul": foldedCount]
+        )
+    }
+
+    /// Checks if a permutation represents a matrix transpose (swapping last two dimensions).
+    /// For 2D: [1, 0]
+    /// For 3D: [0, 2, 1] (batch preserved, matrix transposed)
+    /// For 4D: [0, 1, 3, 2] (batch dims preserved, matrix transposed)
+    private func isMatrixTranspose(_ perm: [Int]) -> Bool {
+        guard perm.count >= 2 else { return false }
+
+        let rank = perm.count
+
+        // Check that all dimensions except the last two are in order
+        for i in 0..<(rank - 2) {
+            if perm[i] != i { return false }
+        }
+
+        // Check that last two dimensions are swapped
+        return perm[rank - 2] == rank - 1 && perm[rank - 1] == rank - 2
+    }
+}

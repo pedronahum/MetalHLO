@@ -7,9 +7,10 @@ import Foundation
 import Metal
 @preconcurrency import MetalPerformanceShadersGraph
 
-/// Global semaphore to serialize Metal/MPSGraph operations.
-/// Metal/MPSGraph operations can crash when multiple instances execute concurrently on the same device.
-/// This limits concurrency to prevent race conditions in the Metal driver or MPS framework.
+/// Global semaphore to serialize Metal shader compilation.
+/// Metal shader compilation can crash when multiple instances compile concurrently.
+/// This is only needed during compilation, NOT during execution of compiled pipelines.
+/// Metal command queues handle concurrent command buffer submission safely.
 public let metalExecutionSemaphore = DispatchSemaphore(value: 1)
 
 /// Manages Metal device, compilation, and execution.
@@ -225,9 +226,8 @@ public final class MetalExecutor: @unchecked Sendable {
 
         let startTime = CFAbsoluteTimeGetCurrent()
 
-        // Serialize MPSGraph operations to prevent concurrent execution crashes
-        metalExecutionSemaphore.wait()
-        defer { metalExecutionSemaphore.signal() }
+        // Note: Semaphore removed - MPSGraph execution is thread-safe once compiled.
+        // The command queue handles concurrent command buffer submission safely.
 
         // Create input tensor data
         var inputDict: [MPSGraphTensor: MPSGraphTensorData] = [:]

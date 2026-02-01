@@ -17,7 +17,7 @@ import MLX
 
 struct ComparisonCLI {
     enum Command {
-        case compare(filter: String?, category: String?, quick: Bool, output: String?)
+        case compare(filter: String?, category: String?, quick: Bool, output: String?, optLevel: Int?)
         case list
         case help
     }
@@ -26,13 +26,14 @@ struct ComparisonCLI {
         let args = CommandLine.arguments.dropFirst()
 
         if args.isEmpty {
-            return .compare(filter: nil, category: nil, quick: false, output: nil)
+            return .compare(filter: nil, category: nil, quick: false, output: nil, optLevel: nil)
         }
 
         var filter: String?
         var category: String?
         var quick = false
         var output: String?
+        var optLevel: Int?
 
         var iterator = args.makeIterator()
         while let arg = iterator.next() {
@@ -49,6 +50,14 @@ struct ComparisonCLI {
                 quick = true
             case "-o", "--output":
                 output = iterator.next()
+            case "-O0":
+                optLevel = 0
+            case "-O1":
+                optLevel = 1
+            case "-O2":
+                optLevel = 2
+            case "-O3":
+                optLevel = 3
             default:
                 if !arg.hasPrefix("-") {
                     filter = arg
@@ -56,7 +65,7 @@ struct ComparisonCLI {
             }
         }
 
-        return .compare(filter: filter, category: category, quick: quick, output: output)
+        return .compare(filter: filter, category: category, quick: quick, output: output, optLevel: optLevel)
     }
 
     static func printHelp() {
@@ -73,10 +82,16 @@ struct ComparisonCLI {
             -f, --filter PAT    Run only benchmarks matching pattern
             -q, --quick         Quick mode (fewer iterations)
             -o, --output PATH   Write results to JSON file
+            -O0                 No optimization (debug mode)
+            -O1                 Basic optimization
+            -O2                 Standard optimization (default)
+            -O3                 Aggressive optimization (fusion, transpose folding)
 
         EXAMPLES:
             mlx-comparison                  Compare all matching benchmarks
             mlx-comparison -q               Quick comparison
+            mlx-comparison -O3              Compare with aggressive optimization
+            mlx-comparison -q -O3           Quick comparison with O3 optimization
             mlx-comparison -c matrix        Compare only matrix benchmarks
             mlx-comparison -f GEMM          Compare benchmarks matching "GEMM"
             mlx-comparison -o results.json  Save comparison to JSON
@@ -164,12 +179,12 @@ func main() async {
     case .list:
         ComparisonCLI.listBenchmarks()
 
-    case .compare(let filter, let category, let quick, let output):
-        await runComparison(filter: filter, category: category, quick: quick, output: output)
+    case .compare(let filter, let category, let quick, let output, let optLevel):
+        await runComparison(filter: filter, category: category, quick: quick, output: output, optLevel: optLevel)
     }
 }
 
-func runComparison(filter: String?, category: String?, quick: Bool, output: String?) async {
+func runComparison(filter: String?, category: String?, quick: Bool, output: String?, optLevel: Int? = nil) async {
     print("""
     ╔════════════════════════════════════════════════════════════════════╗
     ║           MetalHLO vs MLX Comparison Suite                         ║
@@ -183,10 +198,24 @@ func runComparison(filter: String?, category: String?, quick: Bool, output: Stri
     print("OS: \(hw.osVersion)")
     print()
 
+    // Determine optimization level
+    let optimizationLevel: OptimizationLevel
+    if let level = optLevel {
+        switch level {
+        case 0: optimizationLevel = .O0
+        case 1: optimizationLevel = .O1
+        case 3: optimizationLevel = .O3
+        default: optimizationLevel = .O2
+        }
+    } else {
+        optimizationLevel = .O2
+    }
+
     // Configuration
     let warmupIterations = quick ? 3 : 10
     let measurementIterations = quick ? 10 : 50
     print("Mode: \(quick ? "Quick" : "Standard") (\(warmupIterations) warmup, \(measurementIterations) measurements)")
+    print("Optimization: O\(optimizationLevel.rawValue)")
     print()
 
     // Get MLX benchmarks
@@ -225,6 +254,7 @@ func runComparison(filter: String?, category: String?, quick: Bool, output: Stri
     let runner: BenchmarkRunner
     do {
         runner = try BenchmarkRunner(config: config)
+        runner.optimizationLevel = optimizationLevel
         runner.verbose = false
     } catch {
         print("Error: Failed to create MetalHLO benchmark runner: \(error)")

@@ -31,6 +31,9 @@ public struct HLOOptimizerConfig: Sendable {
     /// Whether to enable layout assignment optimization.
     public var enableLayoutAssignment: Bool
 
+    /// Whether to enable transpose folding into matmul operations.
+    public var enableTransposeMatmulFolding: Bool
+
     /// Maximum number of optimization iterations.
     public var maxIterations: Int
 
@@ -40,6 +43,11 @@ public struct HLOOptimizerConfig: Sendable {
     /// Maximum operations in a producer-consumer fusion region.
     public var maxFusionRegionSize: Int
 
+    /// Whether to emit fused operations as custom_call instead of relying on MPSGraph stitching.
+    /// When true, generates actual fused kernels for better performance.
+    /// When false, MPSGraph will stitch operations but won't truly fuse them.
+    public var emitFusedCustomCalls: Bool
+
     /// Creates default configuration.
     public init(
         enableFusion: Bool = true,
@@ -48,9 +56,11 @@ public struct HLOOptimizerConfig: Sendable {
         enableSiblingFusion: Bool = true,
         enableHorizontalFusion: Bool = true,
         enableLayoutAssignment: Bool = true,
+        enableTransposeMatmulFolding: Bool = true,
         maxIterations: Int = 10,
         enabledPatterns: Set<String>? = nil,
-        maxFusionRegionSize: Int = 50
+        maxFusionRegionSize: Int = 50,
+        emitFusedCustomCalls: Bool = true
     ) {
         self.enableFusion = enableFusion
         self.enableAlgebraicSimplification = enableConstantFolding
@@ -58,9 +68,11 @@ public struct HLOOptimizerConfig: Sendable {
         self.enableSiblingFusion = enableSiblingFusion
         self.enableHorizontalFusion = enableHorizontalFusion
         self.enableLayoutAssignment = enableLayoutAssignment
+        self.enableTransposeMatmulFolding = enableTransposeMatmulFolding
         self.maxIterations = maxIterations
         self.enabledPatterns = enabledPatterns
         self.maxFusionRegionSize = maxFusionRegionSize
+        self.emitFusedCustomCalls = emitFusedCustomCalls
     }
 
     /// Default configuration with all optimizations enabled.
@@ -73,7 +85,23 @@ public struct HLOOptimizerConfig: Sendable {
         enableProducerConsumerFusion: false,
         enableSiblingFusion: false,
         enableHorizontalFusion: false,
-        enableLayoutAssignment: false
+        enableLayoutAssignment: false,
+        enableTransposeMatmulFolding: false,
+        emitFusedCustomCalls: false
+    )
+
+    /// Aggressive configuration for maximum performance.
+    public static let aggressive = HLOOptimizerConfig(
+        enableFusion: true,
+        enableConstantFolding: true,
+        enableProducerConsumerFusion: true,
+        enableSiblingFusion: true,
+        enableHorizontalFusion: true,
+        enableLayoutAssignment: true,
+        enableTransposeMatmulFolding: true,
+        maxIterations: 20,
+        maxFusionRegionSize: 100,
+        emitFusedCustomCalls: true
     )
 }
 
@@ -91,25 +119,29 @@ public final class HLOOptimizer: @unchecked Sendable {
     private let siblingFusion: SiblingFusion
     private let horizontalFusion: HorizontalFusion
     private let layoutAssignment: LayoutAssignment
+    private let transposeMatmulFolding: TransposeMatmulFoldingPass
 
     /// Creates an optimizer with the given configuration.
     public init(config: HLOOptimizerConfig = .default, registry: HLOPatternRegistry = .shared) {
         self.config = config
         self.registry = registry
         self.algebraicSimplifier = AlgebraicSimplifier(maxIterations: config.maxIterations)
+        // Enable custom call emission for fusion - this generates fused kernels
+        // instead of relying on MPSGraph stitching (which doesn't truly fuse)
         self.producerConsumerFusion = ProducerConsumerFusion(
             maxFusionSize: config.maxFusionRegionSize,
-            emitCustomCalls: false  // MPSGraph handles stitching
+            emitCustomCalls: config.emitFusedCustomCalls
         )
         self.siblingFusion = SiblingFusion(
             maxSiblings: 8,
-            emitCustomCalls: false  // MPSGraph handles multi-output
+            emitCustomCalls: config.emitFusedCustomCalls
         )
         self.horizontalFusion = HorizontalFusion(
             minBatchSize: 4,
-            emitCustomCalls: false  // MPSGraph handles batching
+            emitCustomCalls: config.emitFusedCustomCalls
         )
         self.layoutAssignment = LayoutAssignment(insertTransposes: true)
+        self.transposeMatmulFolding = TransposeMatmulFoldingPass()
     }
 
     /// Optimizes a function.
@@ -163,7 +195,17 @@ public final class HLOOptimizer: @unchecked Sendable {
             current = horizontalFusion.fuse(current)
         }
 
-        // Phase 6: Layout assignment
+        // Phase 6: Transpose-matmul folding
+        // This folds transpose operations into their consuming matmul operations.
+        // Instead of transpose(A) @ B, we compute matmul(A, B, transA=true).
+        // This avoids expensive memory operations for transposes in attention patterns.
+        if config.enableTransposeMatmulFolding {
+            let emptyAnalysis = AnalysisResults()
+            let result = transposeMatmulFolding.run(on: current, analysis: emptyAnalysis)
+            current = result.function
+        }
+
+        // Phase 7: Layout assignment
         // This assigns optimal memory layouts per operation (NHWC for convolution,
         // row/column major for matmul) and inserts transposes when needed.
         if config.enableLayoutAssignment {
