@@ -176,8 +176,20 @@ public final class Parser {
         )
     }
 
+    /// Tracks whether the last parsed operation name was in generic form (quoted)
+    private var isGenericForm = false
+
     private func parseOperationName() throws -> String {
         var name = ""
+        isGenericForm = false
+
+        // Handle quoted operation names (generic form): "stablehlo.rng"
+        if case .string(let stringValue) = currentToken.kind {
+            name = stringValue
+            isGenericForm = true
+            advance()
+            return name
+        }
 
         // Handle identifiers that may contain dots (e.g., stablehlo.add, func.func)
         if case .identifier = currentToken.kind {
@@ -227,8 +239,11 @@ public final class Parser {
         var operands: [String] = []
         var attributes = HLOAttributes()
 
-        // Special handling for custom_call which has @target(operands) format
-        if kind == .customCall {
+        // Handle generic form: "stablehlo.op"(%op1, %op2) {attributes} : type
+        if isGenericForm {
+            (operands, attributes) = try parseGenericFormOperandsAndAttributes(kind: kind)
+        } else if kind == .customCall {
+            // Special handling for custom_call which has @target(operands) format
             (operands, attributes) = try parseCustomCallOperandsAndAttributes()
         } else if kind == .reduce {
             // Special handling for reduce: (%input init: %init) applies stablehlo.add across dimensions = [0]
@@ -293,6 +308,65 @@ public final class Parser {
                     if case .string(let value) = currentToken.kind {
                         attributes.backendConfig = value
                         advance()
+                    }
+                } else {
+                    // Skip unknown attributes
+                    advance()
+                }
+                _ = match(.comma)
+                skipNewlines()
+            }
+            try expect(.rightBrace)
+        }
+
+        return (operands, attributes)
+    }
+
+    /// Parse generic form operands and attributes
+    /// Format: (%op1, %op2, ...) {attr = value, ...}
+    private func parseGenericFormOperandsAndAttributes(kind: HLOOpKind) throws -> ([String], HLOAttributes) {
+        var operands: [String] = []
+        var attributes = HLOAttributes()
+
+        // Parse operands: (%op1, %op2, ...)
+        if match(.leftParen) {
+            if !check(.rightParen) {
+                repeat {
+                    let operand = try parsePercentIdentifier()
+                    operands.append(operand)
+                } while match(.comma)
+            }
+            try expect(.rightParen)
+        }
+
+        // Parse attribute block: {attr = value, ...}
+        if match(.leftBrace) {
+            skipNewlines()
+            while !check(.rightBrace) && !check(.eof) {
+                // Parse attribute name
+                if checkIdentifier("rng_distribution") {
+                    try expectIdentifier("rng_distribution")
+                    try expect(.equal)
+                    // Parse #stablehlo<rng_distribution UNIFORM> or #stablehlo<rng_distribution NORMAL>
+                    if check(.hashIdentifier) {
+                        // Skip #stablehlo
+                        advance()
+                        // Parse <rng_distribution UNIFORM>
+                        if match(.leftAngle) {
+                            // Skip "rng_distribution" identifier
+                            if check(.identifier) {
+                                advance()
+                            }
+                            // Parse UNIFORM or NORMAL
+                            if checkIdentifier("UNIFORM") {
+                                attributes.rngDistribution = .uniform
+                                advance()
+                            } else if checkIdentifier("NORMAL") {
+                                attributes.rngDistribution = .normal
+                                advance()
+                            }
+                            try expect(.rightAngle)
+                        }
                     }
                 } else {
                     // Skip unknown attributes
@@ -523,7 +597,33 @@ public final class Parser {
             }
 
         case .rng:
-            attributes.rngDistribution = try parseRNGDistribution()
+            // RNG has format: shape = [...], distribution = UNIFORM/NORMAL
+            // Skip shape attribute (output shape comes from result type)
+            while !check(.colon) && !check(.eof) {
+                if checkIdentifier("shape") {
+                    try expectIdentifier("shape")
+                    try expect(.equal)
+                    // Skip the shape array [...]
+                    if match(.leftBracket) {
+                        while !check(.rightBracket) && !check(.eof) {
+                            advance()
+                        }
+                        try expect(.rightBracket)
+                    }
+                    _ = match(.comma)
+                } else if checkIdentifier("distribution") {
+                    try expectIdentifier("distribution")
+                    try expect(.equal)
+                    attributes.rngDistribution = try parseRNGDistribution()
+                    _ = match(.comma)
+                } else if checkIdentifier("UNIFORM") || checkIdentifier("NORMAL") {
+                    // Direct distribution without "distribution =" prefix
+                    attributes.rngDistribution = try parseRNGDistribution()
+                    _ = match(.comma)
+                } else {
+                    break
+                }
+            }
 
         case .whileOp:
             attributes.whileRegions = try parseWhileRegions()

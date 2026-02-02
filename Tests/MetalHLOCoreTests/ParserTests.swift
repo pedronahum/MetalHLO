@@ -177,6 +177,54 @@ struct ParserTests {
         #expect(module.function.returnValues == ["%0"])
     }
 
+    // MARK: - RNG Operations
+
+    @Test("Parse RNG uniform generic form")
+    func parseRngUniformGenericForm() throws {
+        // Test the new generic form with shape as tensor operand
+        let mlir = """
+        module @rng_uniform {
+          func.func @main(%arg0: tensor<f32>, %arg1: tensor<f32>) -> (tensor<5x10xf32>) {
+            %1 = stablehlo.constant dense<[5, 10]> : tensor<2xi64>
+            %0 = "stablehlo.rng"(%arg0, %arg1, %1) {rng_distribution = #stablehlo<rng_distribution UNIFORM>} : (tensor<f32>, tensor<f32>, tensor<2xi64>) -> tensor<5x10xf32>
+            return %0 : tensor<5x10xf32>
+          }
+        }
+        """
+
+        let parser = Parser(source: mlir)
+        let module = try parser.parse()
+
+        #expect(module.name == "rng_uniform")
+        #expect(module.function.operations.count == 2)  // constant + rng
+
+        // Find the RNG operation
+        let rngOp = module.function.operations.first { $0.kind == .rng }
+        #expect(rngOp != nil)
+        #expect(rngOp?.operands.count == 3)  // low, high, shape
+        #expect(rngOp?.attributes.rngDistribution == .uniform)
+    }
+
+    @Test("Parse RNG normal generic form")
+    func parseRngNormalGenericForm() throws {
+        let mlir = """
+        module @rng_normal {
+          func.func @main(%arg0: tensor<f32>, %arg1: tensor<f32>) -> (tensor<3x4xf32>) {
+            %1 = stablehlo.constant dense<[3, 4]> : tensor<2xi64>
+            %0 = "stablehlo.rng"(%arg0, %arg1, %1) {rng_distribution = #stablehlo<rng_distribution NORMAL>} : (tensor<f32>, tensor<f32>, tensor<2xi64>) -> tensor<3x4xf32>
+            return %0 : tensor<3x4xf32>
+          }
+        }
+        """
+
+        let parser = Parser(source: mlir)
+        let module = try parser.parse()
+
+        let rngOp = module.function.operations.first { $0.kind == .rng }
+        #expect(rngOp != nil)
+        #expect(rngOp?.attributes.rngDistribution == .normal)
+    }
+
     // MARK: - Error Handling
 
     @Test("Parse error on invalid syntax")
