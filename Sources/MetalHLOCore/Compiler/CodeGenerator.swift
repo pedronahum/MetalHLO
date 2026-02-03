@@ -112,11 +112,9 @@ public final class CodeGenerator: @unchecked Sendable {
         let constantIDs = Set(module.constants.keys)
 
         // Build a view registry that tracks tensor views
-        // Start with contiguous views for all inputs
-        for input in module.inputs {
-            let inputInfo = TensorInfo(id: input.name, type: input.type)
-            viewMappings[input.name] = StridedTensorView.from(inputInfo)
-        }
+        // NOTE: Inputs are NOT added to viewMappings - they are base tensors, not views.
+        // Only view operations (transpose, reshape, slice) and computed outputs should be tracked here.
+        // Adding inputs would create self-referential cycles since baseTensorID == input.name.
 
         for opID in memoryPlan.executionOrder {
             // opID is an integer index into the operations array
@@ -305,6 +303,8 @@ public final class CodeGenerator: @unchecked Sendable {
         let dispatch = calculateDispatch(
             type: op.type,
             shapes: outputShapes,
+            inputShapes: inputShapes,
+            attributes: op.attributes,
             tuning: tuning,
             elementType: elementType
         )
@@ -898,12 +898,14 @@ public final class CodeGenerator: @unchecked Sendable {
         }
 
         // Generate code to compute input linear index from permuted coordinates
+        // For transpose, permutation[i] tells us which input dimension feeds into output dimension i
+        // So for output coordinate coord[i], we need to use inputStrides[permutation[i]]
         var inputIndexCode = "uint inputIdx = "
         var terms: [String] = []
         for i in 0..<rank {
-            let outputDim = permutation[i]
-            if inputStrides[i] != 0 {
-                terms.append("coord\(outputDim) * \(inputStrides[i])")
+            let inputDim = permutation[i]
+            if inputDim < inputStrides.count && inputStrides[inputDim] != 0 {
+                terms.append("coord\(i) * \(inputStrides[inputDim])")
             }
         }
         inputIndexCode += terms.isEmpty ? "0" : terms.joined(separator: " + ")
@@ -2338,7 +2340,7 @@ public final class CodeGenerator: @unchecked Sendable {
     // MARK: - Dispatch Calculation
 
     /// Calculates dispatch configuration for an operation.
-    private func calculateDispatch(type: FusedOpType, shapes: [[Int]], tuning: TuningConfig?, elementType: ElementType = .float32) -> DispatchConfig {
+    private func calculateDispatch(type: FusedOpType, shapes: [[Int]], inputShapes: [[Int]] = [], attributes: HLOAttributes = HLOAttributes(), tuning: TuningConfig?, elementType: ElementType = .float32) -> DispatchConfig {
         guard let outputShape = shapes.first else {
             return DispatchConfig.dispatch1D(elements: 1)
         }
@@ -2408,26 +2410,28 @@ public final class CodeGenerator: @unchecked Sendable {
                     threadgroupSize: MTLSize(width: blockSize, height: 1, depth: 1)
                 )
             case .transpose:
-                // Use tiled dispatch for 2D and 3D transpose
-                // The kernel uses 32x32 tiles with shared memory
-                // Grid dimensions must match input shape since kernel iterates over input tiles
-                // For transpose [M, N] -> [N, M]: gid.x covers input cols (N), gid.y covers input rows (M)
+                // Get permutation from attributes
+                let permutation = attributes.dimensions ?? []
+                let inputShape = inputShapes.first ?? []
+
+                // Use tiled dispatch ONLY for optimized 2D [1,0] and 3D [0,2,1] transposes
+                // For all other permutations, use 1D dispatch since we use the general transpose kernel
                 let tileSize = 32
-                if outputShape.count == 2 {
-                    // 2D transpose: input was [M, N], output is [N, M]
-                    // output_rows = N (input cols), output_cols = M (input rows)
+
+                // Check for optimized 2D transpose [M, N] -> [N, M] with permutation [1, 0]
+                if inputShape.count == 2 && permutation == [1, 0] {
                     let inputCols = outputShape[0]  // N = output rows = input cols
                     let inputRows = outputShape[1]  // M = output cols = input rows
-                    // Grid covers input tiles: gid.x over cols, gid.y over rows
                     let gridWidth = (inputCols + tileSize - 1) / tileSize
                     let gridHeight = (inputRows + tileSize - 1) / tileSize
                     return DispatchConfig(
                         gridSize: MTLSize(width: gridWidth, height: gridHeight, depth: 1),
                         threadgroupSize: MTLSize(width: tileSize, height: tileSize, depth: 1)
                     )
-                } else if outputShape.count == 3 {
-                    // 3D transpose [B, M, N] -> [B, N, M]
-                    // output is [B, N, M]: outputShape[1] = N (input cols), outputShape[2] = M (input rows)
+                }
+
+                // Check for optimized 3D transpose [B, M, N] -> [B, N, M] with permutation [0, 2, 1]
+                if inputShape.count == 3 && permutation == [0, 2, 1] {
                     let batch = outputShape[0]
                     let inputCols = outputShape[1]  // N = output rows = input cols per batch
                     let inputRows = outputShape[2]  // M = output cols = input rows per batch
@@ -2438,8 +2442,14 @@ public final class CodeGenerator: @unchecked Sendable {
                         threadgroupSize: MTLSize(width: tileSize, height: tileSize, depth: 1)
                     )
                 }
-                // Fall back to 1D for higher dimensions
+
+                // For all other transpose permutations, use 1D dispatch
+                // This matches the general transpose kernel which uses thread_position_in_grid as uint
                 return DispatchConfig.dispatch1D(elements: totalElements, threadgroupSize: 1024)
+            case .broadcastInDim:
+                // Broadcast kernel is NOT vectorized - it expects tid to be the output element index
+                // Use non-vectorized 1D dispatch to match the kernel
+                return DispatchConfig.dispatch1D(elements: totalElements, threadgroupSize: 256)
             default:
                 break
             }

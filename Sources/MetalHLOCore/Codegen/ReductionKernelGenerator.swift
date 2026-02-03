@@ -113,7 +113,9 @@ public struct ReductionKernelGenerator {
     /// Generates an optimized row reduction kernel.
     ///
     /// Row reduction sums/max/min across the last axis.
-    /// Each thread handles one row, using vectorized loads.
+    /// Each thread handles one row, using scalar loads for correctness
+    /// (vectorized loads require 16-byte alignment which isn't guaranteed
+    /// when row size isn't a multiple of 4).
     /// Uses same buffer interface as general kernel for compatibility.
     public static func generateRowReductionKernel(
         op: ReductionOp,
@@ -123,7 +125,7 @@ public struct ReductionKernelGenerator {
         #include <metal_stdlib>
         using namespace metal;
 
-        // Optimized row reduction kernel using vectorized loads
+        // Optimized row reduction kernel
         // Reduces over the last axis: [M, N] -> [M]
         // Each thread handles one complete row
         kernel void \(entryPoint)(
@@ -141,18 +143,19 @@ public struct ReductionKernelGenerator {
             uint base = gid * reduceSize;
             float accum = \(op.identity);
 
-            // Vectorized load: process 4 elements at a time
-            uint cols4 = reduceSize / 4;
-            for (uint i = 0; i < cols4; i++) {
-                float4 vals = reinterpret_cast<device const float4*>(input + base)[i];
-                float val = vals.x; \(op.accumOp)
-                val = vals.y; \(op.accumOp)
-                val = vals.z; \(op.accumOp)
-                val = vals.w; \(op.accumOp)
+            // Use scalar loads to avoid alignment issues when reduceSize is not a multiple of 4
+            // Loop unrolling by 4 for performance without requiring alignment
+            uint i = 0;
+            uint reduceSize4 = reduceSize & ~3u;  // Round down to multiple of 4
+            for (; i < reduceSize4; i += 4) {
+                float val = input[base + i]; \(op.accumOp)
+                val = input[base + i + 1]; \(op.accumOp)
+                val = input[base + i + 2]; \(op.accumOp)
+                val = input[base + i + 3]; \(op.accumOp)
             }
 
-            // Handle remainder
-            for (uint i = cols4 * 4; i < reduceSize; i++) {
+            // Handle remainder (0-3 elements)
+            for (; i < reduceSize; i++) {
                 float val = input[base + i];
                 \(op.accumOp)
             }
