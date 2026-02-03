@@ -151,11 +151,11 @@ public final class CodeGenerator: @unchecked Sendable {
 
             // Use string-converted integer as key to match executionOrder format
             specs[String(opID)] = spec
-
-            // Create contiguous view for this operation's output
-            for output in op.outputs {
-                viewMappings[output.id] = StridedTensorView.from(output)
-            }
+            // NOTE: We do NOT add views for regular compute operation outputs.
+            // Views are only created for actual view operations (transpose, reshape, slice)
+            // which are handled by tryGenerateViewOperation above.
+            // Adding viewMappings[output.id] = StridedTensorView.from(output) here would
+            // create self-referential cycles that cause infinite loops in resolveViewChain.
         }
 
         return CodeGenerationResult(

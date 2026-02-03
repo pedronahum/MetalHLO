@@ -873,4 +873,50 @@ struct ReductionOperationTests {
         #expect(abs(result[4] - 18.5) < 0.01, "Expected 18.5, got \(result[4])")
         #expect(abs(result[5] - 22.5) < 0.01, "Expected 22.5, got \(result[5])")
     }
+
+    @Test("Simple add with IntegratedExecutor")
+    func addWithConfig() throws {
+        let client = try Client.create()
+        let mlir = """
+        module @simple_add {
+          func.func @main(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>) -> (tensor<4xf32>) {
+            %result = stablehlo.add %arg0, %arg1 : tensor<4xf32>
+            return %result : tensor<4xf32>
+          }
+        }
+        """
+        let config = CompilationConfig.default
+        let executable = try client.compile(mlir, config: config)
+        let a = try client.createBuffer([1, 2, 3, 4] as [Float], shape: [4], elementType: .float32)
+        let b = try client.createBuffer([10, 20, 30, 40] as [Float], shape: [4], elementType: .float32)
+        let outputs = try executable.execute([a, b])
+        let result = try outputs[0].toFloatArray()
+        print("add (with config) result: \(result)")
+        #expect(result == [11, 22, 33, 44])
+    }
+
+    @Test("Row reduction (dim 1) with IntegratedExecutor")
+    func reduceRowDim1_WithConfig() throws {
+        let client = try Client.create()
+        let mlir = """
+        module @reduce_row {
+          func.func @main(%arg0: tensor<2x4xf32>) -> (tensor<2xf32>) {
+            %init = stablehlo.constant dense<0.0> : tensor<f32>
+            %result = stablehlo.reduce(%arg0 init: %init) applies stablehlo.add across dimensions = [1] : (tensor<2x4xf32>, tensor<f32>) -> tensor<2xf32>
+            return %result : tensor<2xf32>
+          }
+        }
+        """
+        let config = CompilationConfig.default
+        let executable = try client.compile(mlir, config: config)
+        // Input: [[1,2,3,4], [5,6,7,8]]
+        // Sum over dim 1 (last axis = row reduction): [10, 26]
+        let a = try client.createBuffer([1, 2, 3, 4, 5, 6, 7, 8] as [Float], shape: [2, 4], elementType: .float32)
+        let outputs = try executable.execute([a])
+        let result = try outputs[0].toFloatArray()
+        print("reduce_row (with config) result: \(result)")
+        #expect(result.count == 2, "Expected 2 elements, got \(result.count)")
+        #expect(abs(result[0] - 10.0) < 0.01, "Expected 10, got \(result[0])")
+        #expect(abs(result[1] - 26.0) < 0.01, "Expected 26, got \(result[1])")
+    }
 }
