@@ -586,20 +586,52 @@ let exe = try client.compile(mlir, config: .release)
 
 ## Testing
 
+### Quick Start
+
+Run the core unit tests (fast, ~600 tests):
+
+```bash
+swift test --filter 'MetalHLOCoreTests'
+```
+
 Run the full test suite:
 
 ```bash
 swift test
 ```
 
-Run specific test suites:
+### Recommended: Serial Execution
+
+For the most reliable test runs, use the `--no-parallel` flag. This prevents Metal/MPSGraph resource conflicts that can occur when multiple GPU operations run concurrently:
 
 ```bash
+swift test --no-parallel
+```
+
+### Running Specific Tests
+
+```bash
+# By test suite name
 swift test --filter "Binary"
 swift test --filter "Reduction"
 swift test --filter "CAPITests"
 swift test --filter "AlgebraicSimplifier"
+
+# Conformance tests
+swift test --filter 'OfficialInterpretTests'
+swift test --filter 'Optimization'
+
+# Specific operation tests
+swift test --filter 'testAdd'
+swift test --filter 'scatter'
 ```
+
+### Test Organization
+
+| Target | Description | Test Count |
+|--------|-------------|------------|
+| `MetalHLOCoreTests` | Core compiler and optimizer tests | ~586 |
+| `MetalHLOTests` | Integration and conformance tests | ~400+ |
 
 ### Test Coverage
 
