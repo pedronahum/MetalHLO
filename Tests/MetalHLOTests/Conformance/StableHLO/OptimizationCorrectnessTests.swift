@@ -13,7 +13,7 @@ import MetalHLO
 
 /// Tests that verify all optimization levels produce the same numerical results.
 /// This is critical for ensuring that optimization passes preserve program semantics.
-@Suite("Optimization Correctness")
+@Suite("Optimization Correctness", .serialized)
 struct OptimizationCorrectnessTests {
 
     /// Test configurations for all optimization levels
@@ -204,7 +204,7 @@ struct OptimizationCorrectnessTests {
 // MARK: - Cross-Level Comparison Tests
 
 /// Tests that compare specific test cases across all optimization levels with detailed output comparison.
-@Suite("Optimization Level Comparison")
+@Suite("Optimization Level Comparison", .serialized)
 struct OptimizationLevelComparisonTests {
 
     /// Simple MLIR programs for direct comparison testing
@@ -526,7 +526,7 @@ struct BatchOptimizationCorrectnessTests {
 // MARK: - Individual Pass Tests
 
 /// Tests that verify individual optimization passes preserve correctness.
-@Suite("Individual Pass Correctness")
+@Suite("Individual Pass Correctness", .serialized)
 struct IndividualPassCorrectnessTests {
 
     /// Test program: elementwise chain that can benefit from fusion
@@ -706,7 +706,7 @@ module @reshape_transpose {
 // MARK: - Pass Combination Tests
 
 /// Tests combinations of passes to ensure they work correctly together.
-@Suite("Pass Combination Correctness")
+@Suite("Pass Combination Correctness", .serialized)
 struct PassCombinationCorrectnessTests {
 
     static let testMLIR = """

@@ -8,7 +8,7 @@ import Testing
 
 // MARK: - Binary Operations
 
-@Suite("Binary Operations")
+@Suite("Binary Operations", .serialized)
 struct BinaryOperationTests {
 
     @Test("Subtract operation")
@@ -109,7 +109,7 @@ struct BinaryOperationTests {
 
 // MARK: - Unary Operations
 
-@Suite("Unary Operations")
+@Suite("Unary Operations", .serialized)
 struct UnaryOperationTests {
 
     @Test("Exponential operation")
@@ -321,7 +321,7 @@ struct UnaryOperationTests {
 
 // MARK: - Matrix Operations
 
-@Suite("Matrix Operations")
+@Suite("Matrix Operations", .serialized)
 struct MatrixOperationTests {
 
     @Test("Dot product (matrix multiplication)")
@@ -391,7 +391,7 @@ struct MatrixOperationTests {
 
 // MARK: - Type Conversion
 
-@Suite("Type Conversion")
+@Suite("Type Conversion", .serialized)
 struct TypeConversionTests {
 
     @Test("Convert float32 to int32")
@@ -434,7 +434,7 @@ struct TypeConversionTests {
 
 // MARK: - Linear Layer End-to-End Test
 
-@Suite("End-to-End Tests")
+@Suite("End-to-End Tests", .serialized)
 struct EndToEndTests {
 
     @Test("Linear layer: y = relu(x @ W + b)")
@@ -545,7 +545,7 @@ struct EndToEndTests {
 
 // MARK: - Additional Math Operations (expm1, log1p, cbrt)
 
-@Suite("Additional Math Operations")
+@Suite("Additional Math Operations", .serialized)
 struct AdditionalMathOperationTests {
 
     @Test("Expm1 operation - exp(x) - 1")
@@ -749,7 +749,7 @@ struct AdditionalMathOperationTests {
 
 // MARK: - Reduction Operations
 
-@Suite("Reduction Operations")
+@Suite("Reduction Operations", .serialized)
 struct ReductionOperationTests {
 
     @Test("Reduce sum along dimension 0 (no config - MPSGraph)")

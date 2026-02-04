@@ -8,7 +8,7 @@ import Testing
 
 // MARK: - Additional Math Operations
 
-@Suite("Additional Math Operations")
+@Suite("Additional Math Operations", .serialized)
 struct AdditionalMathOpsTests {
 
     @Test("Expm1 operation (e^x - 1)")
@@ -125,7 +125,7 @@ struct AdditionalMathOpsTests {
 
 // MARK: - Shift Operations
 
-@Suite("Shift Operations")
+@Suite("Shift Operations", .serialized)
 struct ShiftOpsTests {
 
     @Test("Shift left")
@@ -200,7 +200,7 @@ struct ShiftOpsTests {
 
 // MARK: - Dynamic Operations
 
-@Suite("Dynamic Reshape Operations")
+@Suite("Dynamic Reshape Operations", .serialized)
 struct DynamicReshapeOpsTests {
 
     @Test("Dynamic reshape")
@@ -269,7 +269,7 @@ struct DynamicReshapeOpsTests {
 
 // MARK: - Bitcast Convert
 
-@Suite("Bitcast Convert Operations")
+@Suite("Bitcast Convert Operations", .serialized)
 struct BitcastConvertOpsTests {
 
     @Test("Bitcast convert f32 to i32")
@@ -294,7 +294,7 @@ struct BitcastConvertOpsTests {
 
 // MARK: - Complex Number Operations (Simplified)
 
-@Suite("Complex Number Operations")
+@Suite("Complex Number Operations", .serialized)
 struct ComplexOpsTests {
 
     @Test("Create complex from real and imaginary")
@@ -320,7 +320,7 @@ struct ComplexOpsTests {
 
 // MARK: - Population Count Operations
 
-@Suite("Population Count Operations")
+@Suite("Population Count Operations", .serialized)
 struct PopcntOpsTests {
 
     @Test("Popcnt counts set bits")
@@ -371,7 +371,7 @@ struct PopcntOpsTests {
 
 // MARK: - Reduce Precision Operations
 
-@Suite("Reduce Precision Operations")
+@Suite("Reduce Precision Operations", .serialized)
 struct ReducePrecisionOpsTests {
 
     @Test("Reduce precision compiles and runs (identity implementation)")

@@ -8,7 +8,7 @@ import Testing
 
 // MARK: - Batched Matrix Multiplication
 
-@Suite("Batched MatMul")
+@Suite("Batched MatMul", .serialized)
 struct BatchedMatMulTests {
 
     @Test("dot_general with batching dimensions")
@@ -139,7 +139,7 @@ struct BatchedMatMulTests {
 
 // MARK: - Reduction Operations
 
-@Suite("Reduction Operations")
+@Suite("Reduction Operations", .serialized)
 struct ReductionTests {
 
     @Test("Reduce sum over axis")
@@ -249,7 +249,7 @@ struct ReductionTests {
 
 // MARK: - Comparison Operations
 
-@Suite("Comparison Operations")
+@Suite("Comparison Operations", .serialized)
 struct ComparisonTests {
 
     @Test("Compare equal")
@@ -388,7 +388,7 @@ struct ComparisonTests {
 
 // MARK: - Select Operation
 
-@Suite("Select Operation")
+@Suite("Select Operation", .serialized)
 struct SelectTests {
 
     @Test("Select based on predicate")
@@ -449,7 +449,7 @@ struct SelectTests {
 
 // MARK: - Clamp Operation
 
-@Suite("Clamp Operation")
+@Suite("Clamp Operation", .serialized)
 struct ClampTests {
 
     @Test("Clamp values to range")
@@ -503,7 +503,7 @@ struct ClampTests {
 
 // MARK: - Gradient Computation Tests
 
-@Suite("Gradient Computation")
+@Suite("Gradient Computation", .serialized)
 struct GradientTests {
 
     @Test("Linear layer backward pass: dL/dW")

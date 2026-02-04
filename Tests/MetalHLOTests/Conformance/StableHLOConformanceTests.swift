@@ -10,7 +10,7 @@ import Foundation
 
 // MARK: - Core Unary Operations
 
-@Suite("StableHLO Conformance: Unary Operations")
+@Suite("StableHLO Conformance: Unary Operations", .serialized)
 struct UnaryConformanceTests {
 
     @Test("abs float32")
@@ -93,7 +93,7 @@ struct UnaryConformanceTests {
 
 // MARK: - Phase 3: Math Operations
 
-@Suite("StableHLO Conformance: Math Operations")
+@Suite("StableHLO Conformance: Math Operations", .serialized)
 struct MathConformanceTests {
 
     @Test("acos float32 (via atan2)")
@@ -113,7 +113,7 @@ struct MathConformanceTests {
 
 // MARK: - Binary Arithmetic Operations
 
-@Suite("StableHLO Conformance: Binary Operations")
+@Suite("StableHLO Conformance: Binary Operations", .serialized)
 struct BinaryConformanceTests {
 
     @Test("add float32")
@@ -173,7 +173,7 @@ struct BinaryConformanceTests {
 
 // MARK: - Float16 Operations
 
-@Suite("StableHLO Conformance: Float16 Operations")
+@Suite("StableHLO Conformance: Float16 Operations", .serialized)
 struct Float16ConformanceTests {
 
     @Test("abs float16")
@@ -214,7 +214,7 @@ struct Float16ConformanceTests {
 
 // MARK: - Matrix Operations (dot_general)
 
-@Suite("StableHLO Conformance: Matrix Operations")
+@Suite("StableHLO Conformance: Matrix Operations", .serialized)
 struct MatrixConformanceTests {
 
     @Test("dot_general float16 -> float32")
@@ -244,7 +244,7 @@ struct MatrixConformanceTests {
 
 // MARK: - Control Flow Operations (Phase 2)
 
-@Suite("StableHLO Conformance: Control Flow")
+@Suite("StableHLO Conformance: Control Flow", .serialized)
 struct ControlFlowConformanceTests {
 
     @Test("clamp float32")
@@ -267,7 +267,7 @@ struct ControlFlowConformanceTests {
 
 // MARK: - Integer Operations
 
-@Suite("StableHLO Conformance: Integer Operations")
+@Suite("StableHLO Conformance: Integer Operations", .serialized)
 struct IntegerConformanceTests {
 
     @Test("abs int32")
@@ -294,7 +294,7 @@ struct IntegerConformanceTests {
 
 // MARK: - Test Suite Runner
 
-@Suite("StableHLO Conformance Suite")
+@Suite("StableHLO Conformance Suite", .serialized)
 struct ConformanceSuiteTests {
 
     @Test("Run priority test suite")
@@ -311,7 +311,7 @@ struct ConformanceSuiteTests {
 
 // MARK: - Multi-Optimization Level Tests
 
-@Suite("StableHLO Conformance: Optimization Level Consistency")
+@Suite("StableHLO Conformance: Optimization Level Consistency", .serialized)
 struct OptimizationLevelConsistencyTests {
 
     @Test("Unary ops consistent across optimization levels",
@@ -366,7 +366,7 @@ struct OptimizationLevelConsistencyTests {
 
 // MARK: - Comprehensive Test Suite (All Available Tests)
 
-@Suite("StableHLO Conformance: Comprehensive")
+@Suite("StableHLO Conformance: Comprehensive", .serialized)
 struct ComprehensiveConformanceTests {
 
     @Test("Cache statistics")
@@ -496,7 +496,7 @@ struct ComprehensiveConformanceTests {
 
 // MARK: - Debug Tests
 
-@Suite("StableHLO Conformance: Debug")
+@Suite("StableHLO Conformance: Debug", .serialized)
 struct DebugConformanceTests {
 
     @Test("Debug expm1 parsing")

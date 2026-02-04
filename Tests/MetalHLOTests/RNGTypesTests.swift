@@ -9,7 +9,7 @@ import Foundation
 
 // MARK: - RNG Uniform Distribution
 
-@Suite("RNG Uniform")
+@Suite("RNG Uniform", .serialized)
 struct RNGUniformTests {
 
     @Test("RNG uniform: generates values in [0, 1)")
@@ -64,7 +64,7 @@ struct RNGUniformTests {
 
 // MARK: - RNG Normal Distribution
 
-@Suite("RNG Normal")
+@Suite("RNG Normal", .serialized)
 struct RNGNormalTests {
 
     @Test("RNG normal: generates normally distributed values")
@@ -123,7 +123,7 @@ struct RNGNormalTests {
 
 // MARK: - Dropout Layer (Success Criteria)
 
-@Suite("Dropout Layer")
+@Suite("Dropout Layer", .serialized)
 struct DropoutTests {
 
     @Test("Dropout: random masking with probability")
@@ -173,7 +173,7 @@ struct DropoutTests {
 
 // MARK: - Element Types
 
-@Suite("Element Types")
+@Suite("Element Types", .serialized)
 struct ElementTypeTests {
 
     @Test("Float16 arithmetic")
@@ -334,7 +334,7 @@ struct ElementTypeTests {
 
 // MARK: - Mixed Precision Operations
 
-@Suite("Mixed Precision")
+@Suite("Mixed Precision", .serialized)
 struct MixedPrecisionTests {
 
     @Test("F16 matmul with F32 accumulation pattern")

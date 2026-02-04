@@ -6,7 +6,7 @@
 import Testing
 @testable import MetalHLO
 
-@Suite("Client Tests")
+@Suite("Client Tests", .serialized)
 struct ClientTests {
 
     // MARK: - Client Creation

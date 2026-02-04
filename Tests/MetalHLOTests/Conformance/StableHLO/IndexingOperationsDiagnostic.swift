@@ -7,7 +7,7 @@ import Testing
 import Foundation
 import MetalHLO
 
-@Suite("Indexing Operations Diagnostic")
+@Suite("Indexing Operations Diagnostic", .serialized)
 struct IndexingOperationsDiagnosticTests {
 
     // MARK: - Slice Tests

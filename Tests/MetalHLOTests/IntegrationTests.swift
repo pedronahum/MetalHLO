@@ -6,7 +6,7 @@
 import Testing
 @testable import MetalHLO
 
-@Suite("Integration Tests")
+@Suite("Integration Tests", .serialized)
 struct IntegrationTests {
 
     // MARK: - Basic Operations

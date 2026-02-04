@@ -7,7 +7,7 @@ import Testing
 import Foundation
 @testable import MetalHLO
 
-@Suite("Indexing Operations Conformance")
+@Suite("Indexing Operations Conformance", .serialized)
 struct IndexingConformanceTests {
 
     @Test("slice.mlir - Official conformance")

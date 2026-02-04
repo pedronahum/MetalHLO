@@ -10,7 +10,7 @@ import Foundation
 
 // MARK: - Slice Operations
 
-@Suite("Slice Operations")
+@Suite("Slice Operations", .serialized)
 struct SliceTests {
 
     @Test("Slice: basic 1D slice")
@@ -110,7 +110,7 @@ struct SliceTests {
 
 // MARK: - Pad Operations
 
-@Suite("Pad Operations")
+@Suite("Pad Operations", .serialized)
 struct PadTests {
 
     @Test("Pad: 1D zero padding")
@@ -216,7 +216,7 @@ struct PadTests {
 
 // MARK: - Concatenate Operations
 
-@Suite("Concatenate Operations")
+@Suite("Concatenate Operations", .serialized)
 struct ConcatenateTests {
 
     @Test("Concatenate: 1D tensors")
@@ -329,7 +329,7 @@ struct ConcatenateTests {
 
 // MARK: - Gather Operations (Embedding Lookup)
 
-@Suite("Gather Operations")
+@Suite("Gather Operations", .serialized)
 struct GatherTests {
 
     @Test("Gather: simple embedding lookup")
@@ -486,7 +486,7 @@ struct GatherTests {
 
 // MARK: - Scatter Operations
 
-@Suite("Scatter Operations")
+@Suite("Scatter Operations", .serialized)
 struct ScatterTests {
 
     @Test("Scatter: update embedding table")
@@ -548,7 +548,7 @@ struct ScatterTests {
 
 // MARK: - Combined Indexing Test
 
-@Suite("Combined Indexing Operations")
+@Suite("Combined Indexing Operations", .serialized)
 struct CombinedIndexingTests {
 
     @Test("Slice + Pad: extract and pad back")

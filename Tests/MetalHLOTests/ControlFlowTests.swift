@@ -9,7 +9,7 @@ import Foundation
 
 // MARK: - While Loop Tests
 
-@Suite("While Loop")
+@Suite("While Loop", .serialized)
 struct WhileLoopTests {
 
     @Test("Simple counter loop")
@@ -101,7 +101,7 @@ struct WhileLoopTests {
 
 // MARK: - If Conditional Tests
 
-@Suite("If Conditional")
+@Suite("If Conditional", .serialized)
 struct IfConditionalTests {
 
     @Test("Simple if-then-else")
@@ -193,7 +193,7 @@ struct IfConditionalTests {
 
 // MARK: - Combined Control Flow Tests
 
-@Suite("Combined Control Flow")
+@Suite("Combined Control Flow", .serialized)
 struct CombinedControlFlowTests {
 
     @Test("ReLU using max (control flow alternative)")

@@ -10,7 +10,7 @@ import Foundation
 
 // MARK: - ReLU Activation
 
-@Suite("ReLU Activation")
+@Suite("ReLU Activation", .serialized)
 struct ReLUTests {
 
     @Test("ReLU: max(x, 0)")
@@ -61,7 +61,7 @@ struct ReLUTests {
 
 // MARK: - Sigmoid Activation
 
-@Suite("Sigmoid Activation")
+@Suite("Sigmoid Activation", .serialized)
 struct SigmoidTests {
 
     @Test("Sigmoid: 1 / (1 + exp(-x))")
@@ -131,7 +131,7 @@ struct SigmoidTests {
 
 // MARK: - Softmax Activation
 
-@Suite("Softmax Activation")
+@Suite("Softmax Activation", .serialized)
 struct SoftmaxTests {
 
     @Test("Softmax over last axis")
@@ -246,7 +246,7 @@ struct SoftmaxTests {
 
 // MARK: - GELU Activation
 
-@Suite("GELU Activation")
+@Suite("GELU Activation", .serialized)
 struct GELUTests {
 
     @Test("GELU approximation using tanh")
@@ -320,7 +320,7 @@ struct GELUTests {
 
 // MARK: - Leaky ReLU Activation
 
-@Suite("Leaky ReLU Activation")
+@Suite("Leaky ReLU Activation", .serialized)
 struct LeakyReLUTests {
 
     @Test("Leaky ReLU with alpha=0.01")
@@ -395,7 +395,7 @@ struct LeakyReLUTests {
 
 // MARK: - ELU Activation
 
-@Suite("ELU Activation")
+@Suite("ELU Activation", .serialized)
 struct ELUTests {
 
     @Test("ELU with alpha=1.0")
@@ -489,7 +489,7 @@ struct ELUTests {
 
 // MARK: - SiLU (Swish) Activation
 
-@Suite("SiLU Activation")
+@Suite("SiLU Activation", .serialized)
 struct SiLUTests {
 
     @Test("SiLU: x * sigmoid(x)")
@@ -569,7 +569,7 @@ struct SiLUTests {
 
 // MARK: - Activation Gradient Tests
 
-@Suite("Activation Gradients")
+@Suite("Activation Gradients", .serialized)
 struct ActivationGradientTests {
 
     @Test("Sigmoid backward pass")
@@ -623,7 +623,7 @@ struct ActivationGradientTests {
 
 // MARK: - Combined Activation Tests
 
-@Suite("Combined Activations")
+@Suite("Combined Activations", .serialized)
 struct CombinedActivationTests {
 
     @Test("Two-layer MLP with different activations")

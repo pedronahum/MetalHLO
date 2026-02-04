@@ -8,7 +8,7 @@ import Testing
 
 // MARK: - Math Operations (tan, logistic, is_finite, reverse)
 
-@Suite("Quick Wins - Math Operations")
+@Suite("Quick Wins - Math Operations", .serialized)
 struct MathOpsTests {
 
     @Test("Tan operation")
@@ -102,7 +102,7 @@ struct MathOpsTests {
 
 // MARK: - Convolution Operations
 
-@Suite("Quick Wins - Convolution")
+@Suite("Quick Wins - Convolution", .serialized)
 struct ConvolutionOpsTests {
 
     @Test("Basic 2D convolution")
@@ -155,7 +155,7 @@ struct ConvolutionOpsTests {
 
 // MARK: - Pooling Operations (reduce_window)
 
-@Suite("Quick Wins - Pooling")
+@Suite("Quick Wins - Pooling", .serialized)
 struct PoolingOpsTests {
 
     @Test("Max pooling 2x2")
@@ -206,7 +206,7 @@ struct PoolingOpsTests {
 
 // MARK: - Batch Normalization Operations
 
-@Suite("Quick Wins - Batch Normalization")
+@Suite("Quick Wins - Batch Normalization", .serialized)
 struct BatchNormOpsTests {
 
     @Test("Batch norm inference")
@@ -254,7 +254,7 @@ struct BatchNormOpsTests {
 
 // MARK: - Sort Operations
 
-@Suite("Quick Wins - Sort")
+@Suite("Quick Wins - Sort", .serialized)
 struct SortOpsTests {
 
     @Test("Sort 1D tensor")
@@ -303,7 +303,7 @@ struct SortOpsTests {
 
 // MARK: - Combined Tests
 
-@Suite("Quick Wins - Combined Operations")
+@Suite("Quick Wins - Combined Operations", .serialized)
 struct CombinedOpsTests {
 
     @Test("CNN forward pass: conv + pool + normalize")

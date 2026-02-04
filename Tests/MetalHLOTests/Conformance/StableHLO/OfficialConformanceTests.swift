@@ -15,7 +15,7 @@ import Foundation
 
 // MARK: - Interpret Tests (Official Conformance)
 
-@Suite("StableHLO Official: Interpret")
+@Suite("StableHLO Official: Interpret", .serialized)
 struct OfficialInterpretTests {
 
     // MARK: - Core Math Operations
@@ -403,7 +403,7 @@ struct OfficialInterpretTests {
 
 // MARK: - Additional Math Operations
 
-@Suite("StableHLO Official: Extended Math")
+@Suite("StableHLO Official: Extended Math", .serialized)
 struct OfficialExtendedMathTests {
 
     @Test("floor.mlir - Floor")
@@ -507,7 +507,7 @@ struct OfficialExtendedMathTests {
 
 // MARK: - Bitwise and Logical Operations
 
-@Suite("StableHLO Official: Bitwise & Logical")
+@Suite("StableHLO Official: Bitwise & Logical", .serialized)
 struct OfficialBitwiseTests {
 
     @Test("not.mlir - Bitwise NOT")
@@ -556,7 +556,7 @@ struct OfficialBitwiseTests {
 
 // MARK: - Shape and Data Movement Operations
 
-@Suite("StableHLO Official: Shape & Data Movement")
+@Suite("StableHLO Official: Shape & Data Movement", .serialized)
 struct OfficialShapeTests {
 
     @Test("pad.mlir - Pad")
@@ -613,7 +613,7 @@ struct OfficialShapeTests {
 
 // MARK: - Reduction and Window Operations
 
-@Suite("StableHLO Official: Reductions & Windows")
+@Suite("StableHLO Official: Reductions & Windows", .serialized)
 struct OfficialReductionTests {
 
     @Test("reduce_precision.mlir - Reduce precision")
@@ -639,7 +639,7 @@ struct OfficialReductionTests {
 
 // MARK: - Neural Network Operations
 
-@Suite("StableHLO Official: Neural Network")
+@Suite("StableHLO Official: Neural Network", .serialized)
 struct OfficialNNTests {
 
     @Test("sort.mlir - Sort")
@@ -665,7 +665,7 @@ struct OfficialNNTests {
 
 // MARK: - Dynamic Shape Operations
 
-@Suite("StableHLO Official: Dynamic Shapes")
+@Suite("StableHLO Official: Dynamic Shapes", .serialized)
 struct OfficialDynamicTests {
 
     @Test("dynamic_slice.mlir - Dynamic slice")
@@ -713,7 +713,7 @@ struct OfficialDynamicTests {
 
 // MARK: - Control Flow Operations
 
-@Suite("StableHLO Official: Control Flow")
+@Suite("StableHLO Official: Control Flow", .serialized)
 struct OfficialControlFlowTests {
 
     @Test("if.mlir - If conditional")
@@ -757,7 +757,7 @@ struct OfficialControlFlowTests {
 
 // MARK: - Complex Number Operations (expected to skip)
 
-@Suite("StableHLO Official: Complex Numbers")
+@Suite("StableHLO Official: Complex Numbers", .serialized)
 struct OfficialComplexTests {
 
     @Test("complex.mlir - Complex construction")
@@ -791,7 +791,7 @@ struct OfficialComplexTests {
 
 // MARK: - Tuple Operations
 
-@Suite("StableHLO Official: Tuples")
+@Suite("StableHLO Official: Tuples", .serialized)
 struct OfficialTupleTests {
 
     @Test("tuple_and_get_tuple_element.mlir - Tuple operations")
@@ -815,7 +815,7 @@ struct OfficialTupleTests {
 
 // MARK: - Quantization Operations
 
-@Suite("StableHLO Official: Quantization")
+@Suite("StableHLO Official: Quantization", .serialized)
 struct OfficialQuantizationTests {
 
     @Test("quantized_ops.mlir - Quantized operations")
@@ -839,7 +839,7 @@ struct OfficialQuantizationTests {
 
 // MARK: - Batch Test Runner
 
-@Suite("StableHLO Official: Batch Runner")
+@Suite("StableHLO Official: Batch Runner", .serialized)
 struct OfficialBatchTests {
 
     @Test("Download and list interpret tests")
