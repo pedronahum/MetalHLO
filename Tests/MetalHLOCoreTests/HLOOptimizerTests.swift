@@ -1079,11 +1079,13 @@ struct ProducerConsumerFusionTests {
             returnValues: ["%2"]
         )
 
-        // Enable only producer-consumer fusion
+        // Enable only producer-consumer fusion with MPSGraph stitching mode
+        // (emitFusedCustomCalls: false preserves operations for MPSGraph to stitch)
         let config = HLOOptimizerConfig(
             enableFusion: false,
             enableConstantFolding: false,
-            enableProducerConsumerFusion: true
+            enableProducerConsumerFusion: true,
+            emitFusedCustomCalls: false
         )
         let optimizer = HLOOptimizer(config: config)
         let result = optimizer.optimize(function)
@@ -1155,8 +1157,18 @@ struct ProducerConsumerFusionTests {
             returnValues: ["%5"]
         )
 
-        // Enable all optimizations
-        let config = HLOOptimizerConfig.default
+        // Enable all optimizations but use MPSGraph stitching mode to preserve individual ops
+        // (emitFusedCustomCalls: false so we can verify individual operations)
+        let config = HLOOptimizerConfig(
+            enableFusion: true,
+            enableConstantFolding: true,
+            enableProducerConsumerFusion: true,
+            enableSiblingFusion: true,
+            enableHorizontalFusion: true,
+            enableLayoutAssignment: true,
+            enableTransposeMatmulFolding: true,
+            emitFusedCustomCalls: false
+        )
         let optimizer = HLOOptimizer(config: config)
         let result = optimizer.optimize(function)
 

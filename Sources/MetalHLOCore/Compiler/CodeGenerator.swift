@@ -2481,6 +2481,15 @@ public final class CodeGenerator: @unchecked Sendable {
                 return DispatchConfig.dispatch2D(width: N, height: M)
             }
 
+        case .fusedElementwise:
+            // FusedElementwise kernel is NOT vectorized - it processes 1 element per thread
+            // using tid directly as the element index. Do NOT use vectorized dispatch.
+            return DispatchConfig.dispatch1D(elements: totalElements, threadgroupSize: 256)
+
+        case .fusedGELU, .fusedSiLU:
+            // GELU and SiLU kernels are NOT vectorized - they use tid directly
+            return DispatchConfig.dispatch1D(elements: totalElements, threadgroupSize: 256)
+
         default:
             break
         }
