@@ -687,8 +687,10 @@ Some operations only support floating-point types in MPSGraph:
 
 | Operation | Status | Notes |
 |-----------|--------|-------|
-| `gather` | Improved | Embedding lookup and index_vector_dim handling; batching dims supported when at leading positions |
+| `gather` | Improved | Works with all optimization levels (O0-O3); embedding lookup and index_vector_dim handling; batching dims supported when at leading positions |
 | `scatter` | Improved | Supports add/max/min/mul computation modes via MPS; batching dims require leading positions |
+| `convert` | Working | Type conversion between numeric types works with all optimization levels |
+| `slice` | Working | Static slice extraction with starts/limits/strides |
 | `dynamic_slice` | Working | Works when slice_sizes equal input dims (start indices clamped) |
 | `reduce_window` | Partial | Works for common patterns; complex regions limited |
 | `convolution` | Partial | Standard patterns work; complex dimension permutations may fail |

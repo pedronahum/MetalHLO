@@ -350,8 +350,14 @@ public final class CompiledExecutable: @unchecked Sendable {
     /// Input tensor specifications.
     public let inputSpecs: [String: TensorSpec]
 
+    /// Ordered list of input names (preserves function signature order).
+    public let inputOrder: [String]
+
     /// Output tensor specifications.
     public let outputSpecs: [String: TensorSpec]
+
+    /// Ordered list of output names (preserves function signature order).
+    public let outputOrder: [String]
 
     /// Constant buffers (pre-created).
     public let constantBuffers: [String: MTLBuffer]
@@ -380,7 +386,9 @@ public final class CompiledExecutable: @unchecked Sendable {
         threadgroupBufferCounts: [OpID: Int] = [:],
         memoryPlan: MemoryPlan,
         inputSpecs: [String: TensorSpec],
+        inputOrder: [String],
         outputSpecs: [String: TensorSpec],
+        outputOrder: [String],
         constantBuffers: [String: MTLBuffer] = [:],
         viewMappings: [TensorID: StridedTensorView] = [:]
     ) {
@@ -391,7 +399,9 @@ public final class CompiledExecutable: @unchecked Sendable {
         self.threadgroupBufferCounts = threadgroupBufferCounts
         self.memoryPlan = memoryPlan
         self.inputSpecs = inputSpecs
+        self.inputOrder = inputOrder
         self.outputSpecs = outputSpecs
+        self.outputOrder = outputOrder
         self.constantBuffers = constantBuffers
         self.viewMappings = viewMappings
     }

@@ -342,38 +342,54 @@ public final class Parser {
         // Parse attribute block: {attr = value, ...}
         if match(.leftBrace) {
             skipNewlines()
-            while !check(.rightBrace) && !check(.eof) {
-                // Parse attribute name
-                if checkIdentifier("rng_distribution") {
-                    try expectIdentifier("rng_distribution")
-                    try expect(.equal)
-                    // Parse #stablehlo<rng_distribution UNIFORM> or #stablehlo<rng_distribution NORMAL>
-                    if check(.hashIdentifier) {
-                        // Skip #stablehlo
-                        advance()
-                        // Parse <rng_distribution UNIFORM>
-                        if match(.leftAngle) {
-                            // Skip "rng_distribution" identifier
-                            if check(.identifier) {
-                                advance()
-                            }
-                            // Parse UNIFORM or NORMAL
-                            if checkIdentifier("UNIFORM") {
-                                attributes.rngDistribution = .uniform
-                                advance()
-                            } else if checkIdentifier("NORMAL") {
-                                attributes.rngDistribution = .normal
-                                advance()
-                            }
-                            try expect(.rightAngle)
-                        }
-                    }
-                } else {
-                    // Skip unknown attributes
+
+            // For gather operations, use specialized parsing
+            if kind == .gather {
+                attributes.gatherDimensionNumbers = try parseGatherDimensionNumbers()
+                // Skip to end of brace
+                while !check(.rightBrace) && !check(.eof) {
                     advance()
                 }
-                _ = match(.comma)
-                skipNewlines()
+            } else if kind == .scatter {
+                (attributes.scatterDimensionNumbers, attributes.scatterComputationKind) = try parseScatterAttributes()
+                while !check(.rightBrace) && !check(.eof) {
+                    advance()
+                }
+            } else {
+                // Generic attribute parsing
+                while !check(.rightBrace) && !check(.eof) {
+                    // Parse attribute name
+                    if checkIdentifier("rng_distribution") {
+                        try expectIdentifier("rng_distribution")
+                        try expect(.equal)
+                        // Parse #stablehlo<rng_distribution UNIFORM> or #stablehlo<rng_distribution NORMAL>
+                        if check(.hashIdentifier) {
+                            // Skip #stablehlo
+                            advance()
+                            // Parse <rng_distribution UNIFORM>
+                            if match(.leftAngle) {
+                                // Skip "rng_distribution" identifier
+                                if check(.identifier) {
+                                    advance()
+                                }
+                                // Parse UNIFORM or NORMAL
+                                if checkIdentifier("UNIFORM") {
+                                    attributes.rngDistribution = .uniform
+                                    advance()
+                                } else if checkIdentifier("NORMAL") {
+                                    attributes.rngDistribution = .normal
+                                    advance()
+                                }
+                                try expect(.rightAngle)
+                            }
+                        }
+                    } else {
+                        // Skip unknown attributes
+                        advance()
+                    }
+                    _ = match(.comma)
+                    skipNewlines()
+                }
             }
             try expect(.rightBrace)
         }
@@ -1740,10 +1756,15 @@ public final class Parser {
     }
 
     private func parseGatherDimensionNumbers() throws -> GatherDimensionNumbers? {
-        // Parse gather dimension numbers in inline format:
-        // offset_dims = [...], collapsed_slice_dims = [...], start_index_map = [...],
-        // index_vector_dim = N, slice_sizes = [...],
-        // operand_batching_dims = [...], start_indices_batching_dims = [...]
+        // Parse gather dimension numbers in StableHLO MLIR format:
+        // dimension_numbers = #stablehlo.gather<
+        //   offset_dims = [...],
+        //   collapsed_slice_dims = [...],
+        //   start_index_map = [...],
+        //   index_vector_dim = N
+        // >,
+        // slice_sizes = array<i64: ...>,
+        // indices_are_sorted = false
 
         var offsetDims: [Int] = []
         var collapsedSliceDims: [Int] = []
@@ -1754,7 +1775,95 @@ public final class Parser {
         var startIndicesBatchingDims: [Int] = []
 
         while !check(.colon) && !check(.eof) {
-            if checkIdentifier("offset_dims") {
+            skipNewlines()
+
+            if checkIdentifier("dimension_numbers") {
+                // Parse: dimension_numbers = #stablehlo.gather<...>
+                try expectIdentifier("dimension_numbers")
+                try expect(.equal)
+
+                // Skip #stablehlo.gather or similar prefix
+                if check(.hashIdentifier) {
+                    advance()
+                }
+
+                // Parse the inner content between < and >
+                if match(.leftAngle) {
+                    while !check(.rightAngle) && !check(.eof) {
+                        skipNewlines()
+
+                        if checkIdentifier("offset_dims") {
+                            try expectIdentifier("offset_dims")
+                            try expect(.equal)
+                            offsetDims = try parseDimensionList()
+                        } else if checkIdentifier("collapsed_slice_dims") {
+                            try expectIdentifier("collapsed_slice_dims")
+                            try expect(.equal)
+                            collapsedSliceDims = try parseDimensionList()
+                        } else if checkIdentifier("start_index_map") {
+                            try expectIdentifier("start_index_map")
+                            try expect(.equal)
+                            startIndexMap = try parseDimensionList()
+                        } else if checkIdentifier("index_vector_dim") {
+                            try expectIdentifier("index_vector_dim")
+                            try expect(.equal)
+                            indexVectorDim = try parseInteger()
+                        } else if checkIdentifier("operand_batching_dims") {
+                            try expectIdentifier("operand_batching_dims")
+                            try expect(.equal)
+                            operandBatchingDims = try parseDimensionList()
+                        } else if checkIdentifier("start_indices_batching_dims") {
+                            try expectIdentifier("start_indices_batching_dims")
+                            try expect(.equal)
+                            startIndicesBatchingDims = try parseDimensionList()
+                        } else {
+                            // Skip unknown tokens
+                            advance()
+                        }
+                        _ = match(.comma)
+                        skipNewlines()
+                    }
+                    _ = match(.rightAngle)
+                }
+            } else if checkIdentifier("slice_sizes") {
+                // Parse: slice_sizes = array<i64: 1, 3>
+                try expectIdentifier("slice_sizes")
+                try expect(.equal)
+
+                // Handle array<i64: ...> format
+                if checkIdentifier("array") {
+                    try expectIdentifier("array")
+                    if match(.leftAngle) {
+                        // Skip type like "i64:"
+                        while !check(.colon) && !check(.rightAngle) && !check(.eof) {
+                            advance()
+                        }
+                        _ = match(.colon)
+
+                        // Parse the integers
+                        var sizes: [Int] = []
+                        while !check(.rightAngle) && !check(.eof) {
+                            if case .integer(let val) = currentToken.kind {
+                                sizes.append(Int(val))
+                                advance()
+                            } else if check(.minus) {
+                                advance()
+                                if case .integer(let val) = currentToken.kind {
+                                    sizes.append(-Int(val))
+                                    advance()
+                                }
+                            } else {
+                                _ = match(.comma)
+                            }
+                        }
+                        _ = match(.rightAngle)
+                        sliceSizes = sizes
+                    }
+                } else {
+                    sliceSizes = try parseDimensionList()
+                }
+            } else if checkIdentifier("offset_dims") {
+                // Fallback: flat format without dimension_numbers wrapper
                 try expectIdentifier("offset_dims")
                 try expect(.equal)
                 offsetDims = try parseDimensionList()
@@ -1770,23 +1879,20 @@ public final class Parser {
                 try expectIdentifier("index_vector_dim")
                 try expect(.equal)
                 indexVectorDim = try parseInteger()
-            } else if checkIdentifier("slice_sizes") {
-                try expectIdentifier("slice_sizes")
+            } else if checkIdentifier("indices_are_sorted") {
+                // Skip this attribute
+                try expectIdentifier("indices_are_sorted")
                 try expect(.equal)
-                sliceSizes = try parseDimensionList()
-            } else if checkIdentifier("operand_batching_dims") {
-                try expectIdentifier("operand_batching_dims")
-                try expect(.equal)
-                operandBatchingDims = try parseDimensionList()
-            } else if checkIdentifier("start_indices_batching_dims") {
-                try expectIdentifier("start_indices_batching_dims")
-                try expect(.equal)
-                startIndicesBatchingDims = try parseDimensionList()
+                // Skip true/false
+                if checkIdentifier("true") || checkIdentifier("false") {
+                    advance()
+                }
             } else {
                 // Skip unknown tokens
                 break
             }
             _ = match(.comma)
+            skipNewlines()
         }
 
         // Only return if we parsed the essential fields

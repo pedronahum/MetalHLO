@@ -379,13 +379,15 @@ public final class MetalHLOCompiler: @unchecked Sendable {
             }
         }
 
-        // Build input/output specs
+        // Build input/output specs (preserving order from optimized module)
         var inputSpecs: [String: TensorSpec] = [:]
+        let inputOrder = optimized.inputs.map { $0.name }
         for input in optimized.inputs {
             inputSpecs[input.name] = TensorSpec(from: input)
         }
 
         var outputSpecs: [String: TensorSpec] = [:]
+        let outputOrder = optimized.outputs
         for outputID in optimized.outputs {
             if let info = optimized.tensors[outputID] {
                 outputSpecs[outputID] = TensorSpec(from: info)
@@ -403,7 +405,9 @@ public final class MetalHLOCompiler: @unchecked Sendable {
             threadgroupBufferCounts: threadgroupBufferCounts,
             memoryPlan: memoryPlan,
             inputSpecs: inputSpecs,
+            inputOrder: inputOrder,
             outputSpecs: outputSpecs,
+            outputOrder: outputOrder,
             constantBuffers: constantBuffers,
             viewMappings: viewMappings
         )

@@ -219,7 +219,8 @@ public final class Executable: @unchecked Sendable {
 
     private func buildMetalInputs(_ inputs: [Buffer], executable: CompiledExecutable, device: MTLDevice) -> [String: MTLBuffer] {
         var metalInputs: [String: MTLBuffer] = [:]
-        let inputNames = Array(executable.inputSpecs.keys).sorted()
+        // Use inputOrder to preserve function signature order (not alphabetical)
+        let inputNames = executable.inputOrder
 
         for (index, name) in inputNames.enumerated() where index < inputs.count {
             // Create Metal buffer from storage data
@@ -234,7 +235,8 @@ public final class Executable: @unchecked Sendable {
 
     private func buildOutputBuffers(from result: ExecutionResult, executor: IntegratedExecutor) -> [Buffer] {
         let device = executor.device
-        let outputNames = Array(executor.executable.outputSpecs.keys).sorted()
+        // Use outputOrder to preserve function signature order (not alphabetical)
+        let outputNames = executor.executable.outputOrder
         return outputNames.compactMap { name -> Buffer? in
             guard let metalBuffer = result.outputs[name],
                   let spec = executor.executable.outputSpecs[name] else {

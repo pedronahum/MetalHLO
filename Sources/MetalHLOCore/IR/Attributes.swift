@@ -45,6 +45,16 @@ public struct HLOAttributes: Sendable {
     /// Defaults to .set if not specified (simple replacement).
     public var scatterComputationKind: ScatterComputationKind?
 
+    /// Element type of indices tensor (for gather operations).
+    /// Populated during kernel generation from tensor info.
+    public var indicesElementType: ElementType?
+
+    // MARK: - Type Conversion Attributes
+
+    /// Input element types for operations that need them (e.g., convert).
+    /// Populated during kernel generation from tensor info.
+    public var inputElementTypes: [ElementType]?
+
     // MARK: - Comparison Attributes
 
     /// Comparison direction (EQ, NE, LT, LE, GT, GE).

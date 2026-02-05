@@ -290,12 +290,23 @@ public final class CodeGenerator: @unchecked Sendable {
         let outputShapes = op.outputs.map { $0.shape }
         let elementType = op.outputs.first?.elementType ?? .float32
 
+        // Get input element types for operations that need them (convert, gather)
+        let inputElementTypes = op.inputs.compactMap { tensors[$0]?.elementType }
+
+        // Create modified attributes with input types for source generation
+        var modifiedAttributes = op.attributes
+        modifiedAttributes.inputElementTypes = inputElementTypes
+        // For gather, set indices element type (second input)
+        if inputElementTypes.count > 1 {
+            modifiedAttributes.indicesElementType = inputElementTypes[1]
+        }
+
         // Generate Metal source and entry point
         let (source, entry, tuning) = generateSource(
             type: op.type,
             inputShapes: inputShapes,
             outputShapes: outputShapes,
-            attributes: op.attributes,
+            attributes: modifiedAttributes,
             elementType: elementType
         )
 
@@ -548,6 +559,45 @@ public final class CodeGenerator: @unchecked Sendable {
                 metalType: metalType
             )
 
+        // Type conversion operations
+        case .convert, .bitcastConvert:
+            // Get input element type from input shape info or default
+            let inputType = attributes.inputElementTypes?.first ?? .float32
+            source += generateConvertKernel(
+                entryPoint: entryPoint,
+                inputType: inputType,
+                outputType: elementType
+            )
+
+        // Gather operations (embedding lookup)
+        case .gather, .dynamicGather:
+            if let dimNumbers = attributes.gatherDimensionNumbers {
+                source += generateGatherKernel(
+                    entryPoint: entryPoint,
+                    operandShape: inputShapes.first ?? [],
+                    indicesShape: inputShapes.count > 1 ? inputShapes[1] : [],
+                    outputShape: outputShape,
+                    dimNumbers: dimNumbers,
+                    operandType: metalType,
+                    indicesType: attributes.indicesElementType.map { metalTypeName(for: $0) } ?? "int"
+                )
+            } else {
+                // Fallback if no dimension numbers
+                source += generateCopyKernel(entryPoint: entryPoint, metalType: metalType)
+            }
+
+        // Slice operations
+        case .slice:
+            source += generateSliceKernel(
+                entryPoint: entryPoint,
+                inputShape: inputShapes.first ?? [],
+                outputShape: outputShape,
+                starts: attributes.sliceStarts ?? [],
+                limits: attributes.sliceLimits ?? [],
+                strides: attributes.sliceStrides ?? Array(repeating: 1, count: outputShape.count),
+                metalType: metalType
+            )
+
         default:
             // Fallback to copy kernel for unsupported ops
             source += generateCopyKernel(entryPoint: entryPoint, metalType: metalType)
@@ -703,6 +753,189 @@ public final class CodeGenerator: @unchecked Sendable {
         {
             if (tid >= count) return;
             output[tid] = input[tid];
+        }
+        """
+    }
+
+    /// Generates a type conversion kernel.
+    private func generateConvertKernel(
+        entryPoint: String,
+        inputType: ElementType,
+        outputType: ElementType
+    ) -> String {
+        let inputMetal = metalTypeName(for: inputType)
+        let outputMetal = metalTypeName(for: outputType)
+
+        // Special handling for integer to float or vice versa
+        let conversion: String
+        if isFloatType(inputType) && !isFloatType(outputType) {
+            // Float to int - truncate
+            conversion = "\(outputMetal)(x)"
+        } else if !isFloatType(inputType) && isFloatType(outputType) {
+            // Int to float - direct cast
+            conversion = "\(outputMetal)(x)"
+        } else {
+            // Same category - direct cast
+            conversion = "\(outputMetal)(x)"
+        }
+
+        return """
+        kernel void \(entryPoint)(
+            device const \(inputMetal)* input [[buffer(0)]],
+            device \(outputMetal)* output [[buffer(1)]],
+            constant uint& count [[buffer(2)]],
+            uint tid [[thread_position_in_grid]])
+        {
+            if (tid >= count) return;
+            \(inputMetal) x = input[tid];
+            output[tid] = \(conversion);
+        }
+        """
+    }
+
+    /// Generates a gather kernel for embedding lookup patterns.
+    ///
+    /// This handles the common case where:
+    /// - operand is the data tensor to gather from
+    /// - indices contains positions to gather
+    /// - output is gathered data
+    ///
+    /// Supports the standard embedding lookup pattern where each index selects
+    /// a row/slice from the operand tensor.
+    private func generateGatherKernel(
+        entryPoint: String,
+        operandShape: [Int],
+        indicesShape: [Int],
+        outputShape: [Int],
+        dimNumbers: GatherDimensionNumbers,
+        operandType: String,
+        indicesType: String
+    ) -> String {
+        // Calculate dimensions
+        let numIndices = indicesShape.reduce(1, *)
+        let sliceSizes = dimNumbers.sliceSizes
+
+        // Calculate the size of each gathered slice (product of non-collapsed slice dimensions)
+        let sliceSize: Int
+        if sliceSizes.isEmpty {
+            sliceSize = 1
+        } else {
+            var size = 1
+            for (i, sz) in sliceSizes.enumerated() {
+                if !dimNumbers.collapsedSliceDims.contains(i) {
+                    size *= sz
+                }
+            }
+            sliceSize = size
+        }
+
+        // Calculate operand inner stride (elements per row/slice in operand)
+        // For a 2D operand [rows, cols], this is cols
+        let operandInnerStride: Int
+        if operandShape.count >= 2 && dimNumbers.startIndexMap.count == 1 && dimNumbers.startIndexMap[0] == 0 {
+            // Common case: gathering rows from 2D tensor
+            operandInnerStride = operandShape.dropFirst().reduce(1, *)
+        } else if operandShape.count == 1 {
+            operandInnerStride = 1
+        } else {
+            // General case: product of dimensions after the indexed dimension
+            let indexedDim = dimNumbers.startIndexMap.first ?? 0
+            if indexedDim < operandShape.count - 1 {
+                operandInnerStride = operandShape.suffix(from: indexedDim + 1).reduce(1, *)
+            } else {
+                operandInnerStride = 1
+            }
+        }
+
+        // Total output elements
+        let totalOutputElements = outputShape.reduce(1, *)
+
+        return """
+        kernel void \(entryPoint)(
+            device const \(operandType)* operand [[buffer(0)]],
+            device const \(indicesType)* indices [[buffer(1)]],
+            device \(operandType)* output [[buffer(2)]],
+            constant uint& outputCount [[buffer(3)]],
+            uint tid [[thread_position_in_grid]])
+        {
+            if (tid >= \(totalOutputElements)) return;
+
+            // Calculate which index and offset within slice
+            uint indexIdx = tid / \(sliceSize);
+            uint sliceOffset = tid % \(sliceSize);
+
+            // Bounds check for indices
+            if (indexIdx >= \(numIndices)) return;
+
+            // Get the index value (cast to uint for indexing)
+            uint idx = uint(indices[indexIdx]);
+
+            // Bounds check for operand
+            if (idx >= \(operandShape.first ?? 1)) {
+                output[tid] = 0;
+                return;
+            }
+
+            // Calculate source position
+            uint srcPos = idx * \(operandInnerStride) + sliceOffset;
+
+            output[tid] = operand[srcPos];
+        }
+        """
+    }
+
+    /// Generates a slice kernel for extracting sub-tensors.
+    private func generateSliceKernel(
+        entryPoint: String,
+        inputShape: [Int],
+        outputShape: [Int],
+        starts: [Int],
+        limits: [Int],
+        strides: [Int],
+        metalType: String
+    ) -> String {
+        guard !inputShape.isEmpty, !outputShape.isEmpty else {
+            return generateCopyKernel(entryPoint: entryPoint, metalType: metalType)
+        }
+
+        let rank = inputShape.count
+        let totalElements = outputShape.reduce(1, *)
+
+        // Calculate input and output strides
+        var inputStrides = [Int](repeating: 1, count: rank)
+        var outputStrides = [Int](repeating: 1, count: rank)
+        for i in stride(from: rank - 2, through: 0, by: -1) {
+            inputStrides[i] = inputStrides[i + 1] * inputShape[i + 1]
+            outputStrides[i] = outputStrides[i + 1] * outputShape[i + 1]
+        }
+
+        // Generate index calculation code
+        var indexCode = ""
+        for i in 0..<rank {
+            indexCode += "    uint out_idx_\(i) = (tid / \(outputStrides[i])) % \(outputShape[i]);\n"
+            indexCode += "    uint in_idx_\(i) = \(starts[i]) + out_idx_\(i) * \(strides[i]);\n"
+        }
+
+        // Generate source index calculation
+        var srcPosCalc = "uint srcPos = "
+        for i in 0..<rank {
+            if i > 0 { srcPosCalc += " + " }
+            srcPosCalc += "in_idx_\(i) * \(inputStrides[i])"
+        }
+        srcPosCalc += ";"
+
+        return """
+        kernel void \(entryPoint)(
+            device const \(metalType)* input [[buffer(0)]],
+            device \(metalType)* output [[buffer(1)]],
+            constant uint& count [[buffer(2)]],
+            uint tid [[thread_position_in_grid]])
+        {
+            if (tid >= \(totalElements)) return;
+
+        \(indexCode)
+            \(srcPosCalc)
+            output[tid] = input[srcPos];
         }
         """
     }
@@ -2449,6 +2682,17 @@ public final class CodeGenerator: @unchecked Sendable {
             case .broadcastInDim:
                 // Broadcast kernel is NOT vectorized - it expects tid to be the output element index
                 // Use non-vectorized 1D dispatch to match the kernel
+                return DispatchConfig.dispatch1D(elements: totalElements, threadgroupSize: 256)
+            case .gather, .dynamicGather:
+                // Gather kernel is NOT vectorized - it expects tid to be the output element index
+                // Use non-vectorized 1D dispatch to match the kernel
+                return DispatchConfig.dispatch1D(elements: totalElements, threadgroupSize: 256)
+            case .convert, .bitcastConvert:
+                // Convert kernel is NOT vectorized - it expects tid to be the element index
+                // Use non-vectorized 1D dispatch to match the kernel
+                return DispatchConfig.dispatch1D(elements: totalElements, threadgroupSize: 256)
+            case .slice:
+                // Slice kernel is NOT vectorized - it expects tid to be the output element index
                 return DispatchConfig.dispatch1D(elements: totalElements, threadgroupSize: 256)
             default:
                 break
