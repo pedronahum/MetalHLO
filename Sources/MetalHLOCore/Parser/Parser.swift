@@ -323,7 +323,8 @@ public final class Parser {
     }
 
     /// Parse generic form operands and attributes
-    /// Format: (%op1, %op2, ...) {attr = value, ...}
+    /// Format: (%op1, %op2, ...) ({region}) {attr = value, ...}
+    /// The region is optional and used by operations like scatter and reduce.
     private func parseGenericFormOperandsAndAttributes(kind: HLOOpKind) throws -> ([String], HLOAttributes) {
         var operands: [String] = []
         var attributes = HLOAttributes()
@@ -339,6 +340,16 @@ public final class Parser {
             try expect(.rightParen)
         }
 
+        // Parse region if present: ({^bb0(%arg0: type, %arg1: type): ops... })
+        // This appears between operands and attributes for ops like scatter and reduce.
+        // The region body determines the computation kind (e.g., identity, add, max).
+        if check(.leftParen) {
+            let computationKind = try parseOperationRegion()
+            if kind == .scatter {
+                attributes.scatterComputationKind = computationKind
+            }
+        }
+
         // Parse attribute block: {attr = value, ...}
         if match(.leftBrace) {
             skipNewlines()
@@ -351,7 +362,13 @@ public final class Parser {
                     advance()
                 }
             } else if kind == .scatter {
-                (attributes.scatterDimensionNumbers, attributes.scatterComputationKind) = try parseScatterAttributes()
+                let (dimNumbers, attrComputationKind) = try parseScatterAttributes()
+                attributes.scatterDimensionNumbers = dimNumbers
+                // Only overwrite computation kind if the attribute block had one;
+                // otherwise preserve what the region parsing already set.
+                if attrComputationKind != nil {
+                    attributes.scatterComputationKind = attrComputationKind
+                }
                 while !check(.rightBrace) && !check(.eof) {
                     advance()
                 }
@@ -1389,6 +1406,73 @@ public final class Parser {
         return IfRegions(thenBranch: thenRegion, elseBranch: elseRegion)
     }
 
+    /// Parses an inline operation region wrapped in parentheses.
+    /// Format: ({ ^bb0(%arg0: type, %arg1: type): ops... stablehlo.return %val })
+    ///
+    /// Used by generic-form operations like scatter and reduce that embed
+    /// a computation region between the operand list and the attribute dict.
+    /// Returns the computation kind determined by the operation in the region body:
+    /// - `stablehlo.return %arg1` (identity) → `.set`
+    /// - `stablehlo.add` → `.add`
+    /// - `stablehlo.maximum` → `.max`
+    /// - `stablehlo.minimum` → `.min`
+    /// - `stablehlo.multiply` → `.mul`
+    private func parseOperationRegion() throws -> ScatterComputationKind? {
+        try expect(.leftParen)
+        try expect(.leftBrace)
+        skipNewlines()
+
+        var computationKind: ScatterComputationKind? = nil
+
+        // Track brace depth to handle nested braces
+        var braceDepth = 1
+
+        // Scan through the region body looking for known operations
+        while braceDepth > 0 && !check(.eof) {
+            if check(.leftBrace) {
+                braceDepth += 1
+                advance()
+            } else if check(.rightBrace) {
+                braceDepth -= 1
+                if braceDepth == 0 {
+                    break
+                }
+                advance()
+            } else if check(.identifier) || check(.percentIdentifier) {
+                let text = currentToken.text
+
+                // Check for stablehlo operations that determine computation kind
+                if text == "stablehlo.add" || text == "add" {
+                    computationKind = .add
+                } else if text == "stablehlo.maximum" || text == "maximum" {
+                    computationKind = .max
+                } else if text == "stablehlo.minimum" || text == "minimum" {
+                    computationKind = .min
+                } else if text == "stablehlo.multiply" || text == "multiply" {
+                    computationKind = .mul
+                }
+                // If we see stablehlo.return without having found an operation,
+                // the region is identity (just returns the update argument)
+                advance()
+            } else {
+                advance()
+            }
+        }
+
+        // Consume closing } and )
+        try expect(.rightBrace)
+        try expect(.rightParen)
+        skipNewlines()
+
+        // If no computation operation was found, it's an identity/set operation
+        // (region just does: stablehlo.return %arg1)
+        if computationKind == nil {
+            computationKind = .set
+        }
+
+        return computationKind
+    }
+
     /// Parses a region block.
     /// Format: { ^bb(%arg0: type, ...): ops... stablehlo.return %vals }
     private func parseRegion() throws -> Region {
@@ -1879,6 +1963,18 @@ public final class Parser {
                 try expectIdentifier("index_vector_dim")
                 try expect(.equal)
                 indexVectorDim = try parseInteger()
+            } else if checkIdentifier("operand_batching_dims") {
+                try expectIdentifier("operand_batching_dims")
+                try expect(.equal)
+                operandBatchingDims = try parseDimensionList()
+            } else if checkIdentifier("start_indices_batching_dims") {
+                try expectIdentifier("start_indices_batching_dims")
+                try expect(.equal)
+                startIndicesBatchingDims = try parseDimensionList()
+            } else if checkIdentifier("slice_sizes") {
+                try expectIdentifier("slice_sizes")
+                try expect(.equal)
+                sliceSizes = try parseDimensionList()
             } else if checkIdentifier("indices_are_sorted") {
                 // Skip this attribute
                 try expectIdentifier("indices_are_sorted")
@@ -1927,7 +2023,36 @@ public final class Parser {
         var computationKind: ScatterComputationKind? = nil
 
         while !check(.colon) && !check(.eof) {
-            if checkIdentifier("update_window_dims") {
+            // Handle #stablehlo.scatter<...> wrapper format:
+            // scatter_dimension_numbers = #stablehlo.scatter<update_window_dims = ..., ...>
+            if checkIdentifier("scatter_dimension_numbers") {
+                try expectIdentifier("scatter_dimension_numbers")
+                try expect(.equal)
+                // Skip #stablehlo.scatter or #stablehlo<scatter<...>>
+                if check(.hashIdentifier) {
+                    advance() // skip #stablehlo.scatter
+                }
+                if check(.leftAngle) {
+                    advance() // skip <
+                    skipNewlines()
+                }
+                continue
+            } else if checkIdentifier("indices_are_sorted") || checkIdentifier("unique_indices") {
+                // Skip boolean attributes not needed for compilation
+                advance() // name
+                if match(.equal) {
+                    advance() // value (true/false)
+                }
+                _ = match(.comma)
+                skipNewlines()
+                continue
+            } else if check(.rightAngle) {
+                // End of #stablehlo.scatter<...> block
+                advance()
+                _ = match(.comma)
+                skipNewlines()
+                continue
+            } else if checkIdentifier("update_window_dims") {
                 try expectIdentifier("update_window_dims")
                 try expect(.equal)
                 updateWindowDims = try parseDimensionList()
