@@ -2694,6 +2694,10 @@ public final class CodeGenerator: @unchecked Sendable {
             case .slice:
                 // Slice kernel is NOT vectorized - it expects tid to be the output element index
                 return DispatchConfig.dispatch1D(elements: totalElements, threadgroupSize: 256)
+            case .reshape:
+                // Reshape uses a non-vectorized copy kernel (1 element per thread).
+                // Must not use the default float32 vectorized dispatch (8 elements/thread).
+                return DispatchConfig.dispatch1D(elements: totalElements, threadgroupSize: 256)
             default:
                 break
             }
