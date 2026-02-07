@@ -696,6 +696,48 @@ public final class CodeGenerator: @unchecked Sendable {
                 metalType: metalType
             )
 
+        // Convolution operations
+        case .convolution:
+            source += generateConvolutionKernel(
+                entryPoint: entryPoint,
+                inputShape: inputShapes.first ?? [],
+                weightsShape: inputShapes.count > 1 ? inputShapes[1] : [],
+                outputShape: outputShape,
+                attributes: attributes,
+                metalType: metalType
+            )
+
+        // Reduce window (pooling) operations
+        case .reduceWindow:
+            source += generateReduceWindowKernel(
+                entryPoint: entryPoint,
+                inputShape: inputShapes.first ?? [],
+                outputShape: outputShape,
+                attributes: attributes,
+                metalType: metalType
+            )
+
+        // Select and scatter (pooling gradient) operations
+        case .selectAndScatter:
+            source += generateSelectAndScatterKernel(
+                entryPoint: entryPoint,
+                inputShape: inputShapes.first ?? [],
+                sourceShape: inputShapes.count > 1 ? inputShapes[1] : [],
+                outputShape: outputShape,
+                attributes: attributes,
+                metalType: metalType
+            )
+
+        // FFT operations
+        case .fft:
+            source += generateFFTKernel(
+                entryPoint: entryPoint,
+                inputShape: inputShapes.first ?? [],
+                outputShape: outputShape,
+                attributes: attributes,
+                metalType: metalType
+            )
+
         default:
             // Fallback to copy kernel for unsupported ops
             source += generateCopyKernel(entryPoint: entryPoint, metalType: metalType)
@@ -1464,6 +1506,606 @@ public final class CodeGenerator: @unchecked Sendable {
             output[tid] = clamp(operand[tid], min_val[tid], max_val[tid]);
         }
         """
+    }
+
+    /// Generates a 2D convolution kernel that handles arbitrary dimension layouts,
+    /// strides, padding, dilation, and grouped convolutions.
+    /// 1 thread per output element. Each thread computes the convolution sum for its output position.
+    private func generateConvolutionKernel(
+        entryPoint: String,
+        inputShape: [Int],
+        weightsShape: [Int],
+        outputShape: [Int],
+        attributes: HLOAttributes,
+        metalType: String
+    ) -> String {
+        guard inputShape.count >= 3, weightsShape.count >= 3, outputShape.count >= 3 else {
+            // Fallback for unexpected ranks
+            return generateCopyKernel(entryPoint: entryPoint, metalType: metalType)
+        }
+
+        let numSpatialDims = inputShape.count - 2
+        guard numSpatialDims >= 1 && numSpatialDims <= 3 else {
+            return generateCopyKernel(entryPoint: entryPoint, metalType: metalType)
+        }
+
+        // Extract dimension numbers (default: NHWC-style: batch=0, spatial=1..N-2, feature=N-1)
+        let dimNumbers = attributes.convolutionDimensionNumbers
+        let inBatchDim = dimNumbers?.inputBatchDimension ?? 0
+        let inFeatureDim = dimNumbers?.inputFeatureDimension ?? (inputShape.count - 1)
+        let inSpatialDims = dimNumbers?.inputSpatialDimensions ?? Array(1..<(inputShape.count - 1))
+
+        let kInFeatureDim = dimNumbers?.kernelInputFeatureDimension ?? (weightsShape.count - 2)
+        let kOutFeatureDim = dimNumbers?.kernelOutputFeatureDimension ?? (weightsShape.count - 1)
+        let kSpatialDims = dimNumbers?.kernelSpatialDimensions ?? Array(0..<(weightsShape.count - 2))
+
+        let outBatchDim = dimNumbers?.outputBatchDimension ?? 0
+        let outFeatureDim = dimNumbers?.outputFeatureDimension ?? (outputShape.count - 1)
+        let outSpatialDims = dimNumbers?.outputSpatialDimensions ?? Array(1..<(outputShape.count - 1))
+
+        // Extract conv parameters
+        let strides = attributes.windowStrides ?? Array(repeating: 1, count: numSpatialDims)
+        let padding = attributes.convPadding ?? Array(repeating: [0, 0], count: numSpatialDims)
+        let rhsDilation = attributes.rhsDilation ?? Array(repeating: 1, count: numSpatialDims)
+        let lhsDilation = attributes.lhsDilation ?? Array(repeating: 1, count: numSpatialDims)
+        let featureGroupCount = attributes.featureGroupCount ?? 1
+        let batchGroupCount = attributes.batchGroupCount ?? 1
+
+        // Compute strides for input, weights, output (row-major)
+        func computeStrides(_ shape: [Int]) -> [Int] {
+            var s = Array(repeating: 1, count: shape.count)
+            for i in stride(from: shape.count - 2, through: 0, by: -1) {
+                s[i] = s[i + 1] * shape[i + 1]
+            }
+            return s
+        }
+
+        let inputStrides = computeStrides(inputShape)
+        let weightsStrides = computeStrides(weightsShape)
+        let outputStrides = computeStrides(outputShape)
+
+        let totalOutputElements = outputShape.reduce(1, *)
+
+        // Dimension sizes
+        let inputChannels = inputShape[inFeatureDim]
+        let outputChannels = outputShape[outFeatureDim]
+        let icPerGroup = inputChannels / featureGroupCount
+
+        // Build kernel code
+        var code = """
+        kernel void \(entryPoint)(
+            device const \(metalType)* input [[buffer(0)]],
+            device const \(metalType)* weights [[buffer(1)]],
+            device \(metalType)* output [[buffer(2)]],
+            constant uint& count [[buffer(3)]],
+            uint tid [[thread_position_in_grid]])
+        {
+            if (tid >= \(totalOutputElements)u) return;
+
+            // Decompose tid into output N-D coordinates
+            uint remaining = tid;
+
+        """
+
+        // Generate output coordinate decomposition
+        var outCoordNames: [String] = Array(repeating: "", count: outputShape.count)
+        for i in 0..<outputShape.count {
+            let name = "o\(i)"
+            outCoordNames[i] = name
+            if i == outputShape.count - 1 {
+                code += "    int \(name) = int(remaining);\n"
+            } else {
+                code += "    int \(name) = int(remaining / \(outputStrides[i])u);\n"
+                code += "    remaining = remaining % \(outputStrides[i])u;\n"
+            }
+        }
+
+        let oBatch = outCoordNames[outBatchDim]
+        let oFeature = outCoordNames[outFeatureDim]
+
+        // Grouped convolution: determine input channel range
+        if featureGroupCount > 1 {
+            code += "\n    int group = \(oFeature) / \(outputChannels / featureGroupCount);\n"
+            code += "    int ic_start = group * \(icPerGroup);\n"
+        } else if batchGroupCount > 1 {
+            code += "\n    int batch_group = \(oBatch) / \(outputShape[outBatchDim] / batchGroupCount);\n"
+        }
+
+        code += "\n    \(metalType) sum = 0;\n"
+
+        // Generate nested loops over kernel spatial dims
+        for s in 0..<numSpatialDims {
+            let kSize = weightsShape[kSpatialDims[s]]
+            code += "    for (int k\(s) = 0; k\(s) < \(kSize); k\(s)++) {\n"
+        }
+
+        // Compute input spatial positions
+        for s in 0..<numSpatialDims {
+            let outSpatialCoord = outCoordNames[outSpatialDims[s]]
+            let padLow = padding.count > s ? padding[s][0] : 0
+            let stride = strides.count > s ? strides[s] : 1
+            let rhsDil = rhsDilation.count > s ? rhsDilation[s] : 1
+            let lhsDil = lhsDilation.count > s ? lhsDilation[s] : 1
+            let inputSpatialSize = inputShape[inSpatialDims[s]]
+
+            if lhsDil > 1 {
+                // With LHS dilation: virtual input position
+                code += "        int ih\(s)_virtual = \(outSpatialCoord) * \(stride) + k\(s) * \(rhsDil) - \(padLow);\n"
+                code += "        int ih\(s) = ih\(s)_virtual / \(lhsDil);\n"
+                code += "        bool ih\(s)_valid = (ih\(s)_virtual >= 0 && ih\(s)_virtual % \(lhsDil) == 0 && ih\(s) >= 0 && ih\(s) < \(inputSpatialSize));\n"
+            } else {
+                code += "        int ih\(s) = \(outSpatialCoord) * \(stride) + k\(s) * \(rhsDil) - \(padLow);\n"
+                code += "        bool ih\(s)_valid = (ih\(s) >= 0 && ih\(s) < \(inputSpatialSize));\n"
+            }
+        }
+
+        // Bounds check
+        let validChecks = (0..<numSpatialDims).map { "ih\($0)_valid" }.joined(separator: " && ")
+        code += "        if (\(validChecks)) {\n"
+
+        // Inner loop over input channels
+        code += "            for (int ic = 0; ic < \(icPerGroup); ic++) {\n"
+
+        // Compute input flat index
+        var inputIdxParts: [String] = Array(repeating: "0", count: inputShape.count)
+        inputIdxParts[inBatchDim] = "\(oBatch) * \(inputStrides[inBatchDim])"
+        if featureGroupCount > 1 {
+            inputIdxParts[inFeatureDim] = "(ic_start + ic) * \(inputStrides[inFeatureDim])"
+        } else {
+            inputIdxParts[inFeatureDim] = "ic * \(inputStrides[inFeatureDim])"
+        }
+        for s in 0..<numSpatialDims {
+            inputIdxParts[inSpatialDims[s]] = "ih\(s) * \(inputStrides[inSpatialDims[s]])"
+        }
+        let inputIdx = inputIdxParts.filter { $0 != "0" }.joined(separator: " + ")
+
+        // Compute weights flat index
+        var weightsIdxParts: [String] = Array(repeating: "0", count: weightsShape.count)
+        weightsIdxParts[kOutFeatureDim] = "\(oFeature) * \(weightsStrides[kOutFeatureDim])"
+        weightsIdxParts[kInFeatureDim] = "ic * \(weightsStrides[kInFeatureDim])"
+        for s in 0..<numSpatialDims {
+            weightsIdxParts[kSpatialDims[s]] = "k\(s) * \(weightsStrides[kSpatialDims[s]])"
+        }
+        let weightsIdx = weightsIdxParts.filter { $0 != "0" }.joined(separator: " + ")
+
+        code += "                int in_idx = \(inputIdx);\n"
+        code += "                int w_idx = \(weightsIdx);\n"
+        code += "                sum += input[in_idx] * weights[w_idx];\n"
+        code += "            }\n"  // end ic loop
+        code += "        }\n"  // end bounds check
+
+        // Close kernel spatial loops
+        for _ in 0..<numSpatialDims {
+            code += "    }\n"
+        }
+
+        code += """
+
+            output[tid] = sum;
+        }
+        """
+
+        return code
+    }
+
+    /// Generates a reduce_window (pooling) kernel.
+    /// Supports max, sum, min reductions with arbitrary window dimensions, strides, padding, and dilations.
+    /// 1 thread per output element.
+    private func generateReduceWindowKernel(
+        entryPoint: String,
+        inputShape: [Int],
+        outputShape: [Int],
+        attributes: HLOAttributes,
+        metalType: String
+    ) -> String {
+        guard inputShape.count >= 3, outputShape.count >= 3 else {
+            return generateCopyKernel(entryPoint: entryPoint, metalType: metalType)
+        }
+
+        let rank = inputShape.count
+        let windowDims = attributes.windowDimensions ?? Array(repeating: 1, count: rank)
+        let strides = attributes.windowStrides ?? Array(repeating: 1, count: rank)
+        let padding = attributes.convPadding ?? Array(repeating: [0, 0], count: rank)
+        let windowDilations = attributes.windowDilations ?? Array(repeating: 1, count: rank)
+        let baseDilations = attributes.baseDilations ?? Array(repeating: 1, count: rank)
+        let reductionKind = attributes.reductionKind ?? .max
+
+        let totalOutputElements = outputShape.reduce(1, *)
+
+        // Compute input/output strides
+        func computeStrides(_ shape: [Int]) -> [Int] {
+            var s = Array(repeating: 1, count: shape.count)
+            for i in stride(from: shape.count - 2, through: 0, by: -1) {
+                s[i] = s[i + 1] * shape[i + 1]
+            }
+            return s
+        }
+        let outputStrides = computeStrides(outputShape)
+        let inputStrides = computeStrides(inputShape)
+
+        // Initial value for reduction
+        let initValue: String
+        switch reductionKind {
+        case .max: initValue = "-INFINITY"
+        case .min: initValue = "INFINITY"
+        case .sum, .mean: initValue = "0"
+        case .product: initValue = "1"
+        case .and: initValue = "1"
+        case .or: initValue = "0"
+        }
+
+        var code = """
+        kernel void \(entryPoint)(
+            device const \(metalType)* input [[buffer(0)]],
+            device const \(metalType)* init_val [[buffer(1)]],
+            device \(metalType)* output [[buffer(2)]],
+            constant uint& count [[buffer(3)]],
+            uint tid [[thread_position_in_grid]])
+        {
+            if (tid >= \(totalOutputElements)u) return;
+
+            // Decompose tid into output coordinates
+            uint remaining = tid;
+
+        """
+
+        // Generate output coordinate decomposition
+        for i in 0..<rank {
+            if i == rank - 1 {
+                code += "    int o\(i) = int(remaining);\n"
+            } else {
+                code += "    int o\(i) = int(remaining / \(outputStrides[i])u);\n"
+                code += "    remaining = remaining % \(outputStrides[i])u;\n"
+            }
+        }
+
+        code += "\n    \(metalType) acc = \(metalType)(\(initValue));\n"
+
+        // Count for mean computation
+        if reductionKind == .mean {
+            code += "    int window_count = 0;\n"
+        }
+
+        // Generate nested loops for window dimensions
+        // Only loop over dimensions where window > 1
+        var loopDims: [Int] = []
+        for d in 0..<rank {
+            if windowDims[d] > 1 {
+                loopDims.append(d)
+                code += "    for (int w\(d) = 0; w\(d) < \(windowDims[d]); w\(d)++) {\n"
+            }
+        }
+
+        // Compute input positions and bounds check
+        var boundsChecks: [String] = []
+        for d in 0..<rank {
+            let padLow = padding.count > d ? padding[d][0] : 0
+            let stride = strides.count > d ? strides[d] : 1
+            let wDil = windowDilations.count > d ? windowDilations[d] : 1
+            let bDil = baseDilations.count > d ? baseDilations[d] : 1
+
+            if windowDims[d] > 1 {
+                if bDil > 1 {
+                    code += "        int ip\(d)_virtual = o\(d) * \(stride) + w\(d) * \(wDil) - \(padLow);\n"
+                    code += "        int ip\(d) = ip\(d)_virtual / \(bDil);\n"
+                    boundsChecks.append("ip\(d)_virtual >= 0 && ip\(d)_virtual % \(bDil) == 0 && ip\(d) >= 0 && ip\(d) < \(inputShape[d])")
+                } else {
+                    code += "        int ip\(d) = o\(d) * \(stride) + w\(d) * \(wDil) - \(padLow);\n"
+                    boundsChecks.append("ip\(d) >= 0 && ip\(d) < \(inputShape[d])")
+                }
+            } else {
+                // No window in this dimension — input pos = output pos
+                code += "        int ip\(d) = o\(d);\n"
+            }
+        }
+
+        if !boundsChecks.isEmpty {
+            code += "        if (\(boundsChecks.joined(separator: " && "))) {\n"
+        }
+
+        // Compute input flat index
+        let inputIdxParts = (0..<rank).map { "ip\($0) * \(inputStrides[$0])" }
+        let inputIdx = inputIdxParts.joined(separator: " + ")
+        code += "            \(metalType) val = input[\(inputIdx)];\n"
+
+        // Apply reduction
+        switch reductionKind {
+        case .max:
+            code += "            acc = max(acc, val);\n"
+        case .min:
+            code += "            acc = min(acc, val);\n"
+        case .sum:
+            code += "            acc += val;\n"
+        case .mean:
+            code += "            acc += val;\n"
+            code += "            window_count++;\n"
+        case .product:
+            code += "            acc *= val;\n"
+        case .and:
+            code += "            acc = \(metalType)(int(acc) & int(val));\n"
+        case .or:
+            code += "            acc = \(metalType)(int(acc) | int(val));\n"
+        }
+
+        if !boundsChecks.isEmpty {
+            code += "        }\n"
+        }
+
+        // Close window loops
+        for _ in loopDims {
+            code += "    }\n"
+        }
+
+        if reductionKind == .mean {
+            code += "    if (window_count > 0) acc = acc / \(metalType)(window_count);\n"
+        }
+
+        code += """
+
+            output[tid] = acc;
+        }
+        """
+
+        return code
+    }
+
+    /// Generates a select_and_scatter kernel (pooling gradient).
+    /// For max pooling gradient: finds the max position in each window and scatters the gradient there.
+    /// Dispatches 1 thread per output (input-shaped) element; each initializes to init value,
+    /// then a second pass scatters gradients.
+    private func generateSelectAndScatterKernel(
+        entryPoint: String,
+        inputShape: [Int],   // operand (forward pass input)
+        sourceShape: [Int],  // gradient to scatter
+        outputShape: [Int],  // same shape as inputShape
+        attributes: HLOAttributes,
+        metalType: String
+    ) -> String {
+        guard inputShape.count >= 3 else {
+            return generateCopyKernel(entryPoint: entryPoint, metalType: metalType)
+        }
+
+        let rank = inputShape.count
+        let dimNumbers = attributes.selectAndScatterDimensionNumbers
+        let windowDims = dimNumbers?.windowDimensions ?? Array(repeating: 1, count: rank)
+        let strides = dimNumbers?.windowStrides ?? Array(repeating: 1, count: rank)
+        let padding = dimNumbers?.padding ?? Array(repeating: [0, 0], count: rank)
+
+        let totalInputElements = inputShape.reduce(1, *)
+        let totalSourceElements = sourceShape.reduce(1, *)
+
+        func computeStrides(_ shape: [Int]) -> [Int] {
+            var s = Array(repeating: 1, count: shape.count)
+            for i in stride(from: shape.count - 2, through: 0, by: -1) {
+                s[i] = s[i + 1] * shape[i + 1]
+            }
+            return s
+        }
+        let inputStrides = computeStrides(inputShape)
+        let sourceStrides = computeStrides(sourceShape)
+
+        // Two-phase kernel: first init output, then scatter
+        var code = """
+        kernel void \(entryPoint)(
+            device const \(metalType)* operand [[buffer(0)]],
+            device const \(metalType)* source [[buffer(1)]],
+            device const \(metalType)* init_val [[buffer(2)]],
+            device \(metalType)* output [[buffer(3)]],
+            constant uint& count [[buffer(4)]],
+            uint tid [[thread_position_in_grid]])
+        {
+            // Phase 1: Initialize output with init value
+            if (tid < \(totalInputElements)u) {
+                output[tid] = init_val[0];
+            }
+
+            threadgroup_barrier(mem_flags::mem_device);
+
+            // Phase 2: For each source element, find selected position and scatter
+            if (tid < \(totalSourceElements)u) {
+                uint remaining = tid;
+
+        """
+
+        // Decompose source tid into coordinates
+        for i in 0..<rank {
+            if i == rank - 1 {
+                code += "        int s\(i) = int(remaining);\n"
+            } else {
+                code += "        int s\(i) = int(remaining / \(sourceStrides[i])u);\n"
+                code += "        remaining = remaining % \(sourceStrides[i])u;\n"
+            }
+        }
+
+        code += "\n        // Find max position in window\n"
+        code += "        \(metalType) max_val = -INFINITY;\n"
+        code += "        int max_idx = 0;\n"
+
+        // Nested loops over window
+        var loopDims: [Int] = []
+        for d in 0..<rank {
+            if windowDims[d] > 1 {
+                loopDims.append(d)
+                code += "        for (int w\(d) = 0; w\(d) < \(windowDims[d]); w\(d)++) {\n"
+            }
+        }
+
+        // Compute input positions
+        var boundsChecks: [String] = []
+        for d in 0..<rank {
+            let padLow = padding.count > d ? padding[d][0] : 0
+            let stride = strides.count > d ? strides[d] : 1
+            if windowDims[d] > 1 {
+                code += "            int ip\(d) = s\(d) * \(stride) + w\(d) - \(padLow);\n"
+                boundsChecks.append("ip\(d) >= 0 && ip\(d) < \(inputShape[d])")
+            } else {
+                code += "            int ip\(d) = s\(d);\n"
+            }
+        }
+
+        if !boundsChecks.isEmpty {
+            code += "            if (\(boundsChecks.joined(separator: " && "))) {\n"
+        }
+
+        let inputIdxParts = (0..<rank).map { "ip\($0) * \(inputStrides[$0])" }
+        let inputIdx = inputIdxParts.joined(separator: " + ")
+        code += "                int idx = \(inputIdx);\n"
+        code += "                \(metalType) val = operand[idx];\n"
+        code += "                if (val > max_val) { max_val = val; max_idx = idx; }\n"
+
+        if !boundsChecks.isEmpty {
+            code += "            }\n"
+        }
+
+        for _ in loopDims {
+            code += "        }\n"
+        }
+
+        // Scatter source value at max position (atomic add for correctness)
+        code += "\n        output[max_idx] += source[tid];\n"
+
+        code += """
+            }
+        }
+        """
+
+        return code
+    }
+
+    /// Generates an FFT kernel using the naive DFT formula.
+    /// X[k] = Σ x[n] * exp(-2πi*n*k/N) for forward FFT
+    /// Handles real and complex input/output.
+    /// 1 thread per output element.
+    private func generateFFTKernel(
+        entryPoint: String,
+        inputShape: [Int],
+        outputShape: [Int],
+        attributes: HLOAttributes,
+        metalType: String
+    ) -> String {
+        let fftType = attributes.fftType ?? .fft
+        let fftLength = attributes.fftLength ?? [inputShape.last ?? 1]
+
+        guard let N = fftLength.last, N > 0 else {
+            return generateCopyKernel(entryPoint: entryPoint, metalType: metalType)
+        }
+
+        let totalOutputElements = outputShape.reduce(1, *)
+        let batchSize = totalOutputElements / (fftType == .rfft ? (N / 2 + 1) : N)
+        let isInverse = (fftType == .ifft || fftType == .irfft)
+        let sign = isInverse ? "1.0" : "-1.0"
+
+        switch fftType {
+        case .rfft:
+            // Real input → complex output (interleaved real/imag)
+            let outputN = N / 2 + 1
+            return """
+            kernel void \(entryPoint)(
+                device const \(metalType)* input [[buffer(0)]],
+                device \(metalType)* output [[buffer(1)]],
+                constant uint& count [[buffer(2)]],
+                uint tid [[thread_position_in_grid]])
+            {
+                if (tid >= \(totalOutputElements)u) return;
+
+                // Each output element is a complex pair (real, imag)
+                uint complex_idx = tid / 2;
+                bool is_imag = (tid % 2) == 1;
+
+                uint batch = complex_idx / \(outputN)u;
+                uint k = complex_idx % \(outputN)u;
+
+                float sum_real = 0.0;
+                float sum_imag = 0.0;
+                float angle_base = \(sign) * 2.0 * M_PI_F * float(k) / float(\(N));
+
+                for (uint n = 0; n < \(N)u; n++) {
+                    float angle = angle_base * float(n);
+                    float val = float(input[batch * \(N)u + n]);
+                    sum_real += val * cos(angle);
+                    sum_imag += val * sin(angle);
+                }
+
+                output[tid] = \(metalType)(is_imag ? sum_imag : sum_real);
+            }
+            """
+
+        case .irfft:
+            // Complex input → real output
+            let inputN = N / 2 + 1
+            return """
+            kernel void \(entryPoint)(
+                device const \(metalType)* input [[buffer(0)]],
+                device \(metalType)* output [[buffer(1)]],
+                constant uint& count [[buffer(2)]],
+                uint tid [[thread_position_in_grid]])
+            {
+                if (tid >= \(totalOutputElements)u) return;
+
+                uint batch = tid / \(N)u;
+                uint n = tid % \(N)u;
+
+                float sum = 0.0;
+                for (uint k = 0; k < \(inputN)u; k++) {
+                    uint base = batch * \(inputN)u * 2 + k * 2;
+                    float re = float(input[base]);
+                    float im = float(input[base + 1]);
+
+                    float angle = 2.0 * M_PI_F * float(k) * float(n) / float(\(N));
+                    sum += re * cos(angle) - im * sin(angle);
+
+                    // Mirror: add conjugate contribution for k > 0 and k < N/2
+                    if (k > 0 && k < \(N / 2)u) {
+                        uint mirror_k = \(N)u - k;
+                        float m_angle = 2.0 * M_PI_F * float(mirror_k) * float(n) / float(\(N));
+                        sum += re * cos(m_angle) + im * sin(m_angle);
+                    }
+                }
+
+                output[tid] = \(metalType)(sum / float(\(N)));
+            }
+            """
+
+        case .fft, .ifft:
+            // Complex-to-complex (interleaved real/imag pairs)
+            let scale = isInverse ? "/ float(\(N))" : ""
+            return """
+            kernel void \(entryPoint)(
+                device const \(metalType)* input [[buffer(0)]],
+                device \(metalType)* output [[buffer(1)]],
+                constant uint& count [[buffer(2)]],
+                uint tid [[thread_position_in_grid]])
+            {
+                if (tid >= \(totalOutputElements)u) return;
+
+                // Input/output are interleaved (real, imag) pairs
+                uint complex_idx = tid / 2;
+                bool is_imag = (tid % 2) == 1;
+
+                uint batch = complex_idx / \(N)u;
+                uint k = complex_idx % \(N)u;
+
+                float sum_real = 0.0;
+                float sum_imag = 0.0;
+                float angle_base = \(sign) * 2.0 * M_PI_F * float(k) / float(\(N));
+
+                for (uint n = 0; n < \(N)u; n++) {
+                    uint base = batch * \(N)u * 2 + n * 2;
+                    float re = float(input[base]);
+                    float im = float(input[base + 1]);
+
+                    float angle = angle_base * float(n);
+                    float cos_a = cos(angle);
+                    float sin_a = sin(angle);
+
+                    sum_real += re * cos_a - im * sin_a;
+                    sum_imag += re * sin_a + im * cos_a;
+                }
+
+                output[tid] = \(metalType)(is_imag ? sum_imag \(scale) : sum_real \(scale));
+            }
+            """
+        }
     }
 
     /// Generates a transpose kernel that permutes dimensions.
@@ -2241,6 +2883,9 @@ public final class CodeGenerator: @unchecked Sendable {
         case .max: reductionOp = .max
         case .min: reductionOp = .min
         case .mean: reductionOp = .mean
+        case .product: reductionOp = .prod
+        case .and: reductionOp = .sum  // Bitwise AND treated as sum of bools for now
+        case .or: reductionOp = .max   // Bitwise OR treated as max of bools for now
         }
 
         // Analyze the reduction pattern and try to use specialized kernels
@@ -2292,6 +2937,18 @@ public final class CodeGenerator: @unchecked Sendable {
             // Mean reduction: sum then divide by count (handled as sum here, divide done separately)
             accumOp = "accum += val;"
             reduceOp = "a + b"
+            initValue = "0.0f"
+        case .product:
+            accumOp = "accum *= val;"
+            reduceOp = "a * b"
+            initValue = "1.0f"
+        case .and:
+            accumOp = "accum = float(int(accum) & int(val));"
+            reduceOp = "float(int(a) & int(b))"
+            initValue = "1.0f"
+        case .or:
+            accumOp = "accum = float(int(accum) | int(val));"
+            reduceOp = "float(int(a) | int(b))"
             initValue = "0.0f"
         }
 
@@ -3213,6 +3870,19 @@ public final class CodeGenerator: @unchecked Sendable {
                 // Gather kernel is NOT vectorized - it expects tid to be the output element index
                 // Use non-vectorized 1D dispatch to match the kernel
                 return DispatchConfig.dispatch1D(elements: totalElements, threadgroupSize: 256)
+            case .convolution:
+                // Convolution kernel: 1 thread per output element
+                return DispatchConfig.dispatch1D(elements: totalElements, threadgroupSize: 256)
+            case .reduceWindow:
+                // Reduce window kernel: 1 thread per output element
+                return DispatchConfig.dispatch1D(elements: totalElements, threadgroupSize: 256)
+            case .selectAndScatter:
+                // Select and scatter: 1 thread per output element (input shape)
+                let inputElements = inputShapes.first.map { $0.reduce(1, *) } ?? totalElements
+                return DispatchConfig.dispatch1D(elements: inputElements, threadgroupSize: 256)
+            case .fft:
+                // FFT kernel: 1 thread per output element
+                return DispatchConfig.dispatch1D(elements: totalElements, threadgroupSize: 256)
             case .scatter:
                 // Scatter kernel: copy operand to output then write updates at indexed positions.
                 // Needs max(operandElements, updateElements) threads.
@@ -3523,7 +4193,8 @@ public final class CodeGenerator: @unchecked Sendable {
                  .clz,
                  // Shape/indexing operations
                  .reshape, .transpose, .broadcastInDim,
-                 .reverse, .pad, .concatenate, .iota:
+                 .reverse, .pad, .concatenate, .iota,
+                 .convolution, .reduceWindow, .selectAndScatter, .fft:
                 // Calculate total elements from output shape
                 if let output = op.outputs.first {
                     let count = output.shape.isEmpty ? 1 : output.shape.reduce(1, *)

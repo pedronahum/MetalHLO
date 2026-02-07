@@ -70,13 +70,45 @@ public final class Parser {
         var operations: [HLOOperation] = []
         var returnValues: [String] = []
 
+        // Tuple elimination: track tuple compositions and value aliases
+        var tupleOperands: [String: [String]] = [:]
+        var valueAliases: [String: String] = [:]
+
         while !check(.rightBrace) && !check(.eof) {
             if checkKeyword(.return) {
                 returnValues = try parseReturn()
+                // Resolve aliases in return values
+                returnValues = returnValues.map { resolveAlias($0, aliases: valueAliases) }
                 break
             }
             let op = try parseOperation()
-            operations.append(op)
+
+            if op.kind == .tuple {
+                // Record tuple composition — resolve any aliases in operands
+                let resolvedOperands = op.operands.map { resolveAlias($0, aliases: valueAliases) }
+                tupleOperands[op.result] = resolvedOperands
+            } else if op.kind == .getTupleElement {
+                // Resolve get_tuple_element to the actual tensor
+                let tupleRef = resolveAlias(op.operands.first ?? "", aliases: valueAliases)
+                let index = op.attributes.tupleIndex ?? 0
+                if let members = tupleOperands[tupleRef], index < members.count {
+                    valueAliases[op.result] = members[index]
+                }
+            } else {
+                // Substitute aliases in operands for regular operations
+                let resolvedOperands = op.operands.map { resolveAlias($0, aliases: valueAliases) }
+                if resolvedOperands != op.operands {
+                    operations.append(HLOOperation(
+                        result: op.result,
+                        kind: op.kind,
+                        operands: resolvedOperands,
+                        resultType: op.resultType,
+                        attributes: op.attributes
+                    ))
+                } else {
+                    operations.append(op)
+                }
+            }
             skipNewlines()
         }
 
@@ -257,6 +289,9 @@ public final class Parser {
         } else if kind == .iota {
             // Special handling for iota: dim = N : tensor<...>
             (operands, attributes) = try parseIotaOperandsAndAttributes()
+        } else if kind == .getTupleElement {
+            // Special handling for get_tuple_element: %tuple[index]
+            (operands, attributes) = try parseGetTupleElementOperandsAndAttributes()
         } else {
             // Parse operands (% identifiers before attributes/type)
             while check(.percentIdentifier) {
@@ -376,7 +411,21 @@ public final class Parser {
                 // Generic attribute parsing
                 while !check(.rightBrace) && !check(.eof) {
                     // Parse attribute name
-                    if checkIdentifier("rng_distribution") {
+                    if checkIdentifier("index") && kind == .getTupleElement {
+                        // Parse index attribute: index = 0 : i32
+                        try expectIdentifier("index")
+                        try expect(.equal)
+                        if case .integer(let indexValue) = currentToken.kind {
+                            attributes.tupleIndex = Int(indexValue)
+                            advance()
+                        }
+                        // Skip optional type annotation ": i32"
+                        if match(.colon) {
+                            while !check(.comma) && !check(.rightBrace) && !check(.eof) {
+                                advance()
+                            }
+                        }
+                    } else if checkIdentifier("rng_distribution") {
                         try expectIdentifier("rng_distribution")
                         try expect(.equal)
                         // Parse #stablehlo<rng_distribution UNIFORM> or #stablehlo<rng_distribution NORMAL>
@@ -463,7 +512,13 @@ public final class Parser {
             } else if reductionOp.contains("min") {
                 attributes.reductionKind = .min
             }
-            // Note: multiply/prod reduction not currently supported
+            if reductionOp.contains("multiply") {
+                attributes.reductionKind = .product
+            } else if reductionOp.contains("and") {
+                attributes.reductionKind = .and
+            } else if reductionOp.contains("or") {
+                attributes.reductionKind = .or
+            }
 
             if checkIdentifier("across") {
                 try expectIdentifier("across")
@@ -566,6 +621,28 @@ public final class Parser {
             } else {
                 throw ParseError.unexpectedToken(expected: "integer dimension", got: currentToken)
             }
+        }
+
+        return (operands, attributes)
+    }
+
+    /// Parse get_tuple_element operands and attributes.
+    /// Pretty-printed form: %tuple[index]
+    private func parseGetTupleElementOperandsAndAttributes() throws -> ([String], HLOAttributes) {
+        var operands: [String] = []
+        var attributes = HLOAttributes()
+
+        // Parse the tuple operand
+        let operand = try parsePercentIdentifier()
+        operands.append(operand)
+
+        // Parse [index] if present (pretty-printed form)
+        if match(.leftBracket) {
+            if case .integer(let indexValue) = currentToken.kind {
+                attributes.tupleIndex = Int(indexValue)
+                advance()
+            }
+            try expect(.rightBracket)
         }
 
         return (operands, attributes)
@@ -1047,6 +1124,12 @@ public final class Parser {
                     attributes.reductionKind = .max
                 } else if reductionOp.contains("min") {
                     attributes.reductionKind = .min
+                } else if reductionOp.contains("multiply") {
+                    attributes.reductionKind = .product
+                } else if reductionOp.contains("and") {
+                    attributes.reductionKind = .and
+                } else if reductionOp.contains("or") {
+                    attributes.reductionKind = .or
                 }
             } else {
                 break
@@ -1561,6 +1644,10 @@ public final class Parser {
     // MARK: - Type Parsing
 
     private func parseTensorType() throws -> TensorType {
+        // Handle tuple type (skip and return placeholder — tuples are eliminated during parsing)
+        if checkIdentifier("tuple") {
+            return try skipTupleType()
+        }
         try expectKeyword(.tensor)
         try expect(.leftAngle)
 
@@ -1654,6 +1741,37 @@ public final class Parser {
         }
 
         return try parseTensorType()
+    }
+
+    /// Skips a `tuple<...>` type and returns a placeholder TensorType.
+    /// Tuple operations are eliminated during parsing, so the type is not used.
+    private func skipTupleType() throws -> TensorType {
+        // Skip "tuple" identifier
+        if checkIdentifier("tuple") {
+            advance()
+        }
+        // Skip <...> with nested angle brackets
+        if check(.leftAngle) {
+            advance()
+            var depth = 1
+            while depth > 0 && !check(.eof) {
+                if check(.leftAngle) { depth += 1 }
+                if check(.rightAngle) { depth -= 1 }
+                advance()
+            }
+        }
+        return TensorType(shape: [], elementType: .int32)
+    }
+
+    /// Resolves a value through the alias chain (for tuple elimination).
+    private func resolveAlias(_ value: String, aliases: [String: String]) -> String {
+        var current = value
+        var seen = Set<String>()
+        while let alias = aliases[current], !seen.contains(current) {
+            seen.insert(current)
+            current = alias
+        }
+        return current
     }
 
     // MARK: - Attribute Parsing Helpers
@@ -1758,6 +1876,12 @@ public final class Parser {
                 attributes.reductionKind = .max
             } else if reductionOp.contains("min") {
                 attributes.reductionKind = .min
+            } else if reductionOp.contains("multiply") {
+                attributes.reductionKind = .product
+            } else if reductionOp.contains("and") {
+                attributes.reductionKind = .and
+            } else if reductionOp.contains("or") {
+                attributes.reductionKind = .or
             }
 
             if checkIdentifier("across") {

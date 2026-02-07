@@ -298,6 +298,14 @@ public enum HLOOpKind: String, CaseIterable, Sendable {
     /// Dequantize integer to float.
     case uniformDequantize = "uniform_dequantize"
 
+    // MARK: - Tuple Operations (2 ops - eliminated during parsing)
+
+    /// Tuple construction (eliminated during parsing via alias resolution).
+    case tuple
+
+    /// Tuple element extraction (eliminated during parsing via alias resolution).
+    case getTupleElement = "get_tuple_element"
+
     // MARK: - Custom Calls (1 op)
 
     /// Custom call for fused operations.
@@ -471,6 +479,12 @@ extension HLOOpKind {
 
         case .rngBitGenerator:
             return .exactly(1)  // initial_state
+
+        case .tuple:
+            return .atLeast(1)
+
+        case .getTupleElement:
+            return .exactly(1)
 
         case .customCall:
             return .atLeast(1)  // variable inputs depending on target

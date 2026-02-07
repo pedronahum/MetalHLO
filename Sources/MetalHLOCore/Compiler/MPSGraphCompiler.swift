@@ -308,13 +308,17 @@ public final class MPSGraphCompiler {
             return try compileIf(op)
 
         case .clz:
-            throw CompilationError.unsupportedOperation("count_leading_zeros")
+            return try compileCLZ(op)
 
         // Quantization
         case .uniformQuantize:
             return try compileQuantize(op)
         case .uniformDequantize:
             return try compileDequantize(op)
+
+        // Tuple operations (eliminated during parsing — should never reach here)
+        case .tuple, .getTupleElement:
+            throw CompilationError.unsupportedOperation("tuple operations should be eliminated during parsing")
 
         // Custom calls (fused operations from Magma)
         case .customCall:
@@ -687,6 +691,16 @@ public final class MPSGraphCompiler {
             reduced = graph.reductionMinimum(with: input, axes: axesNS, name: nil)
         case .mean:
             reduced = graph.mean(of: input, axes: axesNS, name: nil)
+        case .product:
+            reduced = graph.reductionProduct(with: input, axes: axesNS, name: nil)
+        case .and:
+            // Bitwise AND reduction: all non-zero → 1, any zero → 0
+            // Equivalent to checking if minimum > 0 for boolean inputs
+            reduced = graph.reductionMinimum(with: input, axes: axesNS, name: nil)
+        case .or:
+            // Bitwise OR reduction: any non-zero → 1, all zero → 0
+            // Equivalent to checking if maximum > 0 for boolean inputs
+            reduced = graph.reductionMaximum(with: input, axes: axesNS, name: nil)
         case .none:
             throw CompilationError.missingAttribute("reductionKind", operation: "reduce")
         }
@@ -2145,6 +2159,20 @@ public final class MPSGraphCompiler {
             let negInput = graph.negative(with: processedInput, name: nil)
             let maxPooled = graph.maxPooling2D(withSourceTensor: negInput, descriptor: descriptor, name: nil)
             return graph.negative(with: maxPooled, name: op.result)
+        case .product:
+            // Product pooling: use log-sum-exp trick: prod = exp(sum(log(x)))
+            let logInput = graph.logarithm(with: processedInput, name: nil)
+            let avgPooled = graph.avgPooling2D(withSourceTensor: logInput, descriptor: descriptor, name: nil)
+            let windowSize = Float(kernelHeight * kernelWidth)
+            let scale = graph.constant(Double(windowSize), dataType: avgPooled.dataType)
+            let sumPooled = graph.multiplication(avgPooled, scale, name: nil)
+            return graph.exponent(with: sumPooled, name: op.result)
+        case .and:
+            // AND reduction via min pooling (boolean inputs: min of all = AND)
+            return graph.maxPooling2D(withSourceTensor: processedInput, descriptor: descriptor, name: op.result)
+        case .or:
+            // OR reduction via max pooling (boolean inputs: max of any = OR)
+            return graph.maxPooling2D(withSourceTensor: processedInput, descriptor: descriptor, name: op.result)
         }
     }
 
@@ -2587,6 +2615,70 @@ public final class MPSGraphCompiler {
 
         // Cast back to output type
         return graph.cast(x, to: op.resultType.elementType.mpsDataType, name: op.result)
+    }
+
+    private func compileCLZ(_ op: HLOOperation) throws -> MPSGraphTensor {
+        // Count leading zeros using bit-smearing + popcount:
+        //   1. Smear the highest set bit down to fill all lower bits
+        //   2. CLZ = bitWidth - popcount(smeared)
+        let input = try getOperand(op.operands[0])
+        let bitWidth = op.resultType.elementType.byteSize * 8
+
+        // Work in UInt32 for ≤32-bit types, UInt64 for 64-bit
+        let workType: MPSDataType = bitWidth <= 32 ? .uInt32 : .uInt64
+        var x = graph.cast(input, to: workType, name: nil)
+
+        // Mask to input bit width for sub-32-bit types (prevent sign-extension artifacts)
+        if bitWidth < 32 {
+            let mask = graph.constant(Double((1 << bitWidth) - 1), dataType: workType)
+            x = graph.bitwiseAND(x, mask, name: nil)
+        }
+
+        // Bit-smear: propagate highest set bit to fill all lower positions
+        // x |= x >> 1; x |= x >> 2; x |= x >> 4; ...
+        var shift = 1
+        while shift < bitWidth {
+            let shiftConst = graph.constant(Double(shift), dataType: workType)
+            let shifted = graph.bitwiseRightShift(x, shiftConst, name: nil)
+            x = graph.bitwiseOR(x, shifted, name: nil)
+            shift *= 2
+        }
+
+        // Popcount of smeared value using SWAR algorithm
+        let c1 = graph.constant(bitWidth <= 32 ? Double(0x55555555) : Double(UInt64(0x5555555555555555)), dataType: workType)
+        let c2 = graph.constant(bitWidth <= 32 ? Double(0x33333333) : Double(UInt64(0x3333333333333333)), dataType: workType)
+        let c3 = graph.constant(bitWidth <= 32 ? Double(0x0F0F0F0F) : Double(UInt64(0x0F0F0F0F0F0F0F0F)), dataType: workType)
+        let c4 = graph.constant(bitWidth <= 32 ? Double(0x01010101) : Double(UInt64(0x0101010101010101)), dataType: workType)
+        let finalShift = graph.constant(Double(bitWidth <= 32 ? 24 : 56), dataType: workType)
+        let one = graph.constant(Double(1), dataType: workType)
+        let two = graph.constant(Double(2), dataType: workType)
+        let four = graph.constant(Double(4), dataType: workType)
+
+        // Step 1: x = x - ((x >> 1) & 0x5555...)
+        let xShift1 = graph.bitwiseRightShift(x, one, name: nil)
+        let masked1 = graph.bitwiseAND(xShift1, c1, name: nil)
+        x = graph.subtraction(x, masked1, name: nil)
+
+        // Step 2: x = (x & 0x3333...) + ((x >> 2) & 0x3333...)
+        let xAnd2 = graph.bitwiseAND(x, c2, name: nil)
+        let xShift2 = graph.bitwiseRightShift(x, two, name: nil)
+        let masked2 = graph.bitwiseAND(xShift2, c2, name: nil)
+        x = graph.addition(xAnd2, masked2, name: nil)
+
+        // Step 3: x = (x + (x >> 4)) & 0x0F0F...
+        let xShift4 = graph.bitwiseRightShift(x, four, name: nil)
+        let xSum4 = graph.addition(x, xShift4, name: nil)
+        x = graph.bitwiseAND(xSum4, c3, name: nil)
+
+        // Step 4: x = (x * 0x0101...) >> (bitWidth - 8)
+        let xMul = graph.multiplication(x, c4, name: nil)
+        let popcount = graph.bitwiseRightShift(xMul, finalShift, name: nil)
+
+        // CLZ = bitWidth - popcount
+        let bitWidthConst = graph.constant(Double(bitWidth), dataType: workType)
+        let result = graph.subtraction(bitWidthConst, popcount, name: nil)
+
+        return graph.cast(result, to: op.resultType.elementType.mpsDataType, name: op.result)
     }
 
     private func compileShiftRightLogical(_ op: HLOOperation) throws -> MPSGraphTensor {

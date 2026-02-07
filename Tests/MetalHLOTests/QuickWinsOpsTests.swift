@@ -352,3 +352,93 @@ struct CombinedOpsTests {
         #expect(result[1] > 0)
     }
 }
+
+// MARK: - Tuple Operations (eliminated during parsing)
+
+@Suite("Quick Wins - Tuple Operations", .serialized)
+struct TupleOpsTests {
+
+    @Test("tuple and get_tuple_element — MPSGraph backend")
+    func tuplePassthrough() throws {
+        let client = try Client.create()
+        let mlir = """
+        module @tuple_test {
+          func.func @main(%arg0: tensor<2xf32>, %arg1: tensor<3xf32>) -> (tensor<2xf32>, tensor<3xf32>) {
+            %0 = stablehlo.tuple %arg0, %arg1 : tuple<tensor<2xf32>, tensor<3xf32>>
+            %1 = stablehlo.get_tuple_element %0[0] : (tuple<tensor<2xf32>, tensor<3xf32>>) -> tensor<2xf32>
+            %2 = stablehlo.get_tuple_element %0[1] : (tuple<tensor<2xf32>, tensor<3xf32>>) -> tensor<3xf32>
+            %3 = stablehlo.add %1, %1 : tensor<2xf32>
+            %4 = stablehlo.multiply %2, %2 : tensor<3xf32>
+            return %3, %4 : tensor<2xf32>, tensor<3xf32>
+          }
+        }
+        """
+        let executable = try client.compile(mlir)
+        let a = try client.createBuffer([1.0, 2.0] as [Float], shape: [2], elementType: .float32)
+        let b = try client.createBuffer([3.0, 4.0, 5.0] as [Float], shape: [3], elementType: .float32)
+        let outputs = try executable.execute([a, b])
+        let result0 = try outputs[0].toFloatArray()
+        let result1 = try outputs[1].toFloatArray()
+        // %3 = arg0 + arg0 = [2.0, 4.0]
+        #expect(abs(result0[0] - 2.0) < 0.001)
+        #expect(abs(result0[1] - 4.0) < 0.001)
+        // %4 = arg1 * arg1 = [9.0, 16.0, 25.0]
+        #expect(abs(result1[0] - 9.0) < 0.001)
+        #expect(abs(result1[1] - 16.0) < 0.001)
+        #expect(abs(result1[2] - 25.0) < 0.001)
+    }
+
+    @Test("tuple and get_tuple_element — Metal kernel backend")
+    func tupleMetalKernel() throws {
+        let client = try Client.create()
+        var config = CompilationConfig()
+        config.optimizationLevel = .O0
+        let mlir = """
+        module @tuple_test {
+          func.func @main(%arg0: tensor<2xf32>, %arg1: tensor<3xf32>) -> (tensor<2xf32>, tensor<3xf32>) {
+            %0 = stablehlo.tuple %arg0, %arg1 : tuple<tensor<2xf32>, tensor<3xf32>>
+            %1 = stablehlo.get_tuple_element %0[0] : (tuple<tensor<2xf32>, tensor<3xf32>>) -> tensor<2xf32>
+            %2 = stablehlo.get_tuple_element %0[1] : (tuple<tensor<2xf32>, tensor<3xf32>>) -> tensor<3xf32>
+            %3 = stablehlo.add %1, %1 : tensor<2xf32>
+            %4 = stablehlo.multiply %2, %2 : tensor<3xf32>
+            return %3, %4 : tensor<2xf32>, tensor<3xf32>
+          }
+        }
+        """
+        let executable = try client.compile(mlir, config: config)
+        let a = try client.createBuffer([1.0, 2.0] as [Float], shape: [2], elementType: .float32)
+        let b = try client.createBuffer([3.0, 4.0, 5.0] as [Float], shape: [3], elementType: .float32)
+        let outputs = try executable.execute([a, b])
+        let result0 = try outputs[0].toFloatArray()
+        let result1 = try outputs[1].toFloatArray()
+        #expect(abs(result0[0] - 2.0) < 0.001)
+        #expect(abs(result0[1] - 4.0) < 0.001)
+        #expect(abs(result1[0] - 9.0) < 0.001)
+        #expect(abs(result1[1] - 16.0) < 0.001)
+        #expect(abs(result1[2] - 25.0) < 0.001)
+    }
+
+    @Test("nested tuple with get_tuple_element")
+    func nestedTuple() throws {
+        let client = try Client.create()
+        let mlir = """
+        module @nested_tuple {
+          func.func @main(%arg0: tensor<2xf32>) -> (tensor<2xf32>) {
+            %0 = stablehlo.tuple %arg0 : tuple<tensor<2xf32>>
+            %1 = stablehlo.tuple %arg0, %0 : tuple<tensor<2xf32>, tuple<tensor<2xf32>>>
+            %2 = stablehlo.get_tuple_element %1[1] : (tuple<tensor<2xf32>, tuple<tensor<2xf32>>>) -> tuple<tensor<2xf32>>
+            %3 = stablehlo.get_tuple_element %2[0] : (tuple<tensor<2xf32>>) -> tensor<2xf32>
+            %4 = stablehlo.negate %3 : tensor<2xf32>
+            return %4 : tensor<2xf32>
+          }
+        }
+        """
+        let executable = try client.compile(mlir)
+        let a = try client.createBuffer([3.0, -7.0] as [Float], shape: [2], elementType: .float32)
+        let outputs = try executable.execute([a])
+        let result = try outputs[0].toFloatArray()
+        // negate(arg0) = [-3.0, 7.0]
+        #expect(abs(result[0] - (-3.0)) < 0.001)
+        #expect(abs(result[1] - 7.0) < 0.001)
+    }
+}

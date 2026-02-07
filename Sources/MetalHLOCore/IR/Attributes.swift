@@ -205,6 +205,11 @@ public struct HLOAttributes: Sendable {
     /// If conditional regions (then and else).
     public var ifRegions: IfRegions?
 
+    // MARK: - Tuple Attributes
+
+    /// Index for get_tuple_element operation.
+    public var tupleIndex: Int?
+
     // MARK: - Custom Call Attributes
 
     /// Target name for custom_call operation.
@@ -413,6 +418,9 @@ public enum ReductionKind: Sendable {
     case max
     case min
     case mean
+    case product
+    case and
+    case or
 }
 
 /// Scatter computation kind for combining values.
