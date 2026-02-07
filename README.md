@@ -2,7 +2,7 @@
 
 **StableHLO Execution on Apple Metal**
 
-MetalHLO is a standalone library that compiles and executes [StableHLO](https://github.com/openxla/stablehlo) MLIR programs on Apple Silicon GPUs. It provides both Swift and C APIs, enabling integration with any project that emits StableHLO IR.
+MetalHLO is a standalone library that compiles and executes [StableHLO](https://github.com/openxla/stablehlo) MLIR programs on Apple Silicon GPUs. It provides Swift, C, and [PJRT](https://github.com/openxla/xla/tree/main/xla/pjrt/c) APIs, enabling integration with JAX, XLA, and any project that emits StableHLO IR.
 
 ## Design Philosophy
 
@@ -23,6 +23,7 @@ MetalHLO draws inspiration from both [OpenXLA](https://github.com/openxla/xla) a
 **MetalHLO's unique contribution:**
 - **Dual execution backends** — MPSGraph for broad compatibility, custom Metal kernels for peak performance
 - **Progressive optimization levels** — O0 to O3 matching compiler conventions
+- **PJRT plugin for JAX** — Standard OpenXLA plugin interface enables `import jax; jax.numpy` on Apple GPUs
 - **C API for portability** — Integrate with any language that can call C functions
 
 ## Features
@@ -30,7 +31,7 @@ MetalHLO draws inspiration from both [OpenXLA](https://github.com/openxla/xla) a
 - **StableHLO Conformance** — 191 of 277 conformance tests pass (86 skipped for MPS/Metal limitations)
 - **88% StableHLO Coverage** — 92 of 105 operations implemented
 - **~99% Practical ML Coverage** — All operations needed for production ML workloads
-- **Dual API** — Native Swift API + C API for C/C++ projects
+- **Triple API** — Native Swift API + C API + PJRT plugin for JAX/XLA integration
 - **Configurable Optimization** — O0 to O3 levels with algebraic simplification and operator fusion
 - **Full Training Support** — Forward and backward pass operations
 - **Apple Silicon Optimized** — Leverages MPSGraph and custom Metal kernels
@@ -80,6 +81,9 @@ git clone https://github.com/pedronahum/MetalHLO.git
 cd MetalHLO
 swift build
 swift test
+
+# Build the PJRT plugin for JAX integration
+swift build -c release --product PJRTMetalHLO
 ```
 
 ## Quick Start
@@ -481,41 +485,116 @@ const char* mhlo_get_last_error(void);
 void mhlo_free_string(const char* str);
 ```
 
+## PJRT Plugin (JAX Integration)
+
+MetalHLO implements the [PJRT C API](https://github.com/openxla/xla/tree/main/xla/pjrt/c) (v0.90), the standard device plugin interface for the OpenXLA ecosystem. This enables JAX, TensorFlow, and PyTorch/XLA to execute StableHLO programs on Apple Silicon GPUs via MetalHLO.
+
+### How It Works
+
+The plugin is a dynamic library (`libPJRTMetalHLO.dylib`) that exports a `GetPjrtApi()` symbol returning a fully populated `PJRT_Api` vtable. JAX discovers and loads this plugin automatically via Python's entry-point mechanism.
+
+### Implemented PJRT Functions
+
+| Category | Functions |
+|----------|-----------|
+| **Error** | `Error_Destroy`, `Error_Message`, `Error_GetCode` |
+| **Client** | `Client_Create`, `Client_Destroy`, `Client_PlatformName`, `Client_Devices`, `Client_AddressableDevices`, `Client_Compile`, `Client_BufferFromHostBuffer` |
+| **Executable** | `LoadedExecutable_Execute`, `LoadedExecutable_Destroy`, `LoadedExecutable_GetExecutable`, `Executable_Name`, `Executable_NumOutputs`, `Executable_Serialize`, `Executable_Destroy`, `Executable_Fingerprint`, `Executable_OutputElementTypes`, `Executable_OutputDimensions`, `Executable_OutputMemoryKinds`, `Executable_DeserializeAndLoad` |
+| **Buffer** | `Buffer_ToHostBuffer`, `Buffer_Destroy`, `Buffer_ElementType`, `Buffer_Dimensions`, `Buffer_OnDeviceSizeInBytes`, `Buffer_Device`, `Buffer_Memory`, `Buffer_ReadyEvent`, `Buffer_CopyToDevice` |
+| **Device** | `Device_GetDescription`, `DeviceDescription_Id`, `DeviceDescription_ProcessIndex`, `DeviceDescription_Attributes` |
+| **Memory** | `Device_AddressableMemories`, `Device_DefaultMemory`, `Memory_Id`, `Memory_Kind`, `Memory_Kind_Id` |
+| **Event** | `Event_Await`, `Event_OnReady`, `Event_Destroy`, `Event_IsReady` |
+
+### Building the Plugin
+
+```bash
+# Build the dynamic library
+swift build -c release --product PJRTMetalHLO
+
+# The dylib is at .build/release/libPJRTMetalHLO.dylib
+```
+
+### Using with JAX
+
+Install the Python package that registers MetalHLO as a JAX backend:
+
+```bash
+# From the repository root
+pip install -e python/
+```
+
+Then use JAX as usual — MetalHLO will be available as a backend:
+
+```python
+import jax
+import jax.numpy as jnp
+
+# Check available backends
+print(jax.devices())  # Should include MetalHLO device
+
+# Run computations on MetalHLO
+x = jnp.array([1.0, 2.0, 3.0, 4.0])
+y = jnp.array([5.0, 6.0, 7.0, 8.0])
+result = x + y  # Executes on Apple GPU via MetalHLO
+```
+
+You can also set the `METALHLO_PLUGIN_PATH` environment variable to point to the dylib if it's not in the default build locations:
+
+```bash
+export METALHLO_PLUGIN_PATH=/path/to/libPJRTMetalHLO.dylib
+```
+
+### Plugin Capabilities
+
+- **Platform name:** `metalhlo`
+- **Memory model:** Unified memory (CPU/GPU shared, zero-copy transfers)
+- **Compilation:** Uses O2 optimization by default (pattern fusion, CSE, algebraic simplification)
+- **Serialization:** Full executable serialize/deserialize support for caching compiled programs
+- **Buffer management:** Host-to-device and device-to-host transfers with proper event synchronization
+- **Device attributes:** Reports Metal GPU family, recommended max working set size, and unified memory architecture
+
+### Current Limitations
+
+- Single-device execution only (no multi-GPU or distributed)
+- Static shapes required (no dynamic shape inference at the PJRT level)
+- Token and tuple operations are not supported
+- Some JAX operations may require additional PJRT functions not yet implemented
+
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│   C/C++ Projects                        Swift Projects          │
-│        │                                      │                 │
-│        ▼                                      ▼                 │
-│   ┌─────────────┐                    ┌───────────────────┐      │
-│   │ C API       │                    │ Swift API         │      │
-│   │ mhlo_*      │                    │ MetalHLO.Client   │      │
-│   └──────┬──────┘                    └─────────┬─────────┘      │
-│          │                                     │                │
-│          └─────────────┬───────────────────────┘                │
-│                        ▼                                        │
-│          ┌─────────────────────────────────────────┐            │
-│          │  MetalHLOCore                           │            │
-│          │                                         │            │
-│          │  ┌───────────┐   ┌───────────────────┐  │            │
-│          │  │ Parser    │ → │ Optimizer         │  │            │
-│          │  └───────────┘   │ (PassManager)     │  │            │
-│          │                  └─────────┬─────────┘  │            │
-│          │                            │            │            │
-│          │           ┌────────────────┴────────┐   │            │
-│          │           ▼                         ▼   │            │
-│          │  ┌─────────────────┐  ┌──────────────┐  │            │
-│          │  │ MPSGraph Backend│  │ Metal Kernel │  │            │
-│          │  │ (default)       │  │ Backend (O3) │  │            │
-│          │  └─────────────────┘  └──────────────┘  │            │
-│          └─────────────────────────────────────────┘            │
-│                              │                                  │
-│                              ▼                                  │
-│                ┌─────────────────────────────┐                  │
-│                │  Apple Metal / MPSGraph     │                  │
-│                └─────────────────────────────┘                  │
-└─────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│   JAX / XLA               C/C++ Projects           Swift Projects       │
+│        │                       │                         │              │
+│        ▼                       ▼                         ▼              │
+│   ┌──────────────┐    ┌─────────────┐           ┌───────────────────┐  │
+│   │ PJRT Plugin  │    │ C API       │           │ Swift API         │  │
+│   │ GetPjrtApi() │    │ mhlo_*      │           │ MetalHLO.Client   │  │
+│   └──────┬───────┘    └──────┬──────┘           └─────────┬─────────┘  │
+│          │                   │                            │             │
+│          └───────────────────┴────────────────────────────┘             │
+│                                    ▼                                    │
+│               ┌─────────────────────────────────────────┐              │
+│               │  MetalHLOCore                           │              │
+│               │                                         │              │
+│               │  ┌───────────┐   ┌───────────────────┐  │              │
+│               │  │ Parser    │ → │ Optimizer         │  │              │
+│               │  └───────────┘   │ (PassManager)     │  │              │
+│               │                  └─────────┬─────────┘  │              │
+│               │                            │            │              │
+│               │           ┌────────────────┴────────┐   │              │
+│               │           ▼                         ▼   │              │
+│               │  ┌─────────────────┐  ┌──────────────┐  │              │
+│               │  │ MPSGraph Backend│  │ Metal Kernel │  │              │
+│               │  │ (default)       │  │ Backend (O3) │  │              │
+│               │  └─────────────────┘  └──────────────┘  │              │
+│               └─────────────────────────────────────────┘              │
+│                                    │                                    │
+│                                    ▼                                    │
+│                      ┌─────────────────────────────┐                   │
+│                      │  Apple Metal / MPSGraph     │                   │
+│                      └─────────────────────────────┘                   │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Examples
@@ -617,6 +696,9 @@ swift test --filter "Reduction"
 swift test --filter "CAPITests"
 swift test --filter "AlgebraicSimplifier"
 
+# PJRT plugin tests
+swift test --filter 'PJRTPluginTests'
+
 # Conformance tests
 swift test --filter 'OfficialInterpretTests'
 swift test --filter 'Optimization'
@@ -632,6 +714,7 @@ swift test --filter 'scatter'
 |--------|-------------|------------|
 | `MetalHLOCoreTests` | Core compiler and optimizer tests | ~586 |
 | `MetalHLOTests` | Integration and conformance tests | ~400+ |
+| `PJRTMetalHLOTests` | PJRT plugin API and execution tests | 10 |
 
 ### Test Coverage
 
@@ -648,8 +731,9 @@ swift test --filter 'scatter'
 | Optimizer Passes | 50 |
 | C API | 15 |
 | Integration Tests | 30 |
+| PJRT Plugin | 10 |
 | **StableHLO Conformance** | **191** |
-| **Total** | **439** |
+| **Total** | **449** |
 
 ## Limitations
 
@@ -932,6 +1016,7 @@ Apache License 2.0 - see [LICENSE](LICENSE) for details.
 - [OpenXLA/XLA Compiler](https://github.com/openxla/xla)
 - [MLX by Apple ML Research](https://github.com/ml-explore/mlx)
 - [MPSGraph Documentation](https://developer.apple.com/documentation/metalperformanceshadersgraph)
+- [PJRT C API Specification](https://github.com/openxla/xla/tree/main/xla/pjrt/c)
 - [MLIR Language Reference](https://mlir.llvm.org/docs/LangRef/)
 
 ---
