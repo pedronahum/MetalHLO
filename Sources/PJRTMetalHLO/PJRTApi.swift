@@ -134,10 +134,19 @@ private func buildPjrtApi() -> PJRT_Api {
     api.PJRT_Buffer_CopyToMemory = pjrt_buffer_copy_to_memory
     api.PJRT_Buffer_CopyRawToHost = pjrt_buffer_copy_raw_to_host
 
+    // ---- TopologyDescription ----
+    api.PJRT_Client_TopologyDescription = pjrt_client_topology_description
+    api.PJRT_TopologyDescription_PlatformName = pjrt_topology_description_platform_name
+    api.PJRT_TopologyDescription_PlatformVersion = pjrt_topology_description_platform_version
+    api.PJRT_TopologyDescription_GetDeviceDescriptions = pjrt_topology_description_get_device_descriptions
+    api.PJRT_TopologyDescription_Serialize = pjrt_topology_description_serialize
+    api.PJRT_TopologyDescription_Attributes = pjrt_topology_description_attributes
+
     // ---- Remaining optional functions are left as nil (NULL) ----
     // The framework checks for NULL before calling optional functions.
-    // These include: TopologyDescription, CopyToDeviceStream, Compile (standalone),
-    // ExecuteContext, AsyncHostToDeviceTransfer, DMA, etc.
+    // These include: TopologyDescription_Create/Destroy/Deserialize,
+    // CopyToDeviceStream, Compile (standalone), ExecuteContext,
+    // AsyncHostToDeviceTransfer, DMA, etc.
 
     return api
 }

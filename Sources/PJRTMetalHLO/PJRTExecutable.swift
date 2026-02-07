@@ -9,6 +9,81 @@ import MetalHLO
 import MetalHLOCore
 import Foundation
 
+// MARK: - MLIR Bytecode Conversion
+
+/// Converts MLIR bytecode to text using a Python helper subprocess.
+///
+/// JAX sends compiled StableHLO programs as MLIR bytecode (binary format
+/// starting with `ML\xefR`). Our MLIR parser requires text format, so we
+/// use JAX's own MLIR infrastructure to deserialize the bytecode.
+private enum BytecodeError: Error {
+    case conversionFailed(String)
+}
+
+private func convertBytecodeToText(_ bytecode: Data) -> Result<String, BytecodeError> {
+    let pythonScript = #"""
+        import sys, re
+        from jax._src.interpreters.mlir import make_ir_context
+        from jaxlib.mlir._mlir_libs import _stablehlo
+        ctx = make_ir_context()
+        bytecode = sys.stdin.buffer.read()
+        module = _stablehlo.deserialize_portable_artifact(ctx, bytecode)
+        text = str(module)
+        # Strip module attributes (our parser doesn't handle them)
+        text = re.sub(r'(module @\S+)\s+attributes\s+\{[^}]*\}', r'\1', text)
+        # Strip 'public' visibility on func.func
+        text = text.replace('func.func public ', 'func.func ')
+        # Strip result annotations like {jax.result_info = "..."}
+        text = re.sub(r'\{jax\.\w+\s*=\s*"[^"]*"\}', '', text)
+        # Strip SDY sharding mesh declarations and annotations
+        text = re.sub(r'^\s*sdy\.mesh\s+@\S+\s*=\s*<[^>]*>\s*$', '', text, flags=re.MULTILINE)
+        text = re.sub(r'\{sdy\.sharding\s*=\s*#sdy\.sharding<[^>]*>\}', '', text)
+        # Clean up extra whitespace from removals
+        text = re.sub(r'\n\s*\n\s*\n', '\n\n', text)
+        sys.stdout.write(text)
+        """#
+
+    let process = Process()
+    let stdinPipe = Pipe()
+    let stdoutPipe = Pipe()
+    let stderrPipe = Pipe()
+
+    // Find Python — we're running inside a Python process (JAX called us).
+    // Use the same Python executable that's running the current process.
+    let pythonPath = ProcessInfo.processInfo.arguments[0]
+    process.executableURL = URL(fileURLWithPath: pythonPath)
+    process.arguments = ["-c", pythonScript]
+    process.standardInput = stdinPipe
+    process.standardOutput = stdoutPipe
+    process.standardError = stderrPipe
+
+    do {
+        try process.run()
+    } catch {
+        return .failure(.conversionFailed("Failed to launch Python: \(error)"))
+    }
+
+    // Write bytecode to stdin
+    stdinPipe.fileHandleForWriting.write(bytecode)
+    stdinPipe.fileHandleForWriting.closeFile()
+
+    process.waitUntilExit()
+
+    let outputData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+    let errorData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+
+    guard process.terminationStatus == 0 else {
+        let stderr = String(data: errorData, encoding: .utf8) ?? "unknown error"
+        return .failure(.conversionFailed("Python conversion failed (exit \(process.terminationStatus)): \(stderr)"))
+    }
+
+    guard let text = String(data: outputData, encoding: .utf8), !text.isEmpty else {
+        return .failure(.conversionFailed("Python conversion produced empty output"))
+    }
+
+    return .success(text)
+}
+
 /// Concrete backing storage for opaque PJRT_Executable pointers.
 /// Represents a serializable compiled artifact.
 final class PJRTExecutableImpl: @unchecked Sendable {
@@ -198,10 +273,27 @@ func pjrt_client_compile(
         return makeError(PJRT_Error_Code_INVALID_ARGUMENT, "NULL program code")
     }
     let codeSize = prog.code_size
-    let mlirSource = String(
-        decoding: UnsafeRawBufferPointer(start: codePtr, count: codeSize),
-        as: UTF8.self
-    )
+
+    // For MLIR bytecode, check magic bytes "ML\xefR"
+    let rawBytes = UnsafeRawBufferPointer(start: codePtr, count: codeSize)
+    let isBytecode = codeSize >= 4
+        && rawBytes[0] == 0x4D  // 'M'
+        && rawBytes[1] == 0x4C  // 'L'
+        && rawBytes[2] == 0xEF
+        && rawBytes[3] == 0x52  // 'R'
+
+    let mlirSource: String
+    if isBytecode {
+        // JAX sends MLIR bytecode; convert to text via Python helper
+        switch convertBytecodeToText(Data(rawBytes)) {
+        case .success(let text):
+            mlirSource = text
+        case .failure(let error):
+            return makeError(PJRT_Error_Code_INTERNAL, "Bytecode conversion failed: \(error)")
+        }
+    } else {
+        mlirSource = String(decoding: rawBytes, as: UTF8.self)
+    }
 
     do {
         // Use O2 optimization by default for the PJRT path

@@ -9,10 +9,7 @@ import MetalHLO
 import MetalHLOCore
 import Foundation
 
-// Platform strings — nonisolated(unsafe) because UnsafeMutablePointer isn't Sendable,
-// but these are effectively immutable constants allocated once.
-nonisolated(unsafe) private let platformName = strdup("metalhlo")!
-nonisolated(unsafe) private let platformVersion = strdup("0.1.0")!
+// Platform strings are defined in PJRTTopology.swift as platformNameStatic / platformVersionStatic
 
 /// Concrete backing storage for opaque PJRT_Client pointers.
 final class PJRTClientImpl: @unchecked Sendable {
@@ -20,6 +17,8 @@ final class PJRTClientImpl: @unchecked Sendable {
     let metalDevice: MTLDevice
     let devices: [PJRTDeviceImpl]
     let memories: [PJRTMemoryImpl]
+    let topology: PJRTTopologyDescriptionImpl
+    let topologyOpaquePtr: OpaquePointer
 
     // Stable pointer arrays for C API
     let devicesPtrBuffer: UnsafeMutableBufferPointer<UnsafeMutablePointer<PJRT_Device>?>
@@ -61,11 +60,18 @@ final class PJRTClientImpl: @unchecked Sendable {
             retainAsOpaque(memory)
         )
 
+        // Build topology (owned by client, not separately destroyed)
+        self.topology = PJRTTopologyDescriptionImpl(deviceDescriptions: [device.description])
+        self.topologyOpaquePtr = retainAsOpaque(self.topology)
+
         // Set back-reference
         device.client = self
     }
 
     deinit {
+        // Release topology opaque pointer
+        releaseOpaque(topologyOpaquePtr, as: PJRTTopologyDescriptionImpl.self)
+
         // Release device and memory opaque pointers
         for i in 0..<devicesPtrBuffer.count {
             if let ptr = devicesPtrBuffer[i] {
@@ -137,8 +143,8 @@ func pjrt_client_platform_name(
     guard let args = args else {
         return makeError(PJRT_Error_Code_INVALID_ARGUMENT, "NULL args")
     }
-    args.pointee.platform_name = UnsafePointer(platformName)
-    args.pointee.platform_name_size = strlen(platformName)
+    args.pointee.platform_name = UnsafePointer(platformNameStatic)
+    args.pointee.platform_name_size = strlen(platformNameStatic)
     return nil
 }
 
@@ -158,8 +164,8 @@ func pjrt_client_platform_version(
     guard let args = args else {
         return makeError(PJRT_Error_Code_INVALID_ARGUMENT, "NULL args")
     }
-    args.pointee.platform_version = UnsafePointer(platformVersion)
-    args.pointee.platform_version_size = strlen(platformVersion)
+    args.pointee.platform_version = UnsafePointer(platformVersionStatic)
+    args.pointee.platform_version_size = strlen(platformVersionStatic)
     return nil
 }
 
