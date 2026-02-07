@@ -8,7 +8,7 @@ import Foundation
 @testable import MetalHLO
 @testable import MetalHLOCore
 
-@Suite("Gather/Scatter Batching Tests")
+@Suite("Gather/Scatter Batching Tests", .serialized)
 struct GatherBatchingTests {
 
     // MARK: - Gather Tests

@@ -13,6 +13,12 @@ import Testing
 import Foundation
 @testable import MetalHLO
 
+// Wrapper to serialize all Official test suites.
+// Without this, each child @Suite runs in parallel with others,
+// causing concurrent MPSGraph access that leads to signal 11 crashes.
+@Suite("StableHLO Official Tests", .serialized)
+enum StableHLOOfficialTestsWrapper {
+
 // MARK: - Interpret Tests (Official Conformance)
 
 @Suite("StableHLO Official: Interpret", .serialized)
@@ -912,7 +918,7 @@ struct OfficialBatchTests {
         #expect(totalPassed > 0, "At least some priority tests should pass")
     }
 
-    @Test("Run ALL interpret tests (comprehensive)")
+    @Test("Run ALL interpret tests (comprehensive)", .disabled("Runs 50+ files through MPSGraph; causes resource exhaustion when combined with other suites"))
     func runAllInterpretTests() async throws {
         let runner = try InterpretTestRunner()
         let manager = OfficialTestManager.shared
@@ -949,6 +955,8 @@ struct OfficialBatchTests {
             "quantized_ops.mlir",
             // Tuple operations - not supported in MPSGraph
             "tuple_and_get_tuple_element.mlir",
+            // Complex number operations - MPSGraph aborts on complex types
+            "complex.mlir", "real.mlir", "imag.mlir",
         ]
 
         var totalPassed = 0
@@ -1020,3 +1028,5 @@ struct OfficialBatchTests {
         }
     }
 }
+
+} // end StableHLOOfficialTestsWrapper

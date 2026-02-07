@@ -7,7 +7,7 @@ import Testing
 import Metal
 @testable import MetalHLOCore
 
-@Suite("Auto-Tuning Tests")
+@Suite("Auto-Tuning Tests", .serialized)
 struct TuningTests {
 
     // MARK: - Search Space Tests

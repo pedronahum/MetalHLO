@@ -7,7 +7,7 @@ import Testing
 import Metal
 @testable import MetalHLOCore
 
-@Suite("Zero-Allocation Execution Tests")
+@Suite("Zero-Allocation Execution Tests", .serialized)
 struct ZeroAllocExecutionTests {
 
     // MARK: - ScheduledTensorLifetime Tests

@@ -7,7 +7,7 @@ import Testing
 import Metal
 @testable import MetalHLOCore
 
-@Suite("Metal Kernel Tests")
+@Suite("Metal Kernel Tests", .serialized)
 struct MetalKernelTests {
 
     // MARK: - Setup

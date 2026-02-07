@@ -9,7 +9,7 @@ import Metal
 
 // MARK: - Integrated Executor Tests
 
-@Suite("Integrated Executor Tests")
+@Suite("Integrated Executor Tests", .serialized)
 struct IntegratedExecutorTests {
 
     // MARK: - Config Tests
@@ -134,7 +134,7 @@ struct IntegratedExecutorTests {
 
 // MARK: - Execution Result Tests
 
-@Suite("Execution Result Tests")
+@Suite("Execution Result Tests", .serialized)
 struct ExecutionResultTests {
 
     @Test("ExecutionResult stores data correctly")
@@ -173,7 +173,7 @@ struct ExecutionResultTests {
 
 // MARK: - Integration Types Tests
 
-@Suite("Integration Types Tests")
+@Suite("Integration Types Tests", .serialized)
 struct IntegrationTypesTests {
 
     @Test("TensorInfo stores all properties")
@@ -306,7 +306,7 @@ struct IntegrationTypesTests {
 
 // MARK: - Kernel Types Tests
 
-@Suite("Kernel Types Tests")
+@Suite("Kernel Types Tests", .serialized)
 struct KernelTypesTests {
 
     @Test("DispatchConfig calculates totals correctly")

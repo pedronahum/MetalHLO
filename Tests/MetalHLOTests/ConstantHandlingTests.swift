@@ -8,7 +8,7 @@ import Metal
 @testable import MetalHLO
 @testable import MetalHLOCore
 
-@Suite("Constant Handling Tests")
+@Suite("Constant Handling Tests", .serialized)
 struct ConstantHandlingTests {
 
     // MARK: - Debug Test

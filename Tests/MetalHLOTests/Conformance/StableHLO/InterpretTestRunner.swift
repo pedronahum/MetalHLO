@@ -269,7 +269,10 @@ public final class InterpretTestRunner: @unchecked Sendable {
     /// 6. Exotic float types - f4E2M1FN, etc. not supported by Metal
     private func shouldSkipTest(_ testCase: InterpretTestCase) -> String? {
         // Skip complex number tests (MPS doesn't support, no good promotion path)
-        if testCase.inputs.contains(where: { $0.elementType.contains("complex") }) {
+        // Check both parsed inputs and raw MLIR because the constant parser regex
+        // fails on nested angle brackets in complex types (e.g., tensor<2xcomplex<f32>>)
+        if testCase.inputs.contains(where: { $0.elementType.contains("complex") })
+            || testCase.mlir.contains("complex<") {
             return "Complex types not supported by MPS"
         }
 

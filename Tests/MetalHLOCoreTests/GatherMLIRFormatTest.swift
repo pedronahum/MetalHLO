@@ -6,7 +6,7 @@ import Foundation
 @testable import MetalHLO
 @testable import MetalHLOCore
 
-@Suite("Gather MLIR Format Tests")
+@Suite("Gather MLIR Format Tests", .serialized)
 struct GatherMLIRFormatTests {
 
     @Test("Gather with #stablehlo.gather<> format - default")

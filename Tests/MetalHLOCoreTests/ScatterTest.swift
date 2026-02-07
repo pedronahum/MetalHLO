@@ -10,7 +10,7 @@ import Foundation
 @testable import MetalHLO
 @testable import MetalHLOCore
 
-@Suite("Scatter Tests")
+@Suite("Scatter Tests", .serialized)
 struct ScatterTests {
 
     // MARK: - Parser tests for scatter region syntax

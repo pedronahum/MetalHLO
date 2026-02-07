@@ -6,7 +6,7 @@ import Foundation
 @testable import MetalHLO
 @testable import MetalHLOCore
 
-@Suite("CrossEntropy Tests")
+@Suite("CrossEntropy Tests", .serialized)
 struct CrossEntropyTests {
 
     @Test("Cross-entropy MLIR (O3)")

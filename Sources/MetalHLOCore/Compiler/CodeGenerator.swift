@@ -636,6 +636,66 @@ public final class CodeGenerator: @unchecked Sendable {
                 metalType: metalType
             )
 
+        // Reverse operations
+        case .reverse:
+            source += generateReverseKernel(
+                entryPoint: entryPoint,
+                inputShape: inputShapes.first ?? [],
+                dimensions: attributes.dimensions ?? [],
+                metalType: metalType
+            )
+
+        // Pad operations
+        case .pad:
+            source += generatePadKernel(
+                entryPoint: entryPoint,
+                inputShape: inputShapes.first ?? [],
+                outputShape: outputShape,
+                padLow: attributes.padLow ?? [],
+                padHigh: attributes.padHigh ?? [],
+                padInterior: attributes.padInterior ?? Array(repeating: 0, count: (inputShapes.first ?? []).count),
+                metalType: metalType
+            )
+
+        // Concatenate operations
+        case .concatenate:
+            source += generateConcatenateKernel(
+                entryPoint: entryPoint,
+                inputShapes: inputShapes,
+                outputShape: outputShape,
+                axis: attributes.axis ?? 0,
+                metalType: metalType
+            )
+
+        // Iota operations
+        case .iota:
+            source += generateIotaKernel(
+                entryPoint: entryPoint,
+                outputShape: outputShape,
+                dimension: attributes.iotaDimension ?? attributes.axis ?? 0,
+                metalType: metalType
+            )
+
+        // Count leading zeros
+        case .clz:
+            source += generateUnaryKernel(entryPoint: entryPoint, operation: "\(metalType)(clz(x))", metalType: metalType)
+
+        // Select (ternary) operations
+        case .select:
+            let inputType = attributes.inputElementTypes?.last ?? elementType
+            let valueMetal = metalTypeName(for: inputType)
+            source += generateSelectKernel(
+                entryPoint: entryPoint,
+                metalType: valueMetal
+            )
+
+        // Clamp operations
+        case .clamp:
+            source += generateClampKernel(
+                entryPoint: entryPoint,
+                metalType: metalType
+            )
+
         default:
             // Fallback to copy kernel for unsupported ops
             source += generateCopyKernel(entryPoint: entryPoint, metalType: metalType)
@@ -1109,6 +1169,299 @@ public final class CodeGenerator: @unchecked Sendable {
         \(indexCode)
             \(srcPosCalc)
             output[tid] = input[srcPos];
+        }
+        """
+    }
+
+    /// Generates a reverse kernel that reverses elements along specified dimensions.
+    private func generateReverseKernel(
+        entryPoint: String,
+        inputShape: [Int],
+        dimensions: [Int],
+        metalType: String
+    ) -> String {
+        guard !inputShape.isEmpty else {
+            return generateCopyKernel(entryPoint: entryPoint, metalType: metalType)
+        }
+
+        let rank = inputShape.count
+        let totalElements = inputShape.reduce(1, *)
+        let reversedDims = Set(dimensions)
+
+        // Calculate strides
+        var strides = [Int](repeating: 1, count: rank)
+        for i in stride(from: rank - 2, through: 0, by: -1) {
+            strides[i] = strides[i + 1] * inputShape[i + 1]
+        }
+
+        // Generate index calculation: decompose flat index, flip reversed dims, recompute
+        var indexCode = ""
+        for i in 0..<rank {
+            indexCode += "    uint coord_\(i) = (tid / \(strides[i])) % \(inputShape[i]);\n"
+            if reversedDims.contains(i) {
+                indexCode += "    coord_\(i) = \(inputShape[i] - 1) - coord_\(i);\n"
+            }
+        }
+
+        var srcPosCalc = "uint srcPos = "
+        for i in 0..<rank {
+            if i > 0 { srcPosCalc += " + " }
+            srcPosCalc += "coord_\(i) * \(strides[i])"
+        }
+        srcPosCalc += ";"
+
+        return """
+        kernel void \(entryPoint)(
+            device const \(metalType)* input [[buffer(0)]],
+            device \(metalType)* output [[buffer(1)]],
+            constant uint& count [[buffer(2)]],
+            uint tid [[thread_position_in_grid]])
+        {
+            if (tid >= \(totalElements)) return;
+
+        \(indexCode)
+            \(srcPosCalc)
+            output[tid] = input[srcPos];
+        }
+        """
+    }
+
+    /// Generates a pad kernel that pads a tensor with a constant value.
+    ///
+    /// Supports low padding, high padding, and interior padding.
+    /// Interior padding inserts `padInterior[d]` elements between consecutive elements along dim d.
+    private func generatePadKernel(
+        entryPoint: String,
+        inputShape: [Int],
+        outputShape: [Int],
+        padLow: [Int],
+        padHigh: [Int],
+        padInterior: [Int],
+        metalType: String
+    ) -> String {
+        guard !inputShape.isEmpty, !outputShape.isEmpty else {
+            return generateCopyKernel(entryPoint: entryPoint, metalType: metalType)
+        }
+
+        let rank = inputShape.count
+        let totalOutputElements = outputShape.reduce(1, *)
+
+        // Calculate output strides
+        var outputStrides = [Int](repeating: 1, count: rank)
+        for i in stride(from: rank - 2, through: 0, by: -1) {
+            outputStrides[i] = outputStrides[i + 1] * outputShape[i + 1]
+        }
+
+        // Calculate input strides
+        var inputStrides = [Int](repeating: 1, count: rank)
+        for i in stride(from: rank - 2, through: 0, by: -1) {
+            inputStrides[i] = inputStrides[i + 1] * inputShape[i + 1]
+        }
+
+        // Generate the coordinate decomposition and data region check
+        // Output coord `c` maps to input index `(c - padLow[d]) / (1 + padInterior[d])`
+        // if `(c - padLow[d]) % (1 + padInterior[d]) == 0` and the index is in range.
+        var coordCode = ""
+        var checkCode = "    bool inData = true;\n    uint srcIdx = 0;\n"
+
+        for i in 0..<rank {
+            coordCode += "    uint c_\(i) = (tid / \(outputStrides[i])) % \(outputShape[i]);\n"
+            let interiorStride = 1 + padInterior[i]
+            checkCode += "    int adj_\(i) = int(c_\(i)) - \(padLow[i]);\n"
+            if interiorStride > 1 {
+                checkCode += "    inData = inData && (adj_\(i) >= 0) && (adj_\(i) % \(interiorStride) == 0);\n"
+                checkCode += "    uint src_\(i) = uint(adj_\(i) / \(interiorStride));\n"
+            } else {
+                checkCode += "    inData = inData && (adj_\(i) >= 0);\n"
+                checkCode += "    uint src_\(i) = uint(adj_\(i));\n"
+            }
+            checkCode += "    inData = inData && (src_\(i) < \(inputShape[i]));\n"
+            checkCode += "    srcIdx += src_\(i) * \(inputStrides[i]);\n"
+        }
+
+        return """
+        kernel void \(entryPoint)(
+            device const \(metalType)* input [[buffer(0)]],
+            device const \(metalType)* pad_value [[buffer(1)]],
+            device \(metalType)* output [[buffer(2)]],
+            constant uint& count [[buffer(3)]],
+            uint tid [[thread_position_in_grid]])
+        {
+            if (tid >= \(totalOutputElements)) return;
+
+        \(coordCode)
+        \(checkCode)
+            output[tid] = inData ? input[srcIdx] : pad_value[0];
+        }
+        """
+    }
+
+    /// Generates a concatenate kernel that joins tensors along an axis.
+    private func generateConcatenateKernel(
+        entryPoint: String,
+        inputShapes: [[Int]],
+        outputShape: [Int],
+        axis: Int,
+        metalType: String
+    ) -> String {
+        guard !outputShape.isEmpty, !inputShapes.isEmpty else {
+            return generateCopyKernel(entryPoint: entryPoint, metalType: metalType)
+        }
+
+        let rank = outputShape.count
+        let totalOutputElements = outputShape.reduce(1, *)
+        let numInputs = inputShapes.count
+
+        // Calculate output strides
+        var outputStrides = [Int](repeating: 1, count: rank)
+        for i in stride(from: rank - 2, through: 0, by: -1) {
+            outputStrides[i] = outputStrides[i + 1] * outputShape[i + 1]
+        }
+
+        // Calculate cumulative sizes along concat axis
+        var cumulativeSizes = [Int]()
+        var cumSum = 0
+        for shape in inputShapes {
+            cumulativeSizes.append(cumSum)
+            cumSum += shape[axis]
+        }
+
+        // Calculate input strides for each input
+        var allInputStrides = [[Int]]()
+        for shape in inputShapes {
+            var strides = [Int](repeating: 1, count: rank)
+            for i in stride(from: rank - 2, through: 0, by: -1) {
+                strides[i] = strides[i + 1] * shape[i + 1]
+            }
+            allInputStrides.append(strides)
+        }
+
+        // Build the kernel: decompose output index, determine which input, compute source index
+        var coordCode = ""
+        for i in 0..<rank {
+            coordCode += "    uint c_\(i) = (tid / \(outputStrides[i])) % \(outputShape[i]);\n"
+        }
+
+        // Build input buffer parameters
+        var bufferParams = ""
+        for i in 0..<numInputs {
+            bufferParams += "    device const \(metalType)* input\(i) [[buffer(\(i))]],\n"
+        }
+
+        // Build if-else chain to select the right input
+        var selectCode = ""
+        for i in 0..<numInputs {
+            let condition: String
+            if i == numInputs - 1 {
+                condition = "else"
+            } else if i == 0 {
+                condition = "if (c_\(axis) < \(cumulativeSizes[i] + inputShapes[i][axis]))"
+            } else {
+                condition = "else if (c_\(axis) < \(cumulativeSizes[i] + inputShapes[i][axis]))"
+            }
+
+            // Compute source index within this input
+            var srcCalc = "uint srcIdx = "
+            for d in 0..<rank {
+                if d > 0 { srcCalc += " + " }
+                if d == axis {
+                    srcCalc += "(c_\(d) - \(cumulativeSizes[i])) * \(allInputStrides[i][d])"
+                } else {
+                    srcCalc += "c_\(d) * \(allInputStrides[i][d])"
+                }
+            }
+            srcCalc += ";"
+
+            if i == numInputs - 1 && numInputs > 1 {
+                selectCode += "    \(condition) {\n"
+            } else {
+                selectCode += "    \(condition) {\n"
+            }
+            selectCode += "        \(srcCalc)\n"
+            selectCode += "        output[tid] = input\(i)[srcIdx];\n"
+            selectCode += "    }\n"
+        }
+
+        return """
+        kernel void \(entryPoint)(
+        \(bufferParams)    device \(metalType)* output [[buffer(\(numInputs))]],
+            constant uint& count [[buffer(\(numInputs + 1))]],
+            uint tid [[thread_position_in_grid]])
+        {
+            if (tid >= \(totalOutputElements)) return;
+
+        \(coordCode)
+        \(selectCode)}
+        """
+    }
+
+    /// Generates an iota kernel that fills a tensor with sequential indices along a dimension.
+    private func generateIotaKernel(
+        entryPoint: String,
+        outputShape: [Int],
+        dimension: Int,
+        metalType: String
+    ) -> String {
+        guard !outputShape.isEmpty else {
+            return generateCopyKernel(entryPoint: entryPoint, metalType: metalType)
+        }
+
+        let totalElements = outputShape.reduce(1, *)
+
+        // Calculate stride for the target dimension
+        var stride = 1
+        for i in (dimension + 1)..<outputShape.count {
+            stride *= outputShape[i]
+        }
+
+        return """
+        kernel void \(entryPoint)(
+            device \(metalType)* output [[buffer(0)]],
+            constant uint& count [[buffer(1)]],
+            uint tid [[thread_position_in_grid]])
+        {
+            if (tid >= \(totalElements)) return;
+            output[tid] = \(metalType)((tid / \(stride)) % \(outputShape[dimension]));
+        }
+        """
+    }
+
+    /// Generates a select kernel: output = pred ? on_true : on_false.
+    private func generateSelectKernel(
+        entryPoint: String,
+        metalType: String
+    ) -> String {
+        return """
+        kernel void \(entryPoint)(
+            device const bool* pred [[buffer(0)]],
+            device const \(metalType)* on_true [[buffer(1)]],
+            device const \(metalType)* on_false [[buffer(2)]],
+            device \(metalType)* output [[buffer(3)]],
+            constant uint& count [[buffer(4)]],
+            uint tid [[thread_position_in_grid]])
+        {
+            if (tid >= count) return;
+            output[tid] = pred[tid] ? on_true[tid] : on_false[tid];
+        }
+        """
+    }
+
+    /// Generates a clamp kernel: output = min(max(operand, min_val), max_val).
+    private func generateClampKernel(
+        entryPoint: String,
+        metalType: String
+    ) -> String {
+        return """
+        kernel void \(entryPoint)(
+            device const \(metalType)* min_val [[buffer(0)]],
+            device const \(metalType)* operand [[buffer(1)]],
+            device const \(metalType)* max_val [[buffer(2)]],
+            device \(metalType)* output [[buffer(3)]],
+            constant uint& count [[buffer(4)]],
+            uint tid [[thread_position_in_grid]])
+        {
+            if (tid >= count) return;
+            output[tid] = clamp(operand[tid], min_val[tid], max_val[tid]);
         }
         """
     }
@@ -2885,6 +3238,9 @@ public final class CodeGenerator: @unchecked Sendable {
                 // Reshape uses a non-vectorized copy kernel (1 element per thread).
                 // Must not use the default float32 vectorized dispatch (8 elements/thread).
                 return DispatchConfig.dispatch1D(elements: totalElements, threadgroupSize: 256)
+            case .reverse, .pad, .concatenate, .iota, .select, .clamp:
+                // These kernels are NOT vectorized - 1 thread per element
+                return DispatchConfig.dispatch1D(elements: totalElements, threadgroupSize: 256)
             default:
                 break
             }
@@ -3164,8 +3520,10 @@ public final class CodeGenerator: @unchecked Sendable {
                  .convert,
                  .popcnt,
                  .bitcastConvert,
-                 // Shape operations that use copy/broadcast kernels
-                 .reshape, .transpose, .broadcastInDim:
+                 .clz,
+                 // Shape/indexing operations
+                 .reshape, .transpose, .broadcastInDim,
+                 .reverse, .pad, .concatenate, .iota:
                 // Calculate total elements from output shape
                 if let output = op.outputs.first {
                     let count = output.shape.isEmpty ? 1 : output.shape.reduce(1, *)

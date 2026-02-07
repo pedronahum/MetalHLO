@@ -6,7 +6,7 @@ import Foundation
 @testable import MetalHLO
 @testable import MetalHLOCore
 
-@Suite("Reduce Tests")
+@Suite("Reduce Tests", .serialized)
 struct ReduceTests {
 
     @Test("Reduce sum 2D along axis 1 - simplified format (default)")
