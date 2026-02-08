@@ -332,7 +332,7 @@ public final class CodeGenerator: @unchecked Sendable {
 
         // Calculate shared memory size and buffer count
         let sharedMemorySize = calculateSharedMemorySize(type: op.type, tuning: tuning, elementType: elementType)
-        let threadgroupBufferCount = calculateThreadgroupBufferCount(type: op.type, elementType: elementType)
+        let threadgroupBufferCount = calculateThreadgroupBufferCount(type: op.type, tuning: tuning, elementType: elementType)
 
         return KernelSpec(
             opID: op.id,
@@ -2437,17 +2437,26 @@ public final class CodeGenerator: @unchecked Sendable {
         }
 
         let lhsShape = inputShapes[0]
+        let rhsShape = inputShapes[1]
         let metalType = metalTypeName(for: elementType)
         let isFloat = isFloatType(elementType)
 
         // Calculate batch size (product of all dimensions except last 2)
         let batchSize = lhsShape.count > 2 ? lhsShape.dropLast(2).reduce(1, *) : 1
 
-        // Use optimized simdgroup kernel for float types, fallback for integers
-        if isFloat {
+        // Extract M, K, N dimensions
+        let M = lhsShape.count >= 2 ? lhsShape[lhsShape.count - 2] : 1
+        let K = lhsShape.count >= 1 ? lhsShape[lhsShape.count - 1] : 1
+        let N = rhsShape.count >= 1 ? rhsShape[rhsShape.count - 1] : 1
+
+        // Use optimized simdgroup kernel only for float types with all dims >= 8.
+        // simdgroup_load/simdgroup_store always operate on 8x8 tiles and will
+        // read/write out of bounds for smaller matrices.
+        if isFloat && M >= 8 && K >= 8 && N >= 8 {
             return generateSimdgroupMatMulSource(batchSize: batchSize, metalType: metalType, elementType: elementType)
         } else {
-            return generateBasicTiledMatMulSource(batchSize: batchSize, metalType: metalType, zeroValue: "0")
+            let zeroValue = isFloat ? "0.0" : "0"
+            return generateBasicTiledMatMulSource(batchSize: batchSize, metalType: metalType, zeroValue: zeroValue)
         }
     }
 
@@ -2729,9 +2738,13 @@ public final class CodeGenerator: @unchecked Sendable {
         return (source, "kernel_matmul", tuning)
     }
 
-    /// Generates a basic tiled matmul kernel for integer types (simdgroup_matrix not supported).
+    /// Generates a basic tiled matmul kernel for integer types or small float matrices
+    /// (simdgroup_matrix requires all dims >= 8).
     private func generateBasicTiledMatMulSource(batchSize: Int, metalType: String, zeroValue: String) -> (String, String, TuningConfig?) {
-        let tuning = TuningConfig.matmul
+        let tuning = TuningConfig(
+            tileM: 32, tileN: 32, tileK: 32,
+            useSharedMemory: true, useSIMDGroups: false
+        )
 
         let source: String
         if batchSize > 1 {
@@ -3778,10 +3791,11 @@ public final class CodeGenerator: @unchecked Sendable {
                     let gridWidth = (N + tileSize - 1) / tileSize
                     let gridHeight = (M + tileSize - 1) / tileSize
 
-                    // Check if using simdgroup kernel (float types) or basic tiled (integer)
-                    // Simdgroup kernel uses 4 simdgroups = 128 threads per threadgroup
-                    // Basic tiled uses 32x32 = 1024 threads per threadgroup
-                    let useSimdgroup = isFloatType(elementType)
+                    // Check if using simdgroup kernel (float types with all dims >= 8)
+                    // or basic tiled (integer types or small float matrices).
+                    // simdgroup_load/store requires 8x8 tiles — small matrices use basic tiled.
+                    let K = inputShapes.first.map { $0.count >= 1 ? $0[$0.count - 1] : 1 } ?? 1
+                    let useSimdgroup = isFloatType(elementType) && M >= 8 && K >= 8 && N >= 8
 
                     if batchSize > 1 {
                         // 3D dispatch for batched matmul
@@ -3804,7 +3818,13 @@ public final class CodeGenerator: @unchecked Sendable {
                                 threadgroupSize: MTLSize(width: 128, height: 1, depth: 1)
                             )
                         } else {
-                            return DispatchConfig.dispatch2D(width: N, height: M, tileWidth: 32, tileHeight: 32)
+                            // Basic tiled matmul needs the full 32x32 threadgroup to
+                            // initialize all shared memory tile entries. dispatch2D
+                            // would clamp to min(32, matrixDim), leaving tiles uninitialized.
+                            return DispatchConfig(
+                                gridSize: MTLSize(width: gridWidth, height: gridHeight, depth: 1),
+                                threadgroupSize: MTLSize(width: tileSize, height: tileSize, depth: 1)
+                            )
                         }
                     }
                 }
@@ -4246,12 +4266,11 @@ public final class CodeGenerator: @unchecked Sendable {
         switch type {
         case .original(let opKind):
             if opKind == .dot || opKind == .dotGeneral {
-                // Simdgroup kernels (float types) don't use threadgroup memory
-                // They use simdgroup_matrix operations in registers
-                if isFloatType(elementType) {
+                // Simdgroup kernels use simdgroup_matrix operations in registers (no shared memory).
+                // Basic tiled kernels need 2 threadgroup buffers (tileA and tileB).
+                if tuning?.useSIMDGroups == true {
                     return 0
                 }
-                // Basic tiled kernels (integer types) need threadgroup memory
                 let tileSize = tuning?.tileM ?? 32
                 return 2 * tileSize * tileSize * elemSize
             }
@@ -4279,15 +4298,15 @@ public final class CodeGenerator: @unchecked Sendable {
     }
 
     /// Calculates the number of threadgroup memory buffers for an operation.
-    private func calculateThreadgroupBufferCount(type: FusedOpType, elementType: ElementType = .float32) -> Int {
+    private func calculateThreadgroupBufferCount(type: FusedOpType, tuning: TuningConfig? = nil, elementType: ElementType = .float32) -> Int {
         switch type {
         case .original(let opKind):
             if opKind == .dot || opKind == .dotGeneral {
-                // Simdgroup kernels (float types) don't use threadgroup memory
-                if isFloatType(elementType) {
+                // Simdgroup kernels don't use threadgroup memory.
+                // Basic tiled matmul needs 2 buffers (tileA and tileB).
+                if tuning?.useSIMDGroups == true {
                     return 0
                 }
-                // Basic tiled matmul needs 2 buffers (tileA and tileB)
                 return 2
             }
             if opKind == .transpose {
