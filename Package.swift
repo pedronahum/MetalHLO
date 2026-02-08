@@ -19,6 +19,12 @@ let package = Package(
             type: .dynamic,
             targets: ["CMetalHLO"]
         ),
+        // PJRT plugin (dynamic library for JAX/XLA integration)
+        .library(
+            name: "PJRTMetalHLO",
+            type: .dynamic,
+            targets: ["PJRTMetalHLO"]
+        ),
         // Benchmark library
         .library(
             name: "MetalHLOBenchmarks",
@@ -71,6 +77,24 @@ let package = Package(
             publicHeadersPath: "include"
         ),
 
+        // MARK: - PJRT C API Header (vendored from OpenXLA)
+        .target(
+            name: "CPJRTApi",
+            dependencies: [],
+            path: "Sources/CPJRTApi",
+            publicHeadersPath: "include"
+        ),
+
+        // MARK: - PJRT Plugin Implementation
+        .target(
+            name: "PJRTMetalHLO",
+            dependencies: ["MetalHLO", "MetalHLOCore", "CPJRTApi"],
+            path: "Sources/PJRTMetalHLO",
+            linkerSettings: [
+                .linkedFramework("Metal"),
+            ]
+        ),
+
         // MARK: - Benchmarks
         .target(
             name: "MetalHLOBenchmarks",
@@ -109,6 +133,11 @@ let package = Package(
             name: "MetalHLOCoreTests",
             dependencies: ["MetalHLOCore"],
             path: "Tests/MetalHLOCoreTests"
+        ),
+        .testTarget(
+            name: "PJRTMetalHLOTests",
+            dependencies: ["PJRTMetalHLO", "MetalHLO"],
+            path: "Tests/PJRTMetalHLOTests"
         ),
     ],
     swiftLanguageModes: [.v6]

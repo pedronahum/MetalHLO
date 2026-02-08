@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jax-metalhlo"
+version = "0.1.0"
+description = "MetalHLO PJRT plugin for JAX — custom Metal kernel execution on Apple Silicon"
+requires-python = ">=3.9"
+dependencies = ["jax>=0.4.0"]
+
+[project.entry-points.'jax_plugins']
+metalhlo = "jax_plugins.metalhlo"
+
+[tool.setuptools.packages.find]
+include = ["jax_plugins*"]

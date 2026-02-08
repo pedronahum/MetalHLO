@@ -1792,8 +1792,11 @@ public final class Parser {
             advance()
             value = .scalar(f)
         } else if case .integer(let i) = currentToken.kind {
+            // In MLIR, hex integers in dense<> represent float bit patterns
+            // (e.g., 0xFF800000 is -inf as f32, not the integer 4286578688)
+            let doubleValue = integerToConstantDouble(i, text: currentToken.text)
             advance()
-            value = .scalar(Double(i))
+            value = .scalar(doubleValue)
         } else {
             throw ParseError.invalidConstant(
                 "Expected constant value",
@@ -1803,6 +1806,27 @@ public final class Parser {
 
         try expect(.rightAngle)
         return value
+    }
+
+    /// Converts an integer token to a Double for use in a constant value.
+    ///
+    /// In MLIR text format, hex integers in `dense<>` represent IEEE 754 float
+    /// bit patterns: `0xFF800000` is `-inf` (f32), not the integer 4286578688.
+    /// Decimal integers are plain numeric values (e.g., `dense<0>` is 0.0).
+    private func integerToConstantDouble(_ value: Int64, text: String) -> Double {
+        let isHex = text.hasPrefix("0x") || text.hasPrefix("0X")
+            || text.hasPrefix("-0x") || text.hasPrefix("-0X")
+        guard isHex else {
+            return Double(value)
+        }
+        // Reinterpret hex value as a float bit pattern.
+        // f32 bit patterns fit in 32 bits; f64 patterns use 64 bits.
+        let bits = UInt64(bitPattern: value)
+        if bits <= UInt64(UInt32.max) {
+            return Double(Float(bitPattern: UInt32(bits)))
+        } else {
+            return Double(bitPattern: bits)
+        }
     }
 
     private func parseDenseArray() throws -> [Double] {
@@ -1819,7 +1843,7 @@ public final class Parser {
                     values.append(f)
                     advance()
                 } else if case .integer(let i) = currentToken.kind {
-                    values.append(Double(i))
+                    values.append(integerToConstantDouble(i, text: currentToken.text))
                     advance()
                 } else if check(.minus) {
                     advance()
