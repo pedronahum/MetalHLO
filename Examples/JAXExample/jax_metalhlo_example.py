@@ -446,10 +446,7 @@ def test_convolution():
     conv_result = conv1d(conv_input, conv_kernel)
     check("conv1d_valid", conv_result, [[[-2.0], [-2.0], [-2.0], [-2.0]]])
 
-# Note: Convolution currently causes a SIGBUS crash during Metal kernel dispatch.
-# The MLIR parsing works after format conversion, but the convolution kernel
-# may have buffer binding or dispatch issues. Skipped for now.
-# section("Convolution", test_convolution)
+section("Convolution", test_convolution)
 
 
 def test_large_reductions():

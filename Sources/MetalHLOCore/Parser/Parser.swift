@@ -876,15 +876,27 @@ public final class Parser {
         }
 
         // Skip angle bracket if present
-        if check(.leftAngle) {
+        let hasAngleBrackets = check(.leftAngle)
+        if hasAngleBrackets {
             advance()
         }
 
         // Collect the format string: [b, 0, 1, f]x[0, 1, i, o]->[b, 0, 1, f]
+        // When wrapped in <...>, stop at '>'. Otherwise, the format has exactly
+        // 3 closing brackets ']' (input, kernel, output) — stop after the third.
         var formatString = ""
+        var closeBracketCount = 0
         while !check(.rightAngle) && !check(.colon) && !check(.eof) {
-            formatString += currentToken.text
+            let tokenText = currentToken.text
+            formatString += tokenText
+            if tokenText == "]" {
+                closeBracketCount += 1
+            }
             advance()
+            // Without angle brackets, stop after the 3rd ']' (end of output layout)
+            if !hasAngleBrackets && closeBracketCount >= 3 {
+                break
+            }
         }
 
         if check(.rightAngle) {
