@@ -38,6 +38,38 @@ private func convertBytecodeToText(_ bytecode: Data) -> Result<String, BytecodeE
         # Strip SDY sharding mesh declarations and annotations
         text = re.sub(r'^\s*sdy\.mesh\s+@\S+\s*=\s*<[^>]*>\s*$', '', text, flags=re.MULTILINE)
         text = re.sub(r'\{sdy\.sharding\s*=\s*#sdy\.sharding<[^>]*>\}', '', text)
+        # Strip precision attributes
+        text = re.sub(r',\s*precision_config\s*=\s*\[[^\]]*\]', '', text)
+        text = re.sub(r',\s*precision\s*=\s*\[[^\]]*\]', '', text)
+        # Convert generic form inherent attributes <{...}> to {...}
+        text = text.replace('<{', '{')
+        text = re.sub(r'\}>\s*:', '} :', text)
+        # Convert dynamic_slice 'sizes' to 'slice_sizes'
+        text = re.sub(r',\s*sizes\s*=\s*\[', ', slice_sizes = [', text)
+        # Convert convolution parenthesized operands to standard form
+        text = re.sub(r'stablehlo\.convolution\(([^)]+)\)\s*dim_numbers',
+                       r'stablehlo.convolution \1, dim_numbers', text)
+        text = re.sub(r'\bdim_numbers\s*=', 'dimension_numbers =', text)
+        # Expand convolution window= {...} to individual attributes
+        def expand_conv_window(m):
+            wb = m.group(1)
+            r = ''
+            s = re.search(r'stride\s*=\s*(\[[^\]]*\])', wb)
+            if s: r += ', window_strides = ' + s.group(1)
+            p = re.search(r'pad\s*=\s*(\[\[[^\]]*\]\]|\[[^\]]*\])', wb)
+            if p: r += ', padding = ' + p.group(1)
+            l = re.search(r'lhs_dilate\s*=\s*(\[[^\]]*\])', wb)
+            if l: r += ', lhs_dilation = ' + l.group(1)
+            d = re.search(r'rhs_dilate\s*=\s*(\[[^\]]*\])', wb)
+            if d: r += ', rhs_dilation = ' + d.group(1)
+            return r
+        text = re.sub(r',\s*window\s*=\s*\{([^}]*)\}', expand_conv_window, text)
+        # Inline trailing conv attribute block (use [^}\n]* to avoid crossing lines)
+        def inline_conv_attrs(m):
+            a = re.sub(r'\s*:\s*i\d+', '', m.group(1))
+            return ', ' + a.strip() + ' :'
+        text = re.sub(r' \{([^}\n]*(?:batch_group_count|feature_group_count)[^}\n]*)\} :',
+                       inline_conv_attrs, text)
         # Clean up extra whitespace from removals
         text = re.sub(r'\n\s*\n\s*\n', '\n\n', text)
         sys.stdout.write(text)
@@ -549,8 +581,8 @@ func pjrt_loaded_executable_execute(
 
     // Extract input buffers from argument_lists[0]
     var inputs: [Buffer] = []
-    if let argLists = args.pointee.argument_lists, numDevices > 0 {
-        guard let deviceArgs = argLists[0] else {
+    if numDevices > 0 && numArgs > 0 {
+        guard let argLists = args.pointee.argument_lists, let deviceArgs = argLists[0] else {
             return makeError(PJRT_Error_Code_INVALID_ARGUMENT, "NULL argument list for device 0")
         }
         for i in 0..<numArgs {

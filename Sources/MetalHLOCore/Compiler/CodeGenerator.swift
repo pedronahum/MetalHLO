@@ -493,6 +493,12 @@ public final class CodeGenerator: @unchecked Sendable {
             } else {
                 source += generateUnaryKernel(entryPoint: entryPoint, operation: "\(metalType)(sign(float(x)) * pow(abs(float(x)), 0.333333333333f))", metalType: metalType)
             }
+        case .sign:
+            if isFloat {
+                source += generateUnaryKernel(entryPoint: entryPoint, operation: "sign(x)", metalType: metalType)
+            } else {
+                source += generateUnaryKernel(entryPoint: entryPoint, operation: "\(metalType)(sign(float(x)))", metalType: metalType)
+            }
         case .floor:
             if isFloat {
                 source += generateUnaryKernel(entryPoint: entryPoint, operation: "floor(x)", metalType: metalType)
@@ -527,6 +533,20 @@ public final class CodeGenerator: @unchecked Sendable {
             } else {
                 source += generateBinaryKernel(entryPoint: entryPoint, operation: "\(metalType)(pow(float(a), float(b)))", metalType: metalType)
             }
+
+        // Bitwise operations (integer types)
+        case .and:
+            source += generateBinaryKernel(entryPoint: entryPoint, operation: "a & b", metalType: metalType)
+        case .or:
+            source += generateBinaryKernel(entryPoint: entryPoint, operation: "a | b", metalType: metalType)
+        case .xor:
+            source += generateBinaryKernel(entryPoint: entryPoint, operation: "a ^ b", metalType: metalType)
+        case .not:
+            source += generateUnaryKernel(entryPoint: entryPoint, operation: "~x", metalType: metalType)
+        case .shiftLeft:
+            source += generateBinaryKernel(entryPoint: entryPoint, operation: "a << b", metalType: metalType)
+        case .shiftRightArithmetic, .shiftRightLogical:
+            source += generateBinaryKernel(entryPoint: entryPoint, operation: "a >> b", metalType: metalType)
 
         // Comparison operations (output is bool/i1)
         case .compare:
@@ -634,6 +654,28 @@ public final class CodeGenerator: @unchecked Sendable {
                 limits: attributes.sliceLimits ?? [],
                 strides: attributes.sliceStrides ?? Array(repeating: 1, count: outputShape.count),
                 metalType: metalType
+            )
+
+        // Dynamic slice operations
+        case .dynamicSlice:
+            source += generateDynamicSliceKernel(
+                entryPoint: entryPoint,
+                inputShape: inputShapes.first ?? [],
+                outputShape: outputShape,
+                sliceSizes: attributes.dynamicSliceSizes ?? outputShape,
+                metalType: metalType,
+                numStartIndices: inputShapes.count - 1
+            )
+
+        // Dynamic update slice operations
+        case .dynamicUpdateSlice:
+            source += generateDynamicUpdateSliceKernel(
+                entryPoint: entryPoint,
+                operandShape: inputShapes.first ?? [],
+                updateShape: inputShapes.count > 1 ? inputShapes[1] : [],
+                outputShape: outputShape,
+                metalType: metalType,
+                numStartIndices: max(0, inputShapes.count - 2)
             )
 
         // Reverse operations
@@ -1211,6 +1253,147 @@ public final class CodeGenerator: @unchecked Sendable {
         \(indexCode)
             \(srcPosCalc)
             output[tid] = input[srcPos];
+        }
+        """
+    }
+
+    /// Generates a dynamic_slice kernel that reads start indices from buffers at runtime.
+    /// buffer(0) = operand, buffer(1..N) = scalar start indices (one per dim), buffer(N+1) = output, buffer(N+2) = count
+    private func generateDynamicSliceKernel(
+        entryPoint: String,
+        inputShape: [Int],
+        outputShape: [Int],
+        sliceSizes: [Int],
+        metalType: String,
+        numStartIndices: Int
+    ) -> String {
+        guard !inputShape.isEmpty, !outputShape.isEmpty else {
+            return generateCopyKernel(entryPoint: entryPoint, metalType: metalType)
+        }
+
+        let rank = inputShape.count
+        let totalElements = outputShape.reduce(1, *)
+
+        // Calculate input strides
+        var inputStrides = [Int](repeating: 1, count: rank)
+        var outputStrides = [Int](repeating: 1, count: rank)
+        for i in stride(from: rank - 2, through: 0, by: -1) {
+            inputStrides[i] = inputStrides[i + 1] * inputShape[i + 1]
+            outputStrides[i] = outputStrides[i + 1] * outputShape[i + 1]
+        }
+
+        // Build buffer parameter list: operand + start indices + output + count
+        var params = "    device const \(metalType)* input [[buffer(0)]],\n"
+        for i in 0..<rank {
+            params += "    device const int* start_idx_\(i) [[buffer(\(i + 1))]],\n"
+        }
+        params += "    device \(metalType)* output [[buffer(\(rank + 1))]],\n"
+        params += "    constant uint& count [[buffer(\(rank + 2))]]"
+
+        // Generate index calculation
+        var indexCode = ""
+        for i in 0..<rank {
+            let maxStart = inputShape[i] - sliceSizes[i]
+            indexCode += "    int s_\(i) = clamp(start_idx_\(i)[0], 0, \(maxStart));\n"
+            indexCode += "    uint out_idx_\(i) = (tid / \(outputStrides[i])) % \(outputShape[i]);\n"
+            indexCode += "    uint in_idx_\(i) = uint(s_\(i)) + out_idx_\(i);\n"
+        }
+
+        var srcPosCalc = "uint srcPos = "
+        for i in 0..<rank {
+            if i > 0 { srcPosCalc += " + " }
+            srcPosCalc += "in_idx_\(i) * \(inputStrides[i])"
+        }
+        srcPosCalc += ";"
+
+        return """
+        kernel void \(entryPoint)(
+        \(params),
+            uint tid [[thread_position_in_grid]])
+        {
+            if (tid >= \(totalElements)) return;
+
+        \(indexCode)
+            \(srcPosCalc)
+            output[tid] = input[srcPos];
+        }
+        """
+    }
+
+    /// Generates a dynamic_update_slice kernel.
+    /// Copies the operand to output, then overwrites the slice region with the update.
+    /// buffer(0) = operand, buffer(1) = update, buffer(2..N+1) = scalar start indices,
+    /// buffer(N+2) = output, buffer(N+3) = count
+    private func generateDynamicUpdateSliceKernel(
+        entryPoint: String,
+        operandShape: [Int],
+        updateShape: [Int],
+        outputShape: [Int],
+        metalType: String,
+        numStartIndices: Int
+    ) -> String {
+        guard !operandShape.isEmpty, !updateShape.isEmpty else {
+            return generateCopyKernel(entryPoint: entryPoint, metalType: metalType)
+        }
+
+        let rank = operandShape.count
+        let totalElements = operandShape.reduce(1, *)
+        let updateElements = updateShape.reduce(1, *)
+
+        // Calculate strides
+        var operandStrides = [Int](repeating: 1, count: rank)
+        var updateStrides = [Int](repeating: 1, count: rank)
+        for i in stride(from: rank - 2, through: 0, by: -1) {
+            operandStrides[i] = operandStrides[i + 1] * operandShape[i + 1]
+            updateStrides[i] = updateStrides[i + 1] * updateShape[i + 1]
+        }
+
+        // Build buffer parameter list
+        var params = "    device const \(metalType)* operand [[buffer(0)]],\n"
+        params += "    device const \(metalType)* update [[buffer(1)]],\n"
+        for i in 0..<rank {
+            params += "    device const int* start_idx_\(i) [[buffer(\(i + 2))]],\n"
+        }
+        params += "    device \(metalType)* output [[buffer(\(rank + 2))]],\n"
+        params += "    constant uint& count [[buffer(\(rank + 3))]]"
+
+        // Generate start index clamping
+        var startCode = ""
+        for i in 0..<rank {
+            let maxStart = operandShape[i] - updateShape[i]
+            startCode += "    int s_\(i) = clamp(start_idx_\(i)[0], 0, \(maxStart));\n"
+        }
+
+        // Generate check: is this thread's position inside the update region?
+        var coordCode = ""
+        var inRegionCheck = ""
+        var updateIdxCalc = "uint updateIdx = "
+        for i in 0..<rank {
+            coordCode += "    uint coord_\(i) = (tid / \(operandStrides[i])) % \(operandShape[i]);\n"
+            coordCode += "    int rel_\(i) = int(coord_\(i)) - s_\(i);\n"
+            if i > 0 { inRegionCheck += " && " }
+            inRegionCheck += "rel_\(i) >= 0 && rel_\(i) < \(updateShape[i])"
+            if i > 0 { updateIdxCalc += " + " }
+            updateIdxCalc += "uint(rel_\(i)) * \(updateStrides[i])"
+        }
+        updateIdxCalc += ";"
+
+        return """
+        kernel void \(entryPoint)(
+        \(params),
+            uint tid [[thread_position_in_grid]])
+        {
+            if (tid >= \(totalElements)) return;
+
+        \(startCode)
+        \(coordCode)
+
+            if (\(inRegionCheck)) {
+                \(updateIdxCalc)
+                output[tid] = update[updateIdx];
+            } else {
+                output[tid] = operand[tid];
+            }
         }
         """
     }
@@ -2445,9 +2628,10 @@ public final class CodeGenerator: @unchecked Sendable {
         let batchSize = lhsShape.count > 2 ? lhsShape.dropLast(2).reduce(1, *) : 1
 
         // Extract M, K, N dimensions
+        // For matvec (RHS is 1D vector), treat as matrix-vector: M×K @ K → M (N=1)
         let M = lhsShape.count >= 2 ? lhsShape[lhsShape.count - 2] : 1
         let K = lhsShape.count >= 1 ? lhsShape[lhsShape.count - 1] : 1
-        let N = rhsShape.count >= 1 ? rhsShape[rhsShape.count - 1] : 1
+        let N = rhsShape.count >= 2 ? rhsShape[rhsShape.count - 1] : 1
 
         // Use optimized simdgroup kernel only for float types with all dims >= 8.
         // simdgroup_load/simdgroup_store always operate on 8x8 tiles and will
@@ -3014,7 +3198,7 @@ public final class CodeGenerator: @unchecked Sendable {
             }
 
             // Phase 2: SIMD reduction within each simdgroup (32 threads)
-            accum = simd_\(reductionKind == .sum || reductionKind == .mean ? "sum" : reductionKind == .max ? "max" : "min")(accum);
+            \(simdReduceCode(reductionKind: reductionKind, varName: "accum"))
 
             // First lane of each simdgroup stores to shared memory
             if (simd_lane == 0) {
@@ -3026,7 +3210,7 @@ public final class CodeGenerator: @unchecked Sendable {
             if (tid < 32) {
                 uint numSimdGroups = (tgSize + 31) / 32;
                 float val = (tid < numSimdGroups) ? shared[tid] : \(initValue);
-                val = simd_\(reductionKind == .sum || reductionKind == .mean ? "sum" : reductionKind == .max ? "max" : "min")(val);
+                \(simdReduceCode(reductionKind: reductionKind, varName: "val"))
 
                 // Thread 0 writes the final result
                 if (tid == 0) {
@@ -3040,6 +3224,37 @@ public final class CodeGenerator: @unchecked Sendable {
         """
 
         return (source, "kernel_reduce", TuningConfig(blockSize: blockSize))
+    }
+
+    /// Generates SIMD reduction code for a given reduction kind.
+    private func simdReduceCode(reductionKind: ReductionKind, varName: String) -> String {
+        switch reductionKind {
+        case .sum, .mean:
+            return "\(varName) = simd_sum(\(varName));"
+        case .max:
+            return "\(varName) = simd_max(\(varName));"
+        case .min:
+            return "\(varName) = simd_min(\(varName));"
+        case .product:
+            // No simd_product intrinsic; use shuffle-based reduction
+            return """
+            for (uint _off = 16; _off > 0; _off /= 2) {
+                        \(varName) *= simd_shuffle_down(\(varName), _off);
+                    }
+            """
+        case .and:
+            return """
+            for (uint _off = 16; _off > 0; _off /= 2) {
+                        \(varName) = float(int(\(varName)) & int(simd_shuffle_down(\(varName), _off)));
+                    }
+            """
+        case .or:
+            return """
+            for (uint _off = 16; _off > 0; _off /= 2) {
+                        \(varName) = float(int(\(varName)) | int(simd_shuffle_down(\(varName), _off)));
+                    }
+            """
+        }
     }
 
     /// Generates attention source.
@@ -3780,52 +3995,58 @@ public final class CodeGenerator: @unchecked Sendable {
         case .original(let opKind):
             switch opKind {
             case .dot, .dotGeneral:
+                // For matvec (1D output), N=1; for matmul (2D+ output), read from output shape
+                let M: Int
+                let N: Int
                 if outputShape.count >= 2 {
-                    let M = outputShape[outputShape.count - 2]
-                    let N = outputShape[outputShape.count - 1]
-                    // Calculate batch size for batched matmul
-                    let batchSize = outputShape.count > 2 ? outputShape.dropLast(2).reduce(1, *) : 1
+                    M = outputShape[outputShape.count - 2]
+                    N = outputShape[outputShape.count - 1]
+                } else {
+                    // matvec: output is 1D (M,), so M = output[0], N = 1
+                    M = outputShape.first ?? 1
+                    N = 1
+                }
+                let batchSize = outputShape.count > 2 ? outputShape.dropLast(2).reduce(1, *) : 1
 
-                    // Tile size for output: 32x32 per threadgroup
-                    let tileSize = 32
-                    let gridWidth = (N + tileSize - 1) / tileSize
-                    let gridHeight = (M + tileSize - 1) / tileSize
+                // Tile size for output: 32x32 per threadgroup
+                let tileSize = 32
+                let gridWidth = (N + tileSize - 1) / tileSize
+                let gridHeight = (M + tileSize - 1) / tileSize
 
-                    // Check if using simdgroup kernel (float types with all dims >= 8)
-                    // or basic tiled (integer types or small float matrices).
-                    // simdgroup_load/store requires 8x8 tiles — small matrices use basic tiled.
-                    let K = inputShapes.first.map { $0.count >= 1 ? $0[$0.count - 1] : 1 } ?? 1
-                    let useSimdgroup = isFloatType(elementType) && M >= 8 && K >= 8 && N >= 8
+                // Check if using simdgroup kernel (float types with all dims >= 8)
+                // or basic tiled (integer types or small float matrices).
+                // simdgroup_load/store requires 8x8 tiles — small matrices use basic tiled.
+                let K = inputShapes.first.map { $0.count >= 1 ? $0[$0.count - 1] : 1 } ?? 1
+                let useSimdgroup = isFloatType(elementType) && M >= 8 && K >= 8 && N >= 8
 
-                    if batchSize > 1 {
-                        // 3D dispatch for batched matmul
-                        if useSimdgroup {
-                            // Simdgroup kernel: 4 simdgroups of 32 threads = 128 threads
-                            return DispatchConfig(
-                                gridSize: MTLSize(width: gridWidth, height: gridHeight, depth: batchSize),
-                                threadgroupSize: MTLSize(width: 128, height: 1, depth: 1)
-                            )
-                        } else {
-                            return DispatchConfig(
-                                gridSize: MTLSize(width: gridWidth, height: gridHeight, depth: batchSize),
-                                threadgroupSize: MTLSize(width: tileSize, height: tileSize, depth: 1)
-                            )
-                        }
+                if batchSize > 1 {
+                    // 3D dispatch for batched matmul
+                    if useSimdgroup {
+                        // Simdgroup kernel: 4 simdgroups of 32 threads = 128 threads
+                        return DispatchConfig(
+                            gridSize: MTLSize(width: gridWidth, height: gridHeight, depth: batchSize),
+                            threadgroupSize: MTLSize(width: 128, height: 1, depth: 1)
+                        )
                     } else {
-                        if useSimdgroup {
-                            return DispatchConfig(
-                                gridSize: MTLSize(width: gridWidth, height: gridHeight, depth: 1),
-                                threadgroupSize: MTLSize(width: 128, height: 1, depth: 1)
-                            )
-                        } else {
-                            // Basic tiled matmul needs the full 32x32 threadgroup to
-                            // initialize all shared memory tile entries. dispatch2D
-                            // would clamp to min(32, matrixDim), leaving tiles uninitialized.
-                            return DispatchConfig(
-                                gridSize: MTLSize(width: gridWidth, height: gridHeight, depth: 1),
-                                threadgroupSize: MTLSize(width: tileSize, height: tileSize, depth: 1)
-                            )
-                        }
+                        return DispatchConfig(
+                            gridSize: MTLSize(width: gridWidth, height: gridHeight, depth: batchSize),
+                            threadgroupSize: MTLSize(width: tileSize, height: tileSize, depth: 1)
+                        )
+                    }
+                } else {
+                    if useSimdgroup {
+                        return DispatchConfig(
+                            gridSize: MTLSize(width: gridWidth, height: gridHeight, depth: 1),
+                            threadgroupSize: MTLSize(width: 128, height: 1, depth: 1)
+                        )
+                    } else {
+                        // Basic tiled matmul needs the full 32x32 threadgroup to
+                        // initialize all shared memory tile entries. dispatch2D
+                        // would clamp to min(32, matrixDim), leaving tiles uninitialized.
+                        return DispatchConfig(
+                            gridSize: MTLSize(width: gridWidth, height: gridHeight, depth: 1),
+                            threadgroupSize: MTLSize(width: tileSize, height: tileSize, depth: 1)
+                        )
                     }
                 }
             case .reduce:
@@ -3928,7 +4149,8 @@ public final class CodeGenerator: @unchecked Sendable {
                 // Reshape uses a non-vectorized copy kernel (1 element per thread).
                 // Must not use the default float32 vectorized dispatch (8 elements/thread).
                 return DispatchConfig.dispatch1D(elements: totalElements, threadgroupSize: 256)
-            case .reverse, .pad, .concatenate, .iota, .select, .clamp:
+            case .reverse, .pad, .concatenate, .iota, .select, .clamp,
+                 .dynamicSlice, .dynamicUpdateSlice:
                 // These kernels are NOT vectorized - 1 thread per element
                 return DispatchConfig.dispatch1D(elements: totalElements, threadgroupSize: 256)
             default:
@@ -4088,9 +4310,10 @@ public final class CodeGenerator: @unchecked Sendable {
                 let rhsShape = inputShapes[1]
 
                 // M = rows of A, K = cols of A = rows of B, N = cols of B
+                // For matvec (RHS is 1D vector), N = 1
                 let M = lhsShape.count >= 2 ? UInt32(lhsShape[lhsShape.count - 2]) : 1
                 let K = lhsShape.count >= 1 ? UInt32(lhsShape[lhsShape.count - 1]) : 1
-                let N = rhsShape.count >= 1 ? UInt32(rhsShape[rhsShape.count - 1]) : 1
+                let N = rhsShape.count >= 2 ? UInt32(rhsShape[rhsShape.count - 1]) : 1
 
                 // Calculate batch size for batched matmul
                 let batchSize = lhsShape.count > 2 ? UInt32(lhsShape.dropLast(2).reduce(1, *)) : 1

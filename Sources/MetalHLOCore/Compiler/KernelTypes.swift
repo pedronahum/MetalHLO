@@ -301,7 +301,11 @@ public struct TensorSpec: Sendable, Hashable {
 
     /// Size in bytes.
     public var byteSize: Int {
-        shape.reduce(1, *) * elementType.byteSize
+        let count = shape.reduce(1, *)
+        if elementType == .int1 {
+            return count  // 1 byte per bool for storage
+        }
+        return count * elementType.byteSize
     }
 
     public init(name: String, shape: [Int], elementType: ElementType) {
