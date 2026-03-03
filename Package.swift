@@ -25,6 +25,11 @@ let package = Package(
             type: .dynamic,
             targets: ["PJRTMetalHLO"]
         ),
+        // ANE Runtime
+        .library(
+            name: "ANERuntime",
+            targets: ["ANERuntime"]
+        ),
         // Benchmark library
         .library(
             name: "MetalHLOBenchmarks",
@@ -95,6 +100,16 @@ let package = Package(
             ]
         ),
 
+        // MARK: - ANE Runtime
+        .target(
+            name: "ANERuntime",
+            dependencies: [],
+            path: "Sources/ANERuntime",
+            linkerSettings: [
+                .linkedFramework("IOSurface"),
+            ]
+        ),
+
         // MARK: - Benchmarks
         .target(
             name: "MetalHLOBenchmarks",
@@ -138,6 +153,11 @@ let package = Package(
             name: "PJRTMetalHLOTests",
             dependencies: ["PJRTMetalHLO", "MetalHLO"],
             path: "Tests/PJRTMetalHLOTests"
+        ),
+        .testTarget(
+            name: "ANERuntimeTests",
+            dependencies: ["ANERuntime"],
+            path: "Tests/ANERuntimeTests"
         ),
     ],
     swiftLanguageModes: [.v6]
