@@ -156,7 +156,7 @@ let package = Package(
         ),
         .testTarget(
             name: "ANERuntimeTests",
-            dependencies: ["ANERuntime"],
+            dependencies: ["ANERuntime", "MetalHLOCore"],
             path: "Tests/ANERuntimeTests"
         ),
     ],

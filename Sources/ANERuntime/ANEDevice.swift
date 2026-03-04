@@ -179,7 +179,14 @@ internal struct ANEBridge: Sendable {
 
     // MARK: - _ANEInMemoryModelDescriptor
 
-    /// +[_ANEInMemoryModelDescriptor modelWithMILText:weights:optionsPlist:]
+    /// Creates a model descriptor from MIL text + weights.
+    ///
+    /// Calls `+[_ANEInMemoryModelDescriptor modelWithMILText:weights:optionsPlist:]`.
+    ///
+    /// Note: The descriptor alone is insufficient for direct ANE compilation.
+    /// `_ANEClient.compileModel:` expects espresso-format models, not raw MIL.
+    /// The MIL→espresso step is handled internally by CoreML's compiler.
+    /// Use CoreML (coremltools) for end-to-end MIL compilation and execution.
     func createModelDescriptor(
         milText: Data,
         weights: NSDictionary,
@@ -188,22 +195,10 @@ internal struct ANEBridge: Sendable {
         let sel = sel_registerName("modelWithMILText:weights:optionsPlist:")
         typealias Fn = @convention(c) (
             AnyClass, Selector,
-            AnyObject,    // milText (NSData)
-            AnyObject,    // weights (NSDictionary)
-            AnyObject?    // optionsPlist (NSData?)
+            AnyObject, AnyObject, AnyObject?
         ) -> AnyObject?
         let fn = unsafeBitCast(msgSend, to: Fn.self)
         return fn(modelDescriptorClass, sel, milText as NSData, weights, optionsPlist as NSData?)
-    }
-
-    // MARK: - _ANEModel property access
-
-    /// Read the programHandle property from an _ANEModel
-    func getProgramHandle(model: AnyObject) -> UInt {
-        let sel = sel_registerName("programHandle")
-        typealias Fn = @convention(c) (AnyObject, Selector) -> UInt
-        let fn = unsafeBitCast(msgSend, to: Fn.self)
-        return fn(model, sel)
     }
 
     // MARK: - _ANEIOSurfaceObject
