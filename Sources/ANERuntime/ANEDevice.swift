@@ -336,6 +336,9 @@ public final class ANEDevice: @unchecked Sendable {
     /// The availability detector (retains dlopen handle).
     private let availabilityDetector: ANEAvailability
 
+    /// CoreML bridge for compiling and executing MIL programs via CoreML.
+    private let coreMLBridge = CoreMLBridge()
+
     private let lock = NSLock()
 
     /// Creates an ANEDevice. Returns nil if ANE is not available.
@@ -596,5 +599,50 @@ public final class ANEDevice: @unchecked Sendable {
         }
         try buffer.writeFloat32(data, shape: shape)
         return buffer
+    }
+
+    // MARK: - CoreML Compilation Path
+
+    /// Compiles a MIL program via CoreML (MLModel) for ANE execution.
+    ///
+    /// This is the recommended path for executing MIL programs on the ANE.
+    /// CoreML handles the MIL→espresso conversion internally.
+    ///
+    /// - Parameters:
+    ///   - inputs: Function input names and shapes.
+    ///   - operations: CoreML MIL operations in topological order.
+    ///   - returnVar: Name of the return variable.
+    ///   - weightsData: Optional concatenated weight blob.
+    /// - Returns: A compiled CoreMLProgram ready for execution.
+    public func compileWithCoreML(
+        inputs: [(name: String, shape: [Int])],
+        operations: [CoreMLOp],
+        returnVar: String,
+        weightsData: Data? = nil
+    ) throws -> CoreMLProgram {
+        try coreMLBridge.compile(
+            inputs: inputs,
+            operations: operations,
+            returnVar: returnVar,
+            weightsData: weightsData
+        )
+    }
+
+    /// Executes a compiled CoreML program with Float32 input arrays.
+    ///
+    /// - Parameters:
+    ///   - program: A compiled CoreMLProgram.
+    ///   - inputs: Named input arrays with shapes.
+    /// - Returns: Output as flat Float32 array.
+    public func executeWithCoreML(
+        _ program: CoreMLProgram,
+        inputs: [(name: String, data: [Float], shape: [Int])]
+    ) throws -> [Float] {
+        try coreMLBridge.execute(program, inputs: inputs)
+    }
+
+    /// Clears the CoreML model cache.
+    public func clearCoreMLCache() {
+        coreMLBridge.clearCache()
     }
 }

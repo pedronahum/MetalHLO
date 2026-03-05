@@ -1,82 +1,18 @@
 // ANEMILIntegrationTests.swift
 // ANERuntimeTests
 //
-// Integration tests that verify MIL programs produce correct results.
-// Uses coremltools (Python) to compile and execute MIL programs,
-// validating the MIL emitter's output end-to-end.
+// Integration tests that verify the full HLO → CoreMLOp → CoreML pipeline.
+// Uses CoreMLBridge (pure Swift, no Python) to compile and execute models.
 
 import Testing
 import Foundation
 @testable import MetalHLOCore
+@testable import ANERuntime
 
 @Suite("ANE MIL Integration", .serialized)
 struct ANEMILIntegrationTests {
 
-    /// Path to the Python interpreter with coremltools installed.
-    private static let pythonPath = "/Users/pedro/miniforge3/bin/python"
-
-    /// Verifies a MIL program produces expected results by compiling and
-    /// executing via coremltools/CoreML.
-    ///
-    /// The verification flow:
-    /// 1. MIL emitter produces MIL text from HLO IR
-    /// 2. Python/coremltools rebuilds equivalent model from MIL ops
-    /// 3. CoreML compiles and executes on ANE/CPU
-    /// 4. Results are compared against expected values
-    private func verifyMIL(
-        milText: String,
-        inputNames: [String],
-        inputValues: [[Float]],
-        outputName: String,
-        expectedOutput: [Float],
-        tolerance: Float = 0.1
-    ) throws {
-        // Build Python script to verify
-        let inputDicts = zip(inputNames, inputValues).map { name, values in
-            "'\(name)': np.array([\(values.map { String($0) }.joined(separator: ", "))], dtype=np.float32)"
-        }.joined(separator: ", ")
-
-        let expectedStr = expectedOutput.map { String($0) }.joined(separator: ", ")
-
-        let script = """
-        import sys, json
-        import numpy as np
-        try:
-            import coremltools as ct
-            mb = ct.converters.mil.Builder
-
-            # Reconstruct model from MIL text description
-            mil_text = \"\"\"\(milText)\"\"\"
-
-            # Parse the MIL to understand inputs and ops
-            inputs = {\(inputDicts)}
-            expected = np.array([\(expectedStr)], dtype=np.float32)
-
-            # The MIL text is valid - verified by unit tests
-            # Use coremltools prediction to verify numerical correctness
-            # Build equivalent model programmatically
-            result_json = {"status": "ok", "verified": True}
-            print(json.dumps(result_json))
-        except Exception as e:
-            print(json.dumps({"status": "error", "message": str(e)}))
-        """
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: Self.pythonPath)
-        process.arguments = ["-c", script]
-
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
-
-        try process.run()
-        process.waitUntilExit()
-
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        let output = String(data: data, encoding: .utf8) ?? ""
-
-        #expect(!output.isEmpty, "Python verification produced no output")
-    }
+    private let bridge = CoreMLBridge()
 
     // MARK: - MIL Text Format Verification
 
@@ -113,10 +49,10 @@ struct ANEMILIntegrationTests {
         #expect(text.contains("-> (0);"), "Missing return statement")
     }
 
-    // MARK: - Numerical Verification via coremltools
+    // MARK: - CoreMLOpBuilder Conversion
 
-    @Test("Add produces correct MIL and numerical results")
-    func addVerification() throws {
+    @Test("CoreMLOpBuilder produces correct ops from HLO add")
+    func coreMLOpBuilderAdd() throws {
         let function = HLOFunction(
             name: "main",
             inputs: [
@@ -135,181 +71,205 @@ struct ANEMILIntegrationTests {
             returnValues: ["%0"]
         )
 
-        let emitter = MILEmitter()
-        let program = try emitter.emit(function: function)
+        let builder = CoreMLOpBuilder()
+        let (inputs, ops, returnVar) = try builder.build(function: function)
 
-        // Verify MIL text structure
-        #expect(program.milText.contains("add(x=x, y=y)"))
-
-        // Verify numerics via coremltools
-        try verifyCoreML(
-            opName: "add",
-            inputShapes: [4],
-            inputCount: 2,
-            inputValues: [[1, 2, 3, 4], [5, 6, 7, 8]],
-            expectedOutput: [6, 8, 10, 12]
-        )
+        #expect(inputs.count == 2)
+        #expect(inputs[0].name == "x")
+        #expect(inputs[1].name == "y")
+        #expect(ops.count == 1)
+        #expect(ops[0].op == "add")
+        #expect(ops[0].result == "v0")
+        #expect(ops[0].shape == [4])
+        #expect(returnVar == "v0")
     }
 
-    @Test("Multiply produces correct numerical results")
-    func multiplyVerification() throws {
-        try verifyCoreML(
-            opName: "mul",
-            inputShapes: [4],
-            inputCount: 2,
-            inputValues: [[2, 3, 4, 5], [10, 20, 30, 40]],
-            expectedOutput: [20, 60, 120, 200]
+    // MARK: - End-to-End: HLO → CoreMLOps → CoreML Execution
+
+    @Test("Add: HLO → CoreML end-to-end")
+    func addEndToEnd() throws {
+        let function = makeFunction(
+            inputs: [("%x", [4]), ("%y", [4])],
+            ops: [("%0", .add, ["%x", "%y"], [4])],
+            returnVar: "%0"
         )
+
+        let result = try compileAndExecute(
+            function: function,
+            inputs: [
+                ("x", [1, 2, 3, 4], [4]),
+                ("y", [5, 6, 7, 8], [4]),
+            ]
+        )
+
+        assertClose(result, expected: [6, 8, 10, 12], tolerance: 0.1)
     }
 
-    @Test("Sigmoid produces correct numerical results")
-    func sigmoidVerification() throws {
-        try verifyCoreML(
-            opName: "sigmoid",
-            inputShapes: [4],
-            inputCount: 1,
-            inputValues: [[0, 1, -1, 10]],
-            expectedOutput: [0.5, 0.731, 0.269, 1.0],
-            tolerance: 0.05
+    @Test("Multiply: HLO → CoreML end-to-end")
+    func multiplyEndToEnd() throws {
+        let function = makeFunction(
+            inputs: [("%x", [4]), ("%y", [4])],
+            ops: [("%0", .multiply, ["%x", "%y"], [4])],
+            returnVar: "%0"
         )
+
+        let result = try compileAndExecute(
+            function: function,
+            inputs: [
+                ("x", [2, 3, 4, 5], [4]),
+                ("y", [10, 20, 30, 40], [4]),
+            ]
+        )
+
+        assertClose(result, expected: [20, 60, 120, 200], tolerance: 1.0)
     }
 
-    @Test("Exp produces correct numerical results")
-    func expVerification() throws {
-        try verifyCoreML(
-            opName: "exp",
-            inputShapes: [4],
-            inputCount: 1,
-            inputValues: [[0, 1, -1, 2]],
-            expectedOutput: [1.0, 2.718, 0.368, 7.389],
-            tolerance: 0.05
+    @Test("Sigmoid: HLO → CoreML end-to-end")
+    func sigmoidEndToEnd() throws {
+        let function = makeFunction(
+            inputs: [("%x", [4])],
+            ops: [("%0", .logistic, ["%x"], [4])],
+            returnVar: "%0"
         )
+
+        let result = try compileAndExecute(
+            function: function,
+            inputs: [("x", [0, 1, -1, 10], [4])]
+        )
+
+        assertClose(result, expected: [0.5, 0.731, 0.269, 1.0], tolerance: 0.05)
     }
 
-    @Test("Chain: multiply then add produces correct results")
-    func chainMulAddVerification() throws {
-        // Build: y = x0 * x1 + x2
-        let script = """
-        import sys, json, numpy as np
-        try:
-            import coremltools as ct
-            mb = ct.converters.mil.Builder
+    @Test("Exp: HLO → CoreML end-to-end")
+    func expEndToEnd() throws {
+        let function = makeFunction(
+            inputs: [("%x", [4])],
+            ops: [("%0", .exponential, ["%x"], [4])],
+            returnVar: "%0"
+        )
 
-            @mb.program(input_specs=[mb.TensorSpec(shape=(4,)), mb.TensorSpec(shape=(4,)), mb.TensorSpec(shape=(4,))])
-            def prog(x0, x1, x2):
-                t = mb.mul(x=x0, y=x1)
-                return mb.add(x=t, y=x2)
+        let result = try compileAndExecute(
+            function: function,
+            inputs: [("x", [0, 1, -1, 2], [4])]
+        )
 
-            model = ct.convert(prog, compute_units=ct.ComputeUnit.ALL, minimum_deployment_target=ct.target.macOS14)
-            result = model.predict({
-                'x0': np.array([2, 3, 4, 5], dtype=np.float32),
-                'x1': np.array([10, 10, 10, 10], dtype=np.float32),
-                'x2': np.array([1, 1, 1, 1], dtype=np.float32),
-            })
-            output = list(result.values())[0].flatten().tolist()
-            expected = [21, 31, 41, 51]
-            max_err = max(abs(a - b) for a, b in zip(output, expected))
-            print(json.dumps({"status": "ok", "max_error": max_err, "output": output}))
-        except Exception as e:
-            print(json.dumps({"status": "error", "message": str(e)}))
-        """
+        assertClose(result, expected: [1.0, 2.718, 0.368, 7.389], tolerance: 0.05)
+    }
 
-        let result = try runPython(script)
-        #expect(result["status"] as? String == "ok",
-               "Chain mul+add failed: \(result["message"] ?? "unknown")")
-        if let maxErr = result["max_error"] as? Double {
-            #expect(maxErr < 1.0, "Chain mul+add max error \(maxErr) exceeds tolerance")
-        }
+    @Test("Chain: multiply then add (HLO → CoreML)")
+    func chainMulAddEndToEnd() throws {
+        // y = x0 * x1 + x2
+        let function = HLOFunction(
+            name: "main",
+            inputs: [
+                HLOArgument(name: "%x0", type: TensorType(shape: [4], elementType: .float16)),
+                HLOArgument(name: "%x1", type: TensorType(shape: [4], elementType: .float16)),
+                HLOArgument(name: "%x2", type: TensorType(shape: [4], elementType: .float16)),
+            ],
+            outputTypes: [TensorType(shape: [4], elementType: .float16)],
+            operations: [
+                HLOOperation(result: "%0", kind: .multiply,
+                             operands: ["%x0", "%x1"],
+                             resultType: TensorType(shape: [4], elementType: .float16)),
+                HLOOperation(result: "%1", kind: .add,
+                             operands: ["%0", "%x2"],
+                             resultType: TensorType(shape: [4], elementType: .float16)),
+            ],
+            returnValues: ["%1"]
+        )
+
+        let result = try compileAndExecute(
+            function: function,
+            inputs: [
+                ("x0", [2, 3, 4, 5], [4]),
+                ("x1", [10, 10, 10, 10], [4]),
+                ("x2", [1, 1, 1, 1], [4]),
+            ]
+        )
+
+        assertClose(result, expected: [21, 31, 41, 51], tolerance: 1.0)
+    }
+
+    @Test("Subtract: HLO → CoreML end-to-end")
+    func subtractEndToEnd() throws {
+        let function = makeFunction(
+            inputs: [("%x", [4]), ("%y", [4])],
+            ops: [("%0", .subtract, ["%x", "%y"], [4])],
+            returnVar: "%0"
+        )
+
+        let result = try compileAndExecute(
+            function: function,
+            inputs: [
+                ("x", [10, 20, 30, 40], [4]),
+                ("y", [1, 2, 3, 4], [4]),
+            ]
+        )
+
+        assertClose(result, expected: [9, 18, 27, 36], tolerance: 0.1)
+    }
+
+    @Test("Tanh: HLO → CoreML end-to-end")
+    func tanhEndToEnd() throws {
+        let function = makeFunction(
+            inputs: [("%x", [4])],
+            ops: [("%0", .tanh, ["%x"], [4])],
+            returnVar: "%0"
+        )
+
+        let result = try compileAndExecute(
+            function: function,
+            inputs: [("x", [0, 1, -1, 2], [4])]
+        )
+
+        assertClose(result, expected: [0.0, 0.762, -0.762, 0.964], tolerance: 0.05)
     }
 
     // MARK: - Helpers
 
-    /// Verifies a single MIL operation via coremltools.
-    private func verifyCoreML(
-        opName: String,
-        inputShapes: [Int],
-        inputCount: Int,
-        inputValues: [[Float]],
-        expectedOutput: [Float],
-        tolerance: Float = 0.1
-    ) throws {
-        let shape = inputShapes[0]
-
-        // Build coremltools program dynamically
-        let inputSpecs = (0..<inputCount).map { _ in
-            "mb.TensorSpec(shape=(\(shape),))"
-        }.joined(separator: ", ")
-
-        let inputNames = (0..<inputCount).map { "x\($0)" }.joined(separator: ", ")
-
-        let opCall: String
-        if inputCount == 1 {
-            opCall = "mb.\(opName)(x=x0)"
-        } else {
-            opCall = "mb.\(opName)(x=x0, y=x1)"
-        }
-
-        let inputDict = (0..<inputCount).map { i in
-            "'x\(i)': np.array([\(inputValues[i].map { String($0) }.joined(separator: ", "))], dtype=np.float32)"
-        }.joined(separator: ", ")
-
-        let expectedStr = expectedOutput.map { String($0) }.joined(separator: ", ")
-
-        let script = """
-        import sys, json, numpy as np
-        try:
-            import coremltools as ct
-            mb = ct.converters.mil.Builder
-
-            @mb.program(input_specs=[\(inputSpecs)])
-            def prog(\(inputNames)):
-                return \(opCall)
-
-            model = ct.convert(prog, compute_units=ct.ComputeUnit.ALL, minimum_deployment_target=ct.target.macOS14)
-            result = model.predict({\(inputDict)})
-            output = list(result.values())[0].flatten().tolist()
-            expected = [\(expectedStr)]
-            max_err = max(abs(a - b) for a, b in zip(output, expected))
-            print(json.dumps({"status": "ok", "max_error": max_err, "output": output}))
-        except Exception as e:
-            print(json.dumps({"status": "error", "message": str(e)}))
-        """
-
-        let result = try runPython(script)
-        #expect(result["status"] as? String == "ok",
-               "\(opName) verification failed: \(result["message"] ?? "unknown")")
-        if let maxErr = result["max_error"] as? Double {
-            #expect(maxErr < Double(tolerance),
-                   "\(opName) max error \(maxErr) exceeds tolerance \(tolerance)")
-        }
+    /// Creates a simple HLO function for testing.
+    private func makeFunction(
+        inputs: [(String, [Int])],
+        ops: [(String, HLOOpKind, [String], [Int])],
+        returnVar: String
+    ) -> HLOFunction {
+        HLOFunction(
+            name: "main",
+            inputs: inputs.map { name, shape in
+                HLOArgument(name: name, type: TensorType(shape: shape, elementType: .float16))
+            },
+            outputTypes: [TensorType(shape: ops.last!.3, elementType: .float16)],
+            operations: ops.map { result, kind, operands, shape in
+                HLOOperation(result: result, kind: kind, operands: operands,
+                             resultType: TensorType(shape: shape, elementType: .float16))
+            },
+            returnValues: [returnVar]
+        )
     }
 
-    /// Runs a Python script and returns the parsed JSON output.
-    private func runPython(_ script: String) throws -> [String: Any] {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: Self.pythonPath)
-        process.arguments = ["-c", script]
+    /// Full pipeline: HLO → CoreMLOpBuilder → CoreMLBridge → results.
+    private func compileAndExecute(
+        function: HLOFunction,
+        inputs: [(name: String, data: [Float], shape: [Int])]
+    ) throws -> [Float] {
+        let builder = CoreMLOpBuilder()
+        let (coremlInputs, ops, returnVar) = try builder.build(function: function)
 
-        let outPipe = Pipe()
-        let errPipe = Pipe()
-        process.standardOutput = outPipe
-        process.standardError = errPipe
+        let program = try bridge.compile(
+            inputs: coremlInputs,
+            operations: ops,
+            returnVar: returnVar
+        )
 
-        try process.run()
-        process.waitUntilExit()
+        return try bridge.execute(program, inputs: inputs)
+    }
 
-        let data = outPipe.fileHandleForReading.readDataToEndOfFile()
-        let output = String(data: data, encoding: .utf8) ?? ""
-
-        // Find last JSON line
-        let lines = output.split(separator: "\n")
-        guard let jsonLine = lines.last(where: { $0.hasPrefix("{") }),
-              let jsonData = jsonLine.data(using: .utf8),
-              let json = try JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else {
-            let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
-            let errStr = String(data: errData, encoding: .utf8) ?? ""
-            return ["status": "error", "message": "Failed to parse output: \(output) stderr: \(errStr)"]
+    /// Asserts that actual values are close to expected values.
+    private func assertClose(_ actual: [Float], expected: [Float], tolerance: Float) {
+        #expect(actual.count == expected.count,
+               "Count mismatch: got \(actual.count), expected \(expected.count)")
+        for (a, b) in zip(actual, expected) {
+            #expect(abs(a - b) < tolerance, "Expected \(b), got \(a)")
         }
-        return json
     }
 }

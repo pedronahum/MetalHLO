@@ -66,7 +66,7 @@ let package = Package(
         // MARK: - Core Implementation
         .target(
             name: "MetalHLOCore",
-            dependencies: [],
+            dependencies: ["ANERuntime"],
             path: "Sources/MetalHLOCore",
             linkerSettings: [
                 .linkedFramework("Metal"),
@@ -107,6 +107,7 @@ let package = Package(
             path: "Sources/ANERuntime",
             linkerSettings: [
                 .linkedFramework("IOSurface"),
+                .linkedFramework("CoreML"),
             ]
         ),
 

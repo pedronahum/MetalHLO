@@ -33,6 +33,12 @@ public enum ANEError: Error, Sendable, CustomStringConvertible {
     /// An internal error in the ANE runtime.
     case internalError(String)
 
+    /// CoreML model compilation failed.
+    case coreMLCompilationFailed(String)
+
+    /// Protobuf serialization failed.
+    case protobufSerializationFailed(String)
+
     // MARK: - CustomStringConvertible
 
     public var description: String {
@@ -55,6 +61,10 @@ public enum ANEError: Error, Sendable, CustomStringConvertible {
             return "Unsupported ANE data type: \(dtype)"
         case .internalError(let reason):
             return "ANE internal error: \(reason)"
+        case .coreMLCompilationFailed(let reason):
+            return "CoreML compilation failed: \(reason)"
+        case .protobufSerializationFailed(let reason):
+            return "Protobuf serialization failed: \(reason)"
         }
     }
 }
