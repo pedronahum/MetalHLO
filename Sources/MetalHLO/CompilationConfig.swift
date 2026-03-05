@@ -6,6 +6,20 @@
 import Foundation
 import MetalHLOCore
 
+/// Device execution policy for heterogeneous GPU+ANE execution.
+public enum DevicePolicy: String, Sendable, CaseIterable {
+    /// GPU only (default). No ANE partitioning.
+    case gpuOnly
+    /// Force all compatible ops to ANE.
+    case aneOnly
+    /// Partitioner decides based on cost model.
+    case auto
+    /// Bias toward ANE when cost is similar.
+    case preferANE
+    /// Bias toward GPU when cost is similar.
+    case preferGPU
+}
+
 /// Optimization level for compilation.
 ///
 /// Higher optimization levels apply more aggressive transformations
@@ -64,6 +78,12 @@ public struct CompilationConfig: Sendable {
     /// Passes to disable even if they would normally run at the selected optimization level.
     public var disabledPasses: Set<String>
 
+    /// Device execution policy for heterogeneous GPU+ANE execution.
+    ///
+    /// Controls whether and how the compiler partitions the computation
+    /// graph between GPU and Apple Neural Engine.
+    public var devicePolicy: DevicePolicy
+
     // MARK: - Initialization
 
     /// Creates a compilation configuration with the specified options.
@@ -74,18 +94,21 @@ public struct CompilationConfig: Sendable {
     ///   - generateDebugInfo: Whether to generate debug info (default: `false`).
     ///   - enabledPasses: Specific passes to enable (nil = use level defaults).
     ///   - disabledPasses: Passes to disable (default: empty).
+    ///   - devicePolicy: Device execution policy (default: `.gpuOnly`).
     public init(
         optimizationLevel: OptimizationLevel = .O2,
         enableCaching: Bool = true,
         generateDebugInfo: Bool = false,
         enabledPasses: Set<String>? = nil,
-        disabledPasses: Set<String> = []
+        disabledPasses: Set<String> = [],
+        devicePolicy: DevicePolicy = .gpuOnly
     ) {
         self.optimizationLevel = optimizationLevel
         self.enableCaching = enableCaching
         self.generateDebugInfo = generateDebugInfo
         self.enabledPasses = enabledPasses
         self.disabledPasses = disabledPasses
+        self.devicePolicy = devicePolicy
     }
 
     // MARK: - Presets

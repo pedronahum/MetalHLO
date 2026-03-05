@@ -4,6 +4,7 @@
 
 import Foundation
 import Metal
+import ANERuntime
 
 // MARK: - ANE Compatibility Analysis
 
@@ -111,18 +112,31 @@ public final class ANEAnalyzer: @unchecked Sendable {
     }
 
     /// Operations that are typically optimal on ANE
+    /// Aligned with MILOpTranslator.isSupported()
     private static let aneOptimalOps: Set<HLOOpKind> = [
         .convolution,
         .dot,
+        .dotGeneral,
     ]
 
-    /// Operations that can run on ANE but may not be optimal
+    /// Operations that can run on ANE but may not be optimal.
+    /// Aligned with MILOpTranslator.isSupported()
     private static let aneCompatibleOps: Set<HLOOpKind> = [
+        // P0: Binary arithmetic
         .add, .multiply, .subtract, .divide,
-        .tanh, .exponential, .log,
         .maximum, .minimum,
-        .reduce,
-        .reshape, .transpose,
+        // P0: Shape manipulation
+        .reshape, .transpose, .broadcastInDim,
+        // P1: Unary
+        .negate, .abs, .exponential, .tanh, .logistic,
+        // P1: Aggregate/indexing
+        .reduce, .concatenate, .slice,
+        // P1: Comparison/selection
+        .compare, .select,
+        // P2: Additional math
+        .power, .log, .sqrt, .rsqrt,
+        // Constants
+        .constant,
     ]
 
     /// Operations that cannot run on ANE
@@ -131,6 +145,9 @@ public final class ANEAnalyzer: @unchecked Sendable {
         .scatter, .gather,
         .sort,
         .rng, .rngBitGenerator,
+        .fft,
+        .complex, .real, .imag,
+        .whileOp, .ifOp,
     ]
 
     private let config: Config
@@ -228,13 +245,59 @@ public final class ANEAnalyzer: @unchecked Sendable {
         )
     }
 
-    /// Analyzes an entire function for ANE compatibility
+    /// Analyzes an entire function for ANE compatibility.
+    ///
+    /// Applies a chaining bonus: when consecutive ops are all ANE-compatible,
+    /// the per-op dispatch overhead is amortized across the chain (CoreML
+    /// batches chains into a single ANE dispatch).
     public func analyzeFunction(_ function: HLOFunction) -> FunctionANEAnalysis {
+        // First pass: analyze each op individually
         var analyses: [ANEOperationAnalysis] = []
-
         for operation in function.operations {
-            let analysis = analyze(operation)
-            analyses.append(analysis)
+            analyses.append(analyze(operation))
+        }
+
+        // Second pass: apply chaining bonus for consecutive ANE-compatible ops
+        var chainStart = 0
+        while chainStart < analyses.count {
+            guard analyses[chainStart].compatibility != .incompatible else {
+                chainStart += 1
+                continue
+            }
+
+            // Find chain end
+            var chainEnd = chainStart + 1
+            while chainEnd < analyses.count && analyses[chainEnd].compatibility != .incompatible {
+                chainEnd += 1
+            }
+
+            let chainLength = chainEnd - chainStart
+            if chainLength >= 2 {
+                // Amortize dispatch overhead across chain.
+                // Single dispatch overhead instead of per-op overhead.
+                let overheadMs = config.aneOverheadNs / 1_000_000.0
+                let perOpOverhead = overheadMs / Double(chainLength)
+
+                for i in chainStart..<chainEnd {
+                    let original = analyses[i]
+                    // Subtract the per-op overhead and add amortized share
+                    let adjustedANETime = max(
+                        original.estimatedANETime - overheadMs + perOpOverhead,
+                        0.001
+                    )
+                    analyses[i] = ANEOperationAnalysis(
+                        operationId: original.operationId,
+                        operationType: original.operationType,
+                        compatibility: original.compatibility,
+                        estimatedANETime: adjustedANETime,
+                        estimatedGPUTime: original.estimatedGPUTime,
+                        reason: original.reason + " (chain bonus: \(chainLength) ops)",
+                        constraints: original.constraints
+                    )
+                }
+            }
+
+            chainStart = chainEnd
         }
 
         return FunctionANEAnalysis(
@@ -429,6 +492,11 @@ public final class GPUANEPartitioner: @unchecked Sendable {
         // Build dependency graph
         let dependencies = buildDependencyGraph(function)
 
+        // Build op map for tensor size lookups
+        let opMap = Dictionary(
+            uniqueKeysWithValues: function.operations.map { ($0.result, $0) }
+        )
+
         // Assign operations to devices
         var assignments: [String: ExecutionDevice] = [:]
         for opAnalysis in analysis.operationAnalyses {
@@ -444,9 +512,9 @@ public final class GPUANEPartitioner: @unchecked Sendable {
         // Determine execution order
         let executionOrder = determineExecutionOrder(optimizedPartitions, dependencies: dependencies)
 
-        // Calculate timing estimates
+        // Calculate timing estimates using actual tensor sizes
         let totalTime = optimizedPartitions.reduce(0.0) { $0 + $1.estimatedTimeMs }
-        let transferTime = calculateTransferTime(optimizedPartitions)
+        let transferTime = calculateTransferTime(optimizedPartitions, opMap: opMap, function: function)
         let canPipeline = config.enablePipelining && checkPipeliningPossible(optimizedPartitions)
 
         return PartitionPlan(
@@ -640,18 +708,32 @@ public final class GPUANEPartitioner: @unchecked Sendable {
         return Array(0..<partitions.count)
     }
 
-    /// Calculates estimated transfer time between devices
-    private func calculateTransferTime(_ partitions: [DevicePartition]) -> Double {
+    /// Calculates estimated transfer time between devices using actual tensor sizes.
+    private func calculateTransferTime(
+        _ partitions: [DevicePartition],
+        opMap: [String: HLOOperation],
+        function: HLOFunction
+    ) -> Double {
+        let inputMap = Dictionary(uniqueKeysWithValues: function.inputs.map { ($0.name, $0.type) })
         var totalBytes = 0
 
         for partition in partitions {
-            // Estimate bytes based on tensor count
-            // In practice, this would use actual tensor sizes
-            totalBytes += partition.inputTensors.count * 4096 * 4 // Assume 4KB * 4 bytes
-            totalBytes += partition.outputTensors.count * 4096 * 4
+            for tensorName in partition.inputTensors {
+                if let op = opMap[tensorName] {
+                    totalBytes += op.resultType.byteCount
+                } else if let inputType = inputMap[tensorName] {
+                    totalBytes += inputType.byteCount
+                }
+            }
+            for tensorName in partition.outputTensors {
+                if let op = opMap[tensorName] {
+                    totalBytes += op.resultType.byteCount
+                }
+            }
         }
 
-        // Estimate transfer bandwidth at ~10 GB/s for unified memory
+        // On Apple Silicon unified memory, "transfer" is mostly API conversion overhead.
+        // Estimate ~10 GB/s effective bandwidth for the conversion.
         let bytesPerMs = 10_000_000.0
         return Double(totalBytes) / bytesPerMs
     }
@@ -690,115 +772,112 @@ public final class HeterogeneousExecutor: @unchecked Sendable {
         }
     }
 
-    /// Execution context for a device
-    public struct DeviceContext: Sendable {
-        public let device: ExecutionDevice
-        public let commandQueue: MTLCommandQueue?
-        public let isAvailable: Bool
-
-        public init(device: ExecutionDevice, commandQueue: MTLCommandQueue?, isAvailable: Bool) {
-            self.device = device
-            self.commandQueue = commandQueue
-            self.isAvailable = isAvailable
-        }
-    }
-
     /// Configuration for heterogeneous execution
     public struct Config: Sendable {
         public var enableANE: Bool
         public var enableGPU: Bool
         public var enableCPUFallback: Bool
-        public var maxConcurrentPartitions: Int
-        public var syncStrategy: SyncStrategy
-
-        public enum SyncStrategy: String, Sendable {
-            case barrier     // Full barrier between partitions
-            case event       // Event-based synchronization
-            case fence       // Memory fence only
-        }
 
         public static let `default` = Config(
             enableANE: true,
             enableGPU: true,
-            enableCPUFallback: true,
-            maxConcurrentPartitions: 2,
-            syncStrategy: .event
+            enableCPUFallback: true
         )
 
         public init(
             enableANE: Bool,
             enableGPU: Bool,
-            enableCPUFallback: Bool,
-            maxConcurrentPartitions: Int,
-            syncStrategy: SyncStrategy
+            enableCPUFallback: Bool
         ) {
             self.enableANE = enableANE
             self.enableGPU = enableGPU
             self.enableCPUFallback = enableCPUFallback
-            self.maxConcurrentPartitions = maxConcurrentPartitions
-            self.syncStrategy = syncStrategy
         }
     }
 
     private let config: Config
     private let partitioner: GPUANEPartitioner
-    private var gpuContext: DeviceContext?
+    private let metalExecutor: MetalExecutor
+    private let coreMLBridge: ANERuntime.CoreMLBridge
+    private var transferManager: TensorTransferManager
     private var stats: ExecutionStats
     private let lock = NSLock()
 
-    public init(config: Config = .default, partitioner: GPUANEPartitioner? = nil) {
+    /// Cache of compiled CoreML programs keyed by partition op hash.
+    private var aneCache: [String: ANERuntime.CoreMLProgram] = [:]
+
+    public init(
+        metalExecutor: MetalExecutor,
+        config: Config = .default,
+        partitioner: GPUANEPartitioner? = nil
+    ) {
         self.config = config
         self.partitioner = partitioner ?? GPUANEPartitioner()
+        self.metalExecutor = metalExecutor
+        self.coreMLBridge = ANERuntime.CoreMLBridge()
+        self.transferManager = TensorTransferManager(device: metalExecutor.device)
         self.stats = ExecutionStats()
     }
 
-    /// Initializes device contexts
-    public func initialize(device: MTLDevice) throws {
-        guard let commandQueue = device.makeCommandQueue() else {
-            throw HeterogeneousExecutorError.deviceInitializationFailed("Failed to create command queue")
-        }
-
-        gpuContext = DeviceContext(
-            device: .gpu,
-            commandQueue: commandQueue,
-            isAvailable: true
-        )
-
-        // Note: ANE initialization would require CoreML or Metal Performance Shaders
-        // For this implementation, we simulate ANE availability
-    }
-
-    /// Executes a function using heterogeneous devices
+    /// Executes a function using heterogeneous devices.
+    ///
+    /// Partitions the function between GPU and ANE, executes each partition
+    /// on its assigned device, and transfers tensors between devices at
+    /// partition boundaries.
+    ///
+    /// - Parameters:
+    ///   - function: The HLO function to execute.
+    ///   - inputs: Named input BufferStorages.
+    /// - Returns: Execution result with per-partition timing and output storages.
     public func execute(
         _ function: HLOFunction,
-        inputs: [String: MTLBuffer]
+        inputs: [String: BufferStorage]
     ) throws -> HeterogeneousExecutionResult {
         let startTime = DispatchTime.now()
 
         // Partition the function
         let plan = partitioner.partition(function)
 
-        // Create execution plan
+        // Reset transfer manager for this execution
+        transferManager.clear()
+
+        // Store initial inputs in transfer manager
+        for (name, storage) in inputs {
+            transferManager.storeGPUResult(name: name, storage: storage)
+        }
+
         var partitionResults: [PartitionResult] = []
         var localStats = ExecutionStats()
 
-        // Execute partitions in order
+        // Execute partitions sequentially
         for partitionIndex in plan.executionOrder {
             let partition = plan.partitions[partitionIndex]
 
-            let result = try executePartition(
-                partition,
-                function: function,
-                inputs: inputs
-            )
+            let result: PartitionResult
+            do {
+                result = try executePartition(partition, function: function)
+            } catch {
+                // ANE failure: fall back to GPU if enabled
+                if partition.device == .ane && config.enableCPUFallback {
+                    let gpuPartition = GPUANEPartitioner.DevicePartition(
+                        device: .gpu,
+                        operationIds: partition.operationIds,
+                        estimatedTimeMs: partition.estimatedTimeMs,
+                        inputTensors: partition.inputTensors,
+                        outputTensors: partition.outputTensors
+                    )
+                    result = try executePartition(gpuPartition, function: function)
+                } else {
+                    throw error
+                }
+            }
 
             partitionResults.append(result)
 
-            // Update stats
             localStats.partitionsExecuted += 1
             localStats.operationsExecuted += partition.operationIds.count
 
-            switch partition.device {
+            switch result.device {
             case .gpu:
                 localStats.gpuTimeMs += result.executionTimeMs
             case .ane:
@@ -814,7 +893,6 @@ public final class HeterogeneousExecutor: @unchecked Sendable {
         localStats.totalTimeMs = totalTime
         localStats.transferTimeMs = plan.estimatedTransferTimeMs
 
-        // Update global stats
         lock.lock()
         stats.gpuTimeMs += localStats.gpuTimeMs
         stats.aneTimeMs += localStats.aneTimeMs
@@ -824,29 +902,45 @@ public final class HeterogeneousExecutor: @unchecked Sendable {
         stats.partitionsExecuted += localStats.partitionsExecuted
         lock.unlock()
 
+        // Collect outputs for the original function's return values
+        var outputStorages: [String: BufferStorage] = [:]
+        for retVal in function.returnValues {
+            if let storage = try? transferManager.getBufferStorage(name: retVal) {
+                outputStorages[retVal] = storage
+            }
+        }
+
         return HeterogeneousExecutionResult(
             success: true,
             partitionResults: partitionResults,
             stats: localStats,
-            plan: plan
+            plan: plan,
+            outputStorages: outputStorages
         )
     }
 
-    /// Executes a single partition on its assigned device
+    /// Executes a single partition on its assigned device.
     private func executePartition(
         _ partition: GPUANEPartitioner.DevicePartition,
-        function: HLOFunction,
-        inputs: [String: MTLBuffer]
+        function: HLOFunction
     ) throws -> PartitionResult {
         let startTime = DispatchTime.now()
 
+        let opIds = Set(partition.operationIds)
+        let externalConsumers = SubFunctionExtractor.findExternalConsumers(of: opIds, in: function)
+        let subFunction = SubFunctionExtractor.extract(
+            from: function,
+            operationIds: opIds,
+            outputConsumers: externalConsumers
+        )
+
         switch partition.device {
         case .gpu:
-            try executeOnGPU(partition, function: function, inputs: inputs)
+            try executeOnGPU(subFunction)
         case .ane:
-            try executeOnANE(partition, function: function, inputs: inputs)
+            try executeOnANE(subFunction)
         case .cpu:
-            try executeOnCPU(partition, function: function, inputs: inputs)
+            throw HeterogeneousExecutorError.deviceNotAvailable("CPU execution not implemented")
         }
 
         let endTime = DispatchTime.now()
@@ -860,66 +954,93 @@ public final class HeterogeneousExecutor: @unchecked Sendable {
         )
     }
 
-    /// Executes partition on GPU
-    private func executeOnGPU(
-        _ partition: GPUANEPartitioner.DevicePartition,
-        function: HLOFunction,
-        inputs: [String: MTLBuffer]
-    ) throws {
-        guard let context = gpuContext, context.isAvailable else {
-            throw HeterogeneousExecutorError.deviceNotAvailable("GPU not available")
+    /// Executes a sub-function on GPU via MetalExecutor (MPSGraph path).
+    private func executeOnGPU(_ subFunction: HLOFunction) throws {
+        // Build an HLOModule from the sub-function
+        let module = HLOModule(name: subFunction.name, function: subFunction)
+
+        // Compile via MPSGraph
+        let compiled = try metalExecutor.compile(module: module)
+
+        // Gather inputs from transfer manager as BufferStorage
+        var inputStorages: [BufferStorage] = []
+        for arg in subFunction.inputs {
+            let storage = try transferManager.getBufferStorage(name: arg.name)
+            inputStorages.append(storage)
         }
 
-        guard let commandQueue = context.commandQueue,
-              let commandBuffer = commandQueue.makeCommandBuffer() else {
-            throw HeterogeneousExecutorError.deviceInitializationFailed("Failed to create command buffer")
+        // Execute
+        let outputs = try metalExecutor.execute(compiled: compiled, inputs: inputStorages)
+
+        // Store outputs in transfer manager
+        for (i, retVal) in subFunction.returnValues.enumerated() where i < outputs.count {
+            transferManager.storeGPUResult(name: retVal, storage: outputs[i])
+        }
+    }
+
+    /// Executes a sub-function on ANE via CoreMLBridge.
+    private func executeOnANE(_ subFunction: HLOFunction) throws {
+        let builder = CoreMLOpBuilder()
+        let (coremlInputs, ops, returnVar) = try builder.build(function: subFunction)
+
+        // Check cache
+        let cacheKey = subFunction.operations.map { $0.result }.joined(separator: "_")
+        let program: ANERuntime.CoreMLProgram
+        if let cached = aneCache[cacheKey] {
+            program = cached
+        } else {
+            program = try coreMLBridge.compile(
+                inputs: coremlInputs,
+                operations: ops,
+                returnVar: returnVar
+            )
+            aneCache[cacheKey] = program
         }
 
-        // In a real implementation, this would encode Metal compute commands
-        // For now, we simulate execution
+        // Gather inputs from transfer manager as CPU arrays
+        var aneInputs: [(name: String, data: [Float], shape: [Int])] = []
+        for (coremlInput, arg) in zip(coremlInputs, subFunction.inputs) {
+            let cpuData = try transferManager.getCPUArray(name: arg.name)
+            aneInputs.append((name: coremlInput.name, data: cpuData.data, shape: cpuData.shape))
+        }
 
-        commandBuffer.commit()
-        commandBuffer.waitUntilCompleted()
+        // Execute via CoreML
+        let results = try coreMLBridge.execute(program, inputs: aneInputs)
+
+        // Store outputs — ANE returns a single flat Float array for the return value
+        for retVal in subFunction.returnValues {
+            let opMap = Dictionary(
+                uniqueKeysWithValues: subFunction.operations.map { ($0.result, $0) }
+            )
+            if let op = opMap[retVal] {
+                transferManager.storeCPUResult(
+                    name: retVal,
+                    data: results,
+                    shape: op.resultType.shape,
+                    elementType: op.resultType.elementType
+                )
+            }
+        }
     }
 
-    /// Executes partition on ANE (simulated)
-    private func executeOnANE(
-        _ partition: GPUANEPartitioner.DevicePartition,
-        function: HLOFunction,
-        inputs: [String: MTLBuffer]
-    ) throws {
-        // In a real implementation, this would use CoreML or MPS for ANE
-        // For now, we simulate ANE execution
-
-        // Simulate ANE execution time
-        Thread.sleep(forTimeInterval: partition.estimatedTimeMs / 1000.0)
-    }
-
-    /// Executes partition on CPU (fallback)
-    private func executeOnCPU(
-        _ partition: GPUANEPartitioner.DevicePartition,
-        function: HLOFunction,
-        inputs: [String: MTLBuffer]
-    ) throws {
-        // CPU fallback execution
-        // This would use Accelerate framework in a real implementation
-
-        // Simulate CPU execution time
-        Thread.sleep(forTimeInterval: partition.estimatedTimeMs / 1000.0 * 2.0) // CPU is slower
-    }
-
-    /// Returns current execution statistics
+    /// Returns current execution statistics.
     public func getStats() -> ExecutionStats {
         lock.lock()
         defer { lock.unlock() }
         return stats
     }
 
-    /// Resets execution statistics
+    /// Resets execution statistics.
     public func resetStats() {
         lock.lock()
         defer { lock.unlock() }
         stats = ExecutionStats()
+    }
+
+    /// Clears cached ANE compilations.
+    public func clearCache() {
+        aneCache.removeAll()
+        coreMLBridge.clearCache()
     }
 }
 
@@ -932,11 +1053,14 @@ public struct PartitionResult: Sendable {
 }
 
 /// Result of heterogeneous execution
-public struct HeterogeneousExecutionResult: Sendable {
+/// Result of heterogeneous execution
+public struct HeterogeneousExecutionResult: @unchecked Sendable {
     public let success: Bool
     public let partitionResults: [PartitionResult]
     public let stats: HeterogeneousExecutor.ExecutionStats
     public let plan: GPUANEPartitioner.PartitionPlan
+    /// Output buffers keyed by return value SSA name.
+    public let outputStorages: [String: BufferStorage]
 }
 
 /// Errors that can occur during heterogeneous execution

@@ -327,8 +327,6 @@ struct NeuralEngineTargetingTests {
         #expect(config.enableANE)
         #expect(config.enableGPU)
         #expect(config.enableCPUFallback)
-        #expect(config.maxConcurrentPartitions == 2)
-        #expect(config.syncStrategy == .event)
     }
 
     @Test("ExecutionStats initial values")
@@ -343,8 +341,9 @@ struct NeuralEngineTargetingTests {
     }
 
     @Test("HeterogeneousExecutor stats tracking")
-    func executorStatsTracking() {
-        let executor = HeterogeneousExecutor()
+    func executorStatsTracking() throws {
+        let metalExec = try MetalExecutor()
+        let executor = HeterogeneousExecutor(metalExecutor: metalExec)
 
         let stats = executor.getStats()
         #expect(stats.totalTimeMs == 0)

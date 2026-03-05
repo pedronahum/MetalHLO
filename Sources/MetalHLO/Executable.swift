@@ -34,6 +34,9 @@ public final class Executable: @unchecked Sendable {
 
         /// Optimized Metal kernels via integrated executor
         case integrated(CompiledExecutable, IntegratedExecutor)
+
+        /// Heterogeneous GPU+ANE execution
+        case heterogeneous(HLOFunction, HeterogeneousExecutor)
     }
 
     // MARK: - Properties
@@ -47,6 +50,8 @@ public final class Executable: @unchecked Sendable {
             return compiled.inputTypes.count
         case .integrated(let executable, _):
             return executable.inputSpecs.count
+        case .heterogeneous(let function, _):
+            return function.inputs.count
         }
     }
 
@@ -57,6 +62,8 @@ public final class Executable: @unchecked Sendable {
             return compiled.outputTypes.count
         case .integrated(let executable, _):
             return executable.outputSpecs.count
+        case .heterogeneous(let function, _):
+            return function.outputTypes.count
         }
     }
 
@@ -75,6 +82,13 @@ public final class Executable: @unchecked Sendable {
                 TensorType(
                     shape: spec.shape,
                     elementType: ElementType.fromCoreType(spec.elementType)
+                )
+            }
+        case .heterogeneous(let function, _):
+            return function.inputs.map { arg in
+                TensorType(
+                    shape: arg.type.shape,
+                    elementType: ElementType.fromCoreType(arg.type.elementType)
                 )
             }
         }
@@ -97,6 +111,13 @@ public final class Executable: @unchecked Sendable {
                     elementType: ElementType.fromCoreType(spec.elementType)
                 )
             }
+        case .heterogeneous(let function, _):
+            return function.outputTypes.map { coreType in
+                TensorType(
+                    shape: coreType.shape,
+                    elementType: ElementType.fromCoreType(coreType.elementType)
+                )
+            }
         }
     }
 
@@ -112,6 +133,11 @@ public final class Executable: @unchecked Sendable {
         self.backend = .integrated(compiled, executor)
     }
 
+    /// Internal initializer for heterogeneous GPU+ANE execution.
+    internal init(function: HLOFunction, executor: HeterogeneousExecutor) {
+        self.backend = .heterogeneous(function, executor)
+    }
+
     // MARK: - Execution
 
     /// Executes the program with the given inputs.
@@ -125,6 +151,8 @@ public final class Executable: @unchecked Sendable {
             return try executeMPSGraph(inputs, compiled: compiled, executor: executor)
         case .integrated(_, let executor):
             return try executeIntegrated(inputs, executor: executor)
+        case .heterogeneous(let function, let executor):
+            return try executeHeterogeneous(inputs, function: function, executor: executor)
         }
     }
 
@@ -139,6 +167,15 @@ public final class Executable: @unchecked Sendable {
             return try executeWithTimingMPSGraph(inputs, compiled: compiled, executor: executor)
         case .integrated(_, let executor):
             return try executeWithTimingIntegrated(inputs, executor: executor)
+        case .heterogeneous(let function, let executor):
+            let buffers = try executeHeterogeneous(inputs, function: function, executor: executor)
+            let stats = executor.getStats()
+            let timing = ExecutionTiming(
+                encodeTime: 0,
+                gpuTime: stats.gpuTimeMs / 1000.0,
+                totalTime: stats.totalTimeMs / 1000.0
+            )
+            return (buffers, timing)
         }
     }
 
@@ -254,6 +291,31 @@ public final class Executable: @unchecked Sendable {
             )
             return storage.map { Buffer(storage: $0) }
         }
+    }
+
+    // MARK: - Heterogeneous Execution
+
+    private func executeHeterogeneous(
+        _ inputs: [Buffer],
+        function: HLOFunction,
+        executor: HeterogeneousExecutor
+    ) throws -> [Buffer] {
+        // Build named input storages
+        var namedInputs: [String: BufferStorage] = [:]
+        for (i, arg) in function.inputs.enumerated() where i < inputs.count {
+            namedInputs[arg.name] = inputs[i].storage
+        }
+
+        let result = try executor.execute(function, inputs: namedInputs)
+
+        // Collect outputs in return value order
+        var outputBuffers: [Buffer] = []
+        for retVal in function.returnValues {
+            if let storage = result.outputStorages[retVal] {
+                outputBuffers.append(Buffer(storage: storage))
+            }
+        }
+        return outputBuffers
     }
 
     // MARK: - Error Conversion

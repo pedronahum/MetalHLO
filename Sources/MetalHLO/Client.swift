@@ -94,14 +94,19 @@ public final class Client: @unchecked Sendable {
     /// optimization level. Higher optimization levels enable more aggressive
     /// transformations like operator fusion and algebraic simplification.
     ///
+    /// When `devicePolicy` is not `.gpuOnly`, the compiler will analyze the
+    /// computation graph and partition it between GPU and Apple Neural Engine
+    /// for heterogeneous execution.
+    ///
     /// ## Example
     /// ```swift
     /// // Aggressive optimization for production
     /// let config = CompilationConfig(optimizationLevel: .O3)
     /// let exe = try client.compile(mlir, config: config)
     ///
-    /// // Debug mode with no optimization
-    /// let debugExe = try client.compile(mlir, config: .debug)
+    /// // Heterogeneous GPU+ANE execution
+    /// let hetConfig = CompilationConfig(devicePolicy: .auto)
+    /// let hetExe = try client.compile(mlir, config: hetConfig)
     /// ```
     ///
     /// - Parameters:
@@ -110,6 +115,11 @@ public final class Client: @unchecked Sendable {
     /// - Throws: `MetalHLOError.parseFailed` or `MetalHLOError.compilationFailed`.
     /// - Returns: A compiled `Executable` ready for execution.
     public func compile(_ mlir: String, config: CompilationConfig) throws -> Executable {
+        // Check if heterogeneous execution is requested
+        if config.devicePolicy != .gpuOnly {
+            return try compileHeterogeneous(mlir, config: config)
+        }
+
         // Map optimization level to appropriate pass set if user hasn't specified
         let effectiveEnabledPasses: Set<String>?
         if let userPasses = config.enabledPasses {
@@ -162,6 +172,41 @@ public final class Client: @unchecked Sendable {
         }
 
         return Executable(compiled: compiled, executor: integratedExecutor)
+    }
+
+    // MARK: - Heterogeneous Compilation
+
+    /// Compiles with GPU+ANE heterogeneous execution.
+    private func compileHeterogeneous(_ mlir: String, config: CompilationConfig) throws -> Executable {
+        // Parse MLIR to get the HLO function
+        let parser = Parser(source: mlir)
+        let module: HLOModule
+        do {
+            module = try parser.parse()
+        } catch let error as ParseError {
+            let location = error.location ?? SourceLocation(line: 1, column: 1, offset: 0)
+            throw MetalHLOError.parseFailed(
+                line: location.line,
+                column: location.column,
+                message: error.description
+            )
+        }
+
+        // Analyze whether heterogeneous execution is beneficial
+        let analyzer = ANEAnalyzer()
+        let analysis = analyzer.analyzeFunction(module.function)
+
+        // If no ops benefit from ANE, fall back to GPU-only
+        if analysis.aneRecommendedOps.isEmpty && config.devicePolicy != .aneOnly {
+            // Fall through to standard GPU compilation
+            var gpuConfig = config
+            gpuConfig.devicePolicy = .gpuOnly
+            return try compile(mlir, config: gpuConfig)
+        }
+
+        // Create heterogeneous executor
+        let hetExecutor = HeterogeneousExecutor(metalExecutor: executor)
+        return Executable(function: module.function, executor: hetExecutor)
     }
 
     // MARK: - Error Conversion
