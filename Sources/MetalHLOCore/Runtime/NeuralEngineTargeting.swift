@@ -777,21 +777,25 @@ public final class HeterogeneousExecutor: @unchecked Sendable {
         public var enableANE: Bool
         public var enableGPU: Bool
         public var enableCPUFallback: Bool
+        public var enablePipelining: Bool
 
         public static let `default` = Config(
             enableANE: true,
             enableGPU: true,
-            enableCPUFallback: true
+            enableCPUFallback: true,
+            enablePipelining: false
         )
 
         public init(
             enableANE: Bool,
             enableGPU: Bool,
-            enableCPUFallback: Bool
+            enableCPUFallback: Bool,
+            enablePipelining: Bool = false
         ) {
             self.enableANE = enableANE
             self.enableGPU = enableGPU
             self.enableCPUFallback = enableCPUFallback
+            self.enablePipelining = enablePipelining
         }
     }
 
@@ -802,6 +806,9 @@ public final class HeterogeneousExecutor: @unchecked Sendable {
     private var transferManager: TensorTransferManager
     private var stats: ExecutionStats
     private let lock = NSLock()
+
+    /// Dedicated queue for ANE (CoreML) execution in pipelined mode.
+    private let aneQueue = DispatchQueue(label: "com.metalHLO.ane", qos: .userInitiated)
 
     /// Cache of compiled CoreML programs keyed by partition op hash.
     private var aneCache: [String: ANERuntime.CoreMLProgram] = [:]
@@ -846,45 +853,13 @@ public final class HeterogeneousExecutor: @unchecked Sendable {
             transferManager.storeGPUResult(name: name, storage: storage)
         }
 
-        var partitionResults: [PartitionResult] = []
+        let partitionResults: [PartitionResult]
         var localStats = ExecutionStats()
 
-        // Execute partitions sequentially
-        for partitionIndex in plan.executionOrder {
-            let partition = plan.partitions[partitionIndex]
-
-            let result: PartitionResult
-            do {
-                result = try executePartition(partition, function: function)
-            } catch {
-                // ANE failure: fall back to GPU if enabled
-                if partition.device == .ane && config.enableCPUFallback {
-                    let gpuPartition = GPUANEPartitioner.DevicePartition(
-                        device: .gpu,
-                        operationIds: partition.operationIds,
-                        estimatedTimeMs: partition.estimatedTimeMs,
-                        inputTensors: partition.inputTensors,
-                        outputTensors: partition.outputTensors
-                    )
-                    result = try executePartition(gpuPartition, function: function)
-                } else {
-                    throw error
-                }
-            }
-
-            partitionResults.append(result)
-
-            localStats.partitionsExecuted += 1
-            localStats.operationsExecuted += partition.operationIds.count
-
-            switch result.device {
-            case .gpu:
-                localStats.gpuTimeMs += result.executionTimeMs
-            case .ane:
-                localStats.aneTimeMs += result.executionTimeMs
-            case .cpu:
-                break
-            }
+        if config.enablePipelining && plan.canPipeline {
+            partitionResults = try executePipelined(plan: plan, function: function, stats: &localStats)
+        } else {
+            partitionResults = try executeSequential(plan: plan, function: function, stats: &localStats)
         }
 
         let endTime = DispatchTime.now()
@@ -917,6 +892,194 @@ public final class HeterogeneousExecutor: @unchecked Sendable {
             plan: plan,
             outputStorages: outputStorages
         )
+    }
+
+    /// Executes partitions sequentially in dependency order.
+    private func executeSequential(
+        plan: GPUANEPartitioner.PartitionPlan,
+        function: HLOFunction,
+        stats localStats: inout ExecutionStats
+    ) throws -> [PartitionResult] {
+        var partitionResults: [PartitionResult] = []
+
+        for partitionIndex in plan.executionOrder {
+            let partition = plan.partitions[partitionIndex]
+
+            let result: PartitionResult
+            do {
+                result = try executePartition(partition, function: function)
+            } catch {
+                // ANE failure: fall back to GPU if enabled
+                if partition.device == .ane && config.enableCPUFallback {
+                    let gpuPartition = GPUANEPartitioner.DevicePartition(
+                        device: .gpu,
+                        operationIds: partition.operationIds,
+                        estimatedTimeMs: partition.estimatedTimeMs,
+                        inputTensors: partition.inputTensors,
+                        outputTensors: partition.outputTensors
+                    )
+                    result = try executePartition(gpuPartition, function: function)
+                } else {
+                    throw error
+                }
+            }
+
+            partitionResults.append(result)
+            localStats.partitionsExecuted += 1
+            localStats.operationsExecuted += partition.operationIds.count
+
+            switch result.device {
+            case .gpu:
+                localStats.gpuTimeMs += result.executionTimeMs
+            case .ane:
+                localStats.aneTimeMs += result.executionTimeMs
+            case .cpu:
+                break
+            }
+        }
+
+        return partitionResults
+    }
+
+    /// Executes partitions with GPU/ANE pipelining.
+    ///
+    /// When an ANE partition has no data dependency on a concurrent GPU partition,
+    /// they can overlap: CoreML prediction runs on `aneQueue` while Metal commands
+    /// execute on the GPU. At dependency boundaries, we synchronize.
+    private func executePipelined(
+        plan: GPUANEPartitioner.PartitionPlan,
+        function: HLOFunction,
+        stats localStats: inout ExecutionStats
+    ) throws -> [PartitionResult] {
+        // Use a class to hold mutable state shared across the async closure,
+        // avoiding sendable capture warnings on mutable vars.
+        final class PipelineState: @unchecked Sendable {
+            let lock = NSLock()
+            var results: [PartitionResult?]
+            var error: Error?
+
+            init(count: Int) {
+                self.results = Array(repeating: nil, count: count)
+            }
+        }
+        let state = PipelineState(count: plan.partitions.count)
+
+        // Track which partitions have completed (for dependency checking)
+        var completedPartitions: Set<Int> = []
+
+        for (orderIdx, partitionIndex) in plan.executionOrder.enumerated() {
+            let partition = plan.partitions[partitionIndex]
+
+            // Determine if this partition depends on the immediately previous partition
+            // by checking if any of its input tensors come from previous partitions
+            let previousPartitionOps: Set<String>
+            if orderIdx > 0 {
+                let prevIdx = plan.executionOrder[orderIdx - 1]
+                previousPartitionOps = Set(plan.partitions[prevIdx].operationIds)
+            } else {
+                previousPartitionOps = []
+            }
+
+            let dependsOnPrevious = !partition.inputTensors.intersection(previousPartitionOps).isEmpty
+
+            // Can we overlap this ANE partition with previous GPU work?
+            let canOverlap = partition.device == .ane
+                && !dependsOnPrevious
+                && orderIdx > 0
+                && completedPartitions.contains(plan.executionOrder[orderIdx - 1]) == false
+
+            if canOverlap {
+                let semaphore = DispatchSemaphore(value: 0)
+
+                aneQueue.async { [self] in
+                    do {
+                        let result = try self.executePartitionWithFallback(partition, function: function)
+                        state.lock.lock()
+                        state.results[partitionIndex] = result
+                        state.lock.unlock()
+                    } catch {
+                        state.lock.lock()
+                        state.error = error
+                        state.lock.unlock()
+                    }
+                    semaphore.signal()
+                }
+
+                // Check if the next partition needs this one's output
+                let nextIdx = orderIdx + 1
+                let mustWait: Bool
+                if nextIdx < plan.executionOrder.count {
+                    let nextPartition = plan.partitions[plan.executionOrder[nextIdx]]
+                    let partitionOutputs = Set(partition.operationIds)
+                    mustWait = !nextPartition.inputTensors.intersection(partitionOutputs).isEmpty
+                } else {
+                    mustWait = true // Last partition, must wait
+                }
+
+                if mustWait {
+                    semaphore.wait()
+                    completedPartitions.insert(partitionIndex)
+
+                    // Check for async errors
+                    if let error = state.error { throw error }
+                }
+            } else {
+                // Execute synchronously (GPU partition or ANE with dependency)
+                let result = try executePartitionWithFallback(partition, function: function)
+
+                state.lock.lock()
+                state.results[partitionIndex] = result
+                state.lock.unlock()
+                completedPartitions.insert(partitionIndex)
+            }
+        }
+
+        // Wait for any remaining async work
+        aneQueue.sync {}
+        if let error = state.error { throw error }
+
+        // Collect results in execution order
+        var orderedResults: [PartitionResult] = []
+        for partitionIndex in plan.executionOrder {
+            if let result = state.results[partitionIndex] {
+                orderedResults.append(result)
+                localStats.partitionsExecuted += 1
+                localStats.operationsExecuted += plan.partitions[partitionIndex].operationIds.count
+
+                switch result.device {
+                case .gpu:
+                    localStats.gpuTimeMs += result.executionTimeMs
+                case .ane:
+                    localStats.aneTimeMs += result.executionTimeMs
+                case .cpu:
+                    break
+                }
+            }
+        }
+
+        return orderedResults
+    }
+
+    /// Executes a partition with ANE-to-GPU fallback on failure.
+    private func executePartitionWithFallback(
+        _ partition: GPUANEPartitioner.DevicePartition,
+        function: HLOFunction
+    ) throws -> PartitionResult {
+        do {
+            return try executePartition(partition, function: function)
+        } catch {
+            if partition.device == .ane && config.enableCPUFallback {
+                let gpuPartition = GPUANEPartitioner.DevicePartition(
+                    device: .gpu,
+                    operationIds: partition.operationIds,
+                    estimatedTimeMs: partition.estimatedTimeMs,
+                    inputTensors: partition.inputTensors,
+                    outputTensors: partition.outputTensors
+                )
+                return try executePartition(gpuPartition, function: function)
+            }
+            throw error
+        }
     }
 
     /// Executes a single partition on its assigned device.

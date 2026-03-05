@@ -6,6 +6,7 @@
 
 import Testing
 import Foundation
+import Metal
 @testable import MetalHLOCore
 
 @Suite("Graph Partitioner", .serialized)
@@ -419,6 +420,44 @@ struct PartitionerTests {
         // All ops should be compatible or optimal
         #expect(analysis.incompatibleOpsCount == 0)
         #expect(analysis.compatibleOpsCount + analysis.optimalOpsCount == 3)
+    }
+
+    @Test("TensorTransferManager concurrent access is safe")
+    func transferManagerConcurrentAccess() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            return // Skip on systems without Metal
+        }
+
+        let manager = TensorTransferManager(device: device)
+
+        // Store initial data
+        let storage = BufferStorage(floatData: [1, 2, 3, 4], shape: [4], device: device)
+        manager.storeGPUResult(name: "%init", storage: storage)
+
+        // Concurrent reads/writes from multiple queues
+        let group = DispatchGroup()
+        let queue = DispatchQueue(label: "test.concurrent", attributes: .concurrent)
+
+        for i in 0..<100 {
+            group.enter()
+            queue.async {
+                let name = "%\(i)"
+                manager.storeCPUResult(name: name, data: [Float(i)], shape: [1])
+                _ = manager.hasTensor(name: name)
+                _ = manager.tensorType(for: name)
+                group.leave()
+            }
+        }
+
+        group.wait()
+
+        // Verify data integrity
+        #expect(manager.hasTensor(name: "%init"))
+        #expect(manager.hasTensor(name: "%50"))
+        #expect(manager.hasTensor(name: "%99"))
+
+        let cpuData = try manager.getCPUArray(name: "%50")
+        #expect(cpuData.data == [50.0])
     }
 
     @Test("Mixed function has correct counts")

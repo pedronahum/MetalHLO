@@ -6,15 +6,20 @@
 // unified memory, so transfers are API conversions rather than
 // physical memory copies.
 
+import Foundation
 import Metal
 
 /// Manages intermediate tensor buffers during heterogeneous execution.
 ///
 /// Tracks tensors by their SSA names and converts between GPU (`BufferStorage`)
 /// and ANE (`[Float]`) representations as needed at partition boundaries.
+///
+/// Thread-safe: all public methods are synchronized via `NSLock` to support
+/// concurrent GPU and ANE partition execution in pipelined mode.
 final class TensorTransferManager: @unchecked Sendable {
 
     private let device: MTLDevice
+    private let lock = NSLock()
 
     /// GPU-side tensor data (BufferStorage from MetalExecutor).
     private var gpuStorages: [String: BufferStorage] = [:]
@@ -33,12 +38,16 @@ final class TensorTransferManager: @unchecked Sendable {
 
     /// Stores a GPU BufferStorage result from a GPU partition.
     func storeGPUResult(name: String, storage: BufferStorage) {
+        lock.lock()
+        defer { lock.unlock() }
         gpuStorages[name] = storage
         tensorTypes[name] = TensorType(shape: storage.shape, elementType: storage.elementType)
     }
 
     /// Stores a CPU array result from an ANE partition.
     func storeCPUResult(name: String, data: [Float], shape: [Int], elementType: ElementType = .float32) {
+        lock.lock()
+        defer { lock.unlock() }
         cpuArrays[name] = (data: data, shape: shape)
         tensorTypes[name] = TensorType(shape: shape, elementType: elementType)
     }
@@ -48,6 +57,9 @@ final class TensorTransferManager: @unchecked Sendable {
     /// Gets a tensor as BufferStorage for GPU partition inputs.
     /// If the tensor is only available as a CPU array, creates a BufferStorage from it.
     func getBufferStorage(name: String) throws -> BufferStorage {
+        lock.lock()
+        defer { lock.unlock() }
+
         // Already a GPU storage
         if let storage = gpuStorages[name] {
             return storage
@@ -74,6 +86,9 @@ final class TensorTransferManager: @unchecked Sendable {
     /// Gets a tensor as a Float array for ANE partition inputs.
     /// If the tensor is only available as a GPU BufferStorage, extracts data from it.
     func getCPUArray(name: String) throws -> (data: [Float], shape: [Int]) {
+        lock.lock()
+        defer { lock.unlock() }
+
         // Already a CPU array
         if let cpuData = cpuArrays[name] {
             return cpuData
@@ -101,18 +116,24 @@ final class TensorTransferManager: @unchecked Sendable {
 
     /// Checks if a tensor is available (in either GPU or CPU form).
     func hasTensor(name: String) -> Bool {
-        gpuStorages[name] != nil || cpuArrays[name] != nil
+        lock.lock()
+        defer { lock.unlock() }
+        return gpuStorages[name] != nil || cpuArrays[name] != nil
     }
 
     /// Returns the tensor type for a stored tensor, if available.
     func tensorType(for name: String) -> TensorType? {
-        tensorTypes[name]
+        lock.lock()
+        defer { lock.unlock() }
+        return tensorTypes[name]
     }
 
     // MARK: - Cleanup
 
     /// Clears all stored tensors.
     func clear() {
+        lock.lock()
+        defer { lock.unlock() }
         gpuStorages.removeAll()
         cpuArrays.removeAll()
         tensorTypes.removeAll()
