@@ -4,6 +4,7 @@
 
 import Foundation
 import Metal
+import CoreML
 import ANERuntime
 
 // MARK: - ANE Compatibility Analysis
@@ -337,8 +338,50 @@ public final class ANEAnalyzer: @unchecked Sendable {
             baseTime = elements * 0.00002 // ~20ns per element
         }
 
+        // Apply shape efficiency penalty.
+        // ANE's [1,C,1,S] layout wastes memory for poorly-shaped tensors
+        // (e.g., very small spatial dims or odd channel counts).
+        let shapeEfficiency = aneShapeEfficiency(operation.resultType.shape)
+        let shapePenalty = 1.0 / max(shapeEfficiency, 0.1) // Up to 10x penalty
+
         // Add dispatch overhead
-        return baseTime + config.aneOverheadNs / 1_000_000.0
+        return baseTime * shapePenalty + config.aneOverheadNs / 1_000_000.0
+    }
+
+    /// Estimates how efficiently a tensor shape maps to ANE's [1,C,1,S] layout.
+    ///
+    /// Returns a value in (0, 1]. Shapes with high alignment waste get lower
+    /// scores, biasing the cost model toward GPU.
+    private func aneShapeEfficiency(_ shape: [Int]) -> Double {
+        guard !shape.isEmpty else { return 1.0 }
+
+        // Map logical shape to ANE physical layout [1, C, 1, S]
+        let c: Int
+        let s: Int
+        switch shape.count {
+        case 1:
+            c = 1
+            s = shape[0]
+        case 2:
+            c = shape[0]
+            s = shape[1]
+        case 3:
+            c = shape[1]
+            s = shape[0] * shape[2]
+        default:
+            c = shape.count >= 2 ? shape[1] : 1
+            s = shape.reduce(1, *) / max(c, 1)
+        }
+
+        // ANE aligns channels to multiples of 8 and spatial to multiples of 64 bytes
+        let alignedC = ((c + 7) / 8) * 8
+        let alignedS = ((s * 2 + 63) / 64) * 32  // FP16 elements per 64-byte row
+
+        let usefulElements = c * s
+        let allocatedElements = alignedC * max(alignedS, s)
+        guard allocatedElements > 0 else { return 1.0 }
+
+        return Double(usefulElements) / Double(allocatedElements)
     }
 
     /// Estimates GPU execution time for an operation
@@ -402,24 +445,28 @@ public final class GPUANEPartitioner: @unchecked Sendable {
         public var maxTransferOverheadMs: Double  // Maximum acceptable transfer overhead
         public var enablePipelining: Bool         // Enable GPU-ANE pipelining
         public var balanceLoad: Bool              // Try to balance load between devices
+        public var aneSRAMCapacityBytes: Int      // ANE SRAM capacity for partition splitting
 
         public static let `default` = Config(
             minOpsForANEPartition: 3,
             maxTransferOverheadMs: 1.0,
             enablePipelining: true,
-            balanceLoad: true
+            balanceLoad: true,
+            aneSRAMCapacityBytes: 32 * 1024 * 1024
         )
 
         public init(
             minOpsForANEPartition: Int,
             maxTransferOverheadMs: Double,
             enablePipelining: Bool,
-            balanceLoad: Bool
+            balanceLoad: Bool,
+            aneSRAMCapacityBytes: Int = 32 * 1024 * 1024
         ) {
             self.minOpsForANEPartition = minOpsForANEPartition
             self.maxTransferOverheadMs = maxTransferOverheadMs
             self.enablePipelining = enablePipelining
             self.balanceLoad = balanceLoad
+            self.aneSRAMCapacityBytes = aneSRAMCapacityBytes
         }
     }
 
@@ -430,19 +477,22 @@ public final class GPUANEPartitioner: @unchecked Sendable {
         public let estimatedTimeMs: Double
         public let inputTensors: Set<String>   // Tensors needed from other device
         public let outputTensors: Set<String>  // Tensors produced for other device
+        public let workingSetBytes: Int        // Peak memory usage during partition execution
 
         public init(
             device: ExecutionDevice,
             operationIds: [String],
             estimatedTimeMs: Double,
             inputTensors: Set<String>,
-            outputTensors: Set<String>
+            outputTensors: Set<String>,
+            workingSetBytes: Int = 0
         ) {
             self.device = device
             self.operationIds = operationIds
             self.estimatedTimeMs = estimatedTimeMs
             self.inputTensors = inputTensors
             self.outputTensors = outputTensors
+            self.workingSetBytes = workingSetBytes
         }
     }
 
@@ -509,16 +559,22 @@ public final class GPUANEPartitioner: @unchecked Sendable {
         // Optimize partition boundaries to minimize transfers
         let optimizedPartitions = optimizePartitions(partitions, dependencies: dependencies)
 
+        // Split ANE partitions that exceed SRAM capacity
+        let memoryAwarePartitions = splitOversizedPartitions(optimizedPartitions, function: function)
+
+        // Recalculate cross-device tensors after splitting
+        let finalPartitions = calculateCrossDeviceTensors(memoryAwarePartitions, dependencies: dependencies)
+
         // Determine execution order
-        let executionOrder = determineExecutionOrder(optimizedPartitions, dependencies: dependencies)
+        let executionOrder = determineExecutionOrder(finalPartitions, dependencies: dependencies)
 
         // Calculate timing estimates using actual tensor sizes
-        let totalTime = optimizedPartitions.reduce(0.0) { $0 + $1.estimatedTimeMs }
-        let transferTime = calculateTransferTime(optimizedPartitions, opMap: opMap, function: function)
-        let canPipeline = config.enablePipelining && checkPipeliningPossible(optimizedPartitions)
+        let totalTime = finalPartitions.reduce(0.0) { $0 + $1.estimatedTimeMs }
+        let transferTime = calculateTransferTime(finalPartitions, opMap: opMap, function: function)
+        let canPipeline = config.enablePipelining && checkPipeliningPossible(finalPartitions)
 
         return PartitionPlan(
-            partitions: optimizedPartitions,
+            partitions: finalPartitions,
             executionOrder: executionOrder,
             estimatedTotalTimeMs: totalTime + transferTime,
             estimatedTransferTimeMs: transferTime,
@@ -693,7 +749,8 @@ public final class GPUANEPartitioner: @unchecked Sendable {
                 operationIds: partition.operationIds,
                 estimatedTimeMs: partition.estimatedTimeMs,
                 inputTensors: inputTensors,
-                outputTensors: outputTensors
+                outputTensors: outputTensors,
+                workingSetBytes: partition.workingSetBytes
             )
         }
     }
@@ -736,6 +793,125 @@ public final class GPUANEPartitioner: @unchecked Sendable {
         // Estimate ~10 GB/s effective bandwidth for the conversion.
         let bytesPerMs = 10_000_000.0
         return Double(totalBytes) / bytesPerMs
+    }
+
+    // MARK: - Memory Planning
+
+    /// Calculates the peak working set (in bytes) for a partition.
+    ///
+    /// Simulates execution: tracks live tensors (add output on produce,
+    /// remove after last use), records the peak.
+    private func calculateWorkingSet(
+        partition: DevicePartition,
+        function: HLOFunction
+    ) -> Int {
+        let opMap = Dictionary(uniqueKeysWithValues: function.operations.map { ($0.result, $0) })
+        let partitionOpSet = Set(partition.operationIds)
+        let partitionOps = function.operations.filter { partitionOpSet.contains($0.result) }
+
+        guard !partitionOps.isEmpty else { return 0 }
+
+        // Build last-use map: for each tensor, the index of the last op in this partition that uses it
+        var lastUse: [String: Int] = [:]
+        for (idx, op) in partitionOps.enumerated() {
+            for operand in op.operands {
+                lastUse[operand] = idx
+            }
+        }
+
+        var liveBytes = 0
+        var peakBytes = 0
+        var liveTensors: [String: Int] = [:]  // tensorId -> byteSize
+
+        for (idx, op) in partitionOps.enumerated() {
+            // Add output tensor
+            let outputBytes = op.resultType.byteCount
+            liveTensors[op.result] = outputBytes
+            liveBytes += outputBytes
+            peakBytes = max(peakBytes, liveBytes)
+
+            // Remove dead tensors (those whose last use was at or before this index)
+            for (tensorId, bytes) in liveTensors {
+                if let lastIdx = lastUse[tensorId], lastIdx <= idx, tensorId != op.result {
+                    liveBytes -= bytes
+                    liveTensors.removeValue(forKey: tensorId)
+                }
+            }
+        }
+
+        return peakBytes
+    }
+
+    /// Splits ANE partitions that exceed the SRAM capacity threshold.
+    ///
+    /// For each oversized ANE partition, finds a split point where the
+    /// working set is manageable and creates two sub-partitions.
+    /// Sub-partitions below `minOpsForANEPartition` are moved to GPU.
+    private func splitOversizedPartitions(
+        _ partitions: [DevicePartition],
+        function: HLOFunction
+    ) -> [DevicePartition] {
+        var result: [DevicePartition] = []
+
+        for partition in partitions {
+            let workingSet = calculateWorkingSet(partition: partition, function: function)
+
+            guard partition.device == .ane else {
+                // Non-ANE partitions: just annotate with working set
+                result.append(DevicePartition(
+                    device: partition.device,
+                    operationIds: partition.operationIds,
+                    estimatedTimeMs: partition.estimatedTimeMs,
+                    inputTensors: partition.inputTensors,
+                    outputTensors: partition.outputTensors,
+                    workingSetBytes: workingSet
+                ))
+                continue
+            }
+
+            if workingSet <= config.aneSRAMCapacityBytes || partition.operationIds.count <= 1 {
+                // Within SRAM budget or can't split further
+                result.append(DevicePartition(
+                    device: partition.device,
+                    operationIds: partition.operationIds,
+                    estimatedTimeMs: partition.estimatedTimeMs,
+                    inputTensors: partition.inputTensors,
+                    outputTensors: partition.outputTensors,
+                    workingSetBytes: workingSet
+                ))
+                continue
+            }
+
+            // Split at midpoint
+            let mid = partition.operationIds.count / 2
+            let firstOps = Array(partition.operationIds.prefix(mid))
+            let secondOps = Array(partition.operationIds.suffix(from: mid))
+            let halfTime = partition.estimatedTimeMs / 2.0
+
+            let firstPartition = DevicePartition(
+                device: firstOps.count >= config.minOpsForANEPartition ? .ane : .gpu,
+                operationIds: firstOps,
+                estimatedTimeMs: halfTime,
+                inputTensors: partition.inputTensors,
+                outputTensors: Set()
+            )
+            let secondPartition = DevicePartition(
+                device: secondOps.count >= config.minOpsForANEPartition ? .ane : .gpu,
+                operationIds: secondOps,
+                estimatedTimeMs: halfTime,
+                inputTensors: Set(),
+                outputTensors: partition.outputTensors
+            )
+
+            // Recursively split if still too large
+            let splitFirst = splitOversizedPartitions([firstPartition], function: function)
+            let splitSecond = splitOversizedPartitions([secondPartition], function: function)
+
+            result.append(contentsOf: splitFirst)
+            result.append(contentsOf: splitSecond)
+        }
+
+        return result
     }
 
     /// Checks if GPU-ANE pipelining is possible
@@ -812,6 +988,15 @@ public final class HeterogeneousExecutor: @unchecked Sendable {
 
     /// Cache of compiled CoreML programs keyed by partition op hash.
     private var aneCache: [String: ANERuntime.CoreMLProgram] = [:]
+
+    /// Number of consecutive ANE failures (reset on success).
+    private var consecutiveANEFailures: Int = 0
+
+    /// Set to true after too many consecutive ANE failures.
+    private var aneDisabled: Bool = false
+
+    /// Maximum consecutive ANE failures before disabling ANE for this executor.
+    private let maxConsecutiveANEFailures: Int = 3
 
     public init(
         metalExecutor: MetalExecutor,
@@ -1061,14 +1246,39 @@ public final class HeterogeneousExecutor: @unchecked Sendable {
     }
 
     /// Executes a partition with ANE-to-GPU fallback on failure.
+    ///
+    /// Tracks consecutive ANE failures. After `maxConsecutiveANEFailures`
+    /// consecutive failures, ANE is disabled for the lifetime of this executor
+    /// and all ANE partitions are automatically routed to GPU.
     private func executePartitionWithFallback(
         _ partition: GPUANEPartitioner.DevicePartition,
         function: HLOFunction
     ) throws -> PartitionResult {
+        // If ANE is disabled due to repeated failures, route directly to GPU
+        if partition.device == .ane && aneDisabled {
+            let gpuPartition = GPUANEPartitioner.DevicePartition(
+                device: .gpu,
+                operationIds: partition.operationIds,
+                estimatedTimeMs: partition.estimatedTimeMs,
+                inputTensors: partition.inputTensors,
+                outputTensors: partition.outputTensors
+            )
+            return try executePartition(gpuPartition, function: function)
+        }
+
         do {
-            return try executePartition(partition, function: function)
+            let result = try executePartition(partition, function: function)
+            // Reset failure counter on ANE success
+            if partition.device == .ane {
+                consecutiveANEFailures = 0
+            }
+            return result
         } catch {
             if partition.device == .ane && config.enableCPUFallback {
+                consecutiveANEFailures += 1
+                if consecutiveANEFailures >= maxConsecutiveANEFailures {
+                    aneDisabled = true
+                }
                 let gpuPartition = GPUANEPartitioner.DevicePartition(
                     device: .gpu,
                     operationIds: partition.operationIds,
@@ -1144,7 +1354,29 @@ public final class HeterogeneousExecutor: @unchecked Sendable {
     /// Executes a sub-function on ANE via CoreMLBridge.
     private func executeOnANE(_ subFunction: HLOFunction) throws {
         let builder = CoreMLOpBuilder()
-        let (coremlInputs, ops, returnVar) = try builder.build(function: subFunction)
+
+        // Detect patterns for fusion
+        let analyzer = Analyzer()
+        var shapes: [TensorID: [Int]] = [:]
+        for arg in subFunction.inputs {
+            shapes[arg.name] = arg.type.shape
+        }
+        for op in subFunction.operations {
+            shapes[op.result] = op.resultType.shape
+        }
+        let patterns = analyzer.detectPatterns(subFunction, shapes: shapes)
+
+        // Use fusion-aware build if patterns found, otherwise standard build
+        let coremlInputs: [(name: String, shape: [Int])]
+        let ops: [CoreMLOp]
+        let returnVar: String
+        if !patterns.isEmpty {
+            (coremlInputs, ops, returnVar) = try builder.buildWithFusion(
+                function: subFunction, patterns: patterns
+            )
+        } else {
+            (coremlInputs, ops, returnVar) = try builder.build(function: subFunction)
+        }
 
         // Check cache
         let cacheKey = subFunction.operations.map { $0.result }.joined(separator: "_")
@@ -1160,15 +1392,31 @@ public final class HeterogeneousExecutor: @unchecked Sendable {
             aneCache[cacheKey] = program
         }
 
-        // Gather inputs from transfer manager as CPU arrays
-        var aneInputs: [(name: String, data: [Float], shape: [Int])] = []
+        // Try zero-copy path via shared MLMultiArray inputs
+        var sharedInputs: [(name: String, array: CoreML.MLMultiArray)] = []
+        var useSharedPath = true
+
         for (coremlInput, arg) in zip(coremlInputs, subFunction.inputs) {
-            let cpuData = try transferManager.getCPUArray(name: arg.name)
-            aneInputs.append((name: coremlInput.name, data: cpuData.data, shape: cpuData.shape))
+            if let shared = try transferManager.getSharedMLMultiArray(name: arg.name) {
+                sharedInputs.append((name: coremlInput.name, array: shared.array))
+            } else {
+                useSharedPath = false
+                break
+            }
         }
 
-        // Execute via CoreML
-        let results = try coreMLBridge.execute(program, inputs: aneInputs)
+        // Execute via CoreML — zero-copy or fallback to array copy
+        let results: [Float]
+        if useSharedPath {
+            results = try coreMLBridge.execute(program, multiArrayInputs: sharedInputs)
+        } else {
+            var aneInputs: [(name: String, data: [Float], shape: [Int])] = []
+            for (coremlInput, arg) in zip(coremlInputs, subFunction.inputs) {
+                let cpuData = try transferManager.getCPUArray(name: arg.name)
+                aneInputs.append((name: coremlInput.name, data: cpuData.data, shape: cpuData.shape))
+            }
+            results = try coreMLBridge.execute(program, inputs: aneInputs)
+        }
 
         // Store outputs — ANE returns a single flat Float array for the return value
         for retVal in subFunction.returnValues {

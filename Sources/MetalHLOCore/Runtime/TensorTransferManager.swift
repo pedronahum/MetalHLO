@@ -8,11 +8,15 @@
 
 import Foundation
 import Metal
+import CoreML
 
 /// Manages intermediate tensor buffers during heterogeneous execution.
 ///
 /// Tracks tensors by their SSA names and converts between GPU (`BufferStorage`)
 /// and ANE (`[Float]`) representations as needed at partition boundaries.
+///
+/// When shared IOSurface buffers are available, the GPU→ANE input path
+/// is zero-copy: the Metal buffer and MLMultiArray share the same memory.
 ///
 /// Thread-safe: all public methods are synchronized via `NSLock` to support
 /// concurrent GPU and ANE partition execution in pipelined mode.
@@ -26,6 +30,9 @@ final class TensorTransferManager: @unchecked Sendable {
 
     /// ANE-side tensor data (Float arrays from CoreMLBridge).
     private var cpuArrays: [String: (data: [Float], shape: [Int])] = [:]
+
+    /// Shared buffers for zero-copy GPU↔ANE transfer.
+    private var sharedBuffers: [String: SharedIOSurfaceBuffer] = [:]
 
     /// Tensor types for all stored tensors.
     private var tensorTypes: [String: TensorType] = [:]
@@ -112,6 +119,58 @@ final class TensorTransferManager: @unchecked Sendable {
         return result
     }
 
+    // MARK: - Shared Buffer (Zero-Copy)
+
+    /// Gets or creates a shared IOSurface-backed buffer for a tensor.
+    ///
+    /// If the tensor exists as a GPU storage or CPU array, creates a shared
+    /// buffer and copies the data into it (one-time cost). Subsequent calls
+    /// return the cached shared buffer.
+    ///
+    /// - Returns: An MLMultiArray backed by shared memory, or nil if
+    ///   the tensor isn't available or shared buffer creation fails.
+    func getSharedMLMultiArray(name: String) throws -> (array: MLMultiArray, shape: [Int])? {
+        lock.lock()
+        defer { lock.unlock() }
+
+        // Return cached shared buffer
+        if let shared = sharedBuffers[name] {
+            let array = try shared.makeMLMultiArray()
+            return (array: array, shape: shared.shape)
+        }
+
+        // Try to create from GPU storage
+        if let storage = gpuStorages[name] {
+            let data = storage.data
+            let floatArray: [Float] = data.withUnsafeBytes { bytes in
+                let floatPtr = bytes.bindMemory(to: Float.self)
+                return Array(floatPtr.prefix(storage.count))
+            }
+            guard let shared = SharedIOSurfaceBuffer(
+                device: device, shape: storage.shape, data: floatArray
+            ) else {
+                return nil
+            }
+            sharedBuffers[name] = shared
+            let array = try shared.makeMLMultiArray()
+            return (array: array, shape: shared.shape)
+        }
+
+        // Try to create from CPU array
+        if let cpuData = cpuArrays[name] {
+            guard let shared = SharedIOSurfaceBuffer(
+                device: device, shape: cpuData.shape, data: cpuData.data
+            ) else {
+                return nil
+            }
+            sharedBuffers[name] = shared
+            let array = try shared.makeMLMultiArray()
+            return (array: array, shape: shared.shape)
+        }
+
+        return nil
+    }
+
     // MARK: - Query
 
     /// Checks if a tensor is available (in either GPU or CPU form).
@@ -130,12 +189,13 @@ final class TensorTransferManager: @unchecked Sendable {
 
     // MARK: - Cleanup
 
-    /// Clears all stored tensors.
+    /// Clears all stored tensors and shared buffers.
     func clear() {
         lock.lock()
         defer { lock.unlock() }
         gpuStorages.removeAll()
         cpuArrays.removeAll()
+        sharedBuffers.removeAll()
         tensorTypes.removeAll()
     }
 }

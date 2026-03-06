@@ -17,6 +17,8 @@ public struct ANEAvailabilityInfo: Sendable {
     public let chipName: String?
     /// Number of ANE cores detected (0 if unavailable).
     public let coreCount: Int
+    /// API level detected (0 = unknown, 1 = base selectors present).
+    public let apiLevel: Int
 }
 
 /// Probes the system for ANE hardware and private framework availability.
@@ -74,7 +76,8 @@ public final class ANEAvailability: @unchecked Sendable {
             isAvailable: false,
             reason: "ANE requires Apple Silicon (arm64)",
             chipName: nil,
-            coreCount: 0
+            coreCount: 0,
+            apiLevel: 0
         )
         #else
 
@@ -85,7 +88,8 @@ public final class ANEAvailability: @unchecked Sendable {
                 isAvailable: false,
                 reason: "ANE runtime requires macOS 14.0 or later (running \(version.majorVersion).\(version.minorVersion))",
                 chipName: readChipName(),
-                coreCount: 0
+                coreCount: 0,
+                apiLevel: 0
             )
         }
 
@@ -97,7 +101,8 @@ public final class ANEAvailability: @unchecked Sendable {
                 isAvailable: false,
                 reason: "Failed to load AppleNeuralEngine.framework: \(error)",
                 chipName: readChipName(),
-                coreCount: 0
+                coreCount: 0,
+                apiLevel: 0
             )
         }
         self.frameworkHandle = handle
@@ -108,7 +113,8 @@ public final class ANEAvailability: @unchecked Sendable {
                 isAvailable: false,
                 reason: "_ANEClient class not found in framework",
                 chipName: readChipName(),
-                coreCount: 0
+                coreCount: 0,
+                apiLevel: 0
             )
         }
         self.aneClientClass = clientClass
@@ -116,11 +122,26 @@ public final class ANEAvailability: @unchecked Sendable {
         // Query core count via _ANEDeviceInfo if available
         let cores = queryCoreCount()
 
+        // Detect API level by checking for required selectors
+        let apiLevel = detectAPILevel(clientClass: clientClass)
+
+        // If required base selectors are missing, mark as unavailable
+        if apiLevel < 1 {
+            return ANEAvailabilityInfo(
+                isAvailable: false,
+                reason: "_ANEClient is missing required method selectors (API may have changed)",
+                chipName: readChipName(),
+                coreCount: cores,
+                apiLevel: 0
+            )
+        }
+
         return ANEAvailabilityInfo(
             isAvailable: true,
             reason: nil,
             chipName: readChipName(),
-            coreCount: cores
+            coreCount: cores,
+            apiLevel: apiLevel
         )
         #endif
     }
@@ -147,6 +168,35 @@ extension ANEAvailability {
         typealias Fn = @convention(c) (AnyClass, Selector) -> Int
         let fn = unsafeBitCast(msgSend, to: Fn.self)
         return fn(devInfoClass, sel)
+    }
+
+    /// Detects the ANE API level by checking for known selectors on `_ANEClient`.
+    ///
+    /// - Level 0: Required selectors missing (API changed or unavailable)
+    /// - Level 1: Base compile/load/evaluate selectors present
+    /// - Level 2: Async variants also present (macOS 15+)
+    private func detectAPILevel(clientClass: AnyClass) -> Int {
+        // Required base selectors — all must be present for level 1
+        let requiredSelectors = [
+            "compileModel:options:qos:error:",
+            "loadModel:options:qos:error:",
+            "evaluateWithModel:options:request:qos:error:",
+        ]
+
+        for selectorName in requiredSelectors {
+            let sel = sel_registerName(selectorName)
+            if class_getInstanceMethod(clientClass, sel) == nil {
+                return 0
+            }
+        }
+
+        // Optional selectors for higher API levels
+        let asyncSelector = sel_registerName("compileModel:options:qos:completionHandler:")
+        if class_getInstanceMethod(clientClass, asyncSelector) != nil {
+            return 2
+        }
+
+        return 1
     }
 
     /// Reads the chip/CPU brand string via sysctl.

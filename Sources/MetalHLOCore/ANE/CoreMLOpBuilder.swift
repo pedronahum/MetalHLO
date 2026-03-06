@@ -60,6 +60,387 @@ public struct CoreMLOpBuilder {
         return (inputs, ops, returnVar)
     }
 
+    // MARK: - Fusion-Aware Build
+
+    /// Converts an HLO function to CoreML operations with pattern fusion.
+    ///
+    /// Detected patterns (LayerNorm, GELU, SiLU, etc.) are emitted as single
+    /// fused CoreML ops instead of decomposed element-wise chains. This lets
+    /// the ANE execute longer fused graphs in its internal SRAM.
+    ///
+    /// - Parameters:
+    ///   - function: The HLO function to convert.
+    ///   - patterns: Detected patterns from `Analyzer.detectPatterns()`.
+    /// - Returns: Inputs, operations, and return variable name.
+    public func buildWithFusion(
+        function: HLOFunction,
+        patterns: [DetectedPattern]
+    ) throws -> (
+        inputs: [(name: String, shape: [Int])],
+        operations: [CoreMLOp],
+        returnVar: String
+    ) {
+        let rewritten = MILFusionRewriter.rewrite(function: function, patterns: patterns)
+
+        var ops: [CoreMLOp] = []
+        var operandShapes: [String: [Int]] = [:]
+
+        // Map inputs
+        let inputs = function.inputs.map { arg in
+            let name = coreMLName(arg.name)
+            operandShapes[arg.name] = arg.type.shape
+            return (name: name, shape: arg.type.shape)
+        }
+
+        // Translate operations (fused or original)
+        for entry in rewritten {
+            switch entry {
+            case .original(let op):
+                let translated = try translateOp(op, operandShapes: &operandShapes)
+                ops.append(contentsOf: translated)
+
+            case .fused(let pattern, let rootOp, let consumedOps):
+                let translated = try translateFusedPattern(
+                    pattern: pattern,
+                    rootOp: rootOp,
+                    consumedOps: consumedOps,
+                    operandShapes: &operandShapes
+                )
+                ops.append(contentsOf: translated)
+            }
+        }
+
+        // Return variable
+        guard let returnValue = function.returnValues.first else {
+            throw MILEmitterError.internalError("Function has no return values")
+        }
+        let returnVar = coreMLName(returnValue)
+
+        return (inputs, ops, returnVar)
+    }
+
+    // MARK: - Fused Pattern Translation
+
+    private func translateFusedPattern(
+        pattern: DetectedPattern,
+        rootOp: HLOOperation,
+        consumedOps: [HLOOperation],
+        operandShapes: inout [String: [Int]]
+    ) throws -> [CoreMLOp] {
+        let resultName = coreMLName(rootOp.result)
+        let outputShape = rootOp.resultType.shape
+        operandShapes[rootOp.result] = outputShape
+
+        // Also register consumed op shapes so downstream ops can reference them
+        for consumed in consumedOps {
+            operandShapes[consumed.result] = consumed.resultType.shape
+        }
+
+        switch pattern.type {
+        case .layerNorm:
+            return translateFusedLayerNorm(
+                resultName: resultName, outputShape: outputShape,
+                rootOp: rootOp, consumedOps: consumedOps,
+                metadata: pattern.metadata, operandShapes: &operandShapes
+            )
+
+        case .rmsNorm:
+            return translateFusedRMSNorm(
+                resultName: resultName, outputShape: outputShape,
+                rootOp: rootOp, consumedOps: consumedOps,
+                metadata: pattern.metadata, operandShapes: &operandShapes
+            )
+
+        case .gelu:
+            return translateFusedGELU(
+                resultName: resultName, outputShape: outputShape,
+                rootOp: rootOp, operandShapes: &operandShapes
+            )
+
+        case .silu:
+            return translateFusedSiLU(
+                resultName: resultName, outputShape: outputShape,
+                rootOp: rootOp, consumedOps: consumedOps,
+                operandShapes: &operandShapes
+            )
+
+        case .matmulBiasActivation:
+            return translateFusedMatMulBiasAct(
+                resultName: resultName, outputShape: outputShape,
+                rootOp: rootOp, consumedOps: consumedOps,
+                metadata: pattern.metadata, operandShapes: &operandShapes
+            )
+
+        case .ffn:
+            return translateFusedFFN(
+                resultName: resultName, outputShape: outputShape,
+                rootOp: rootOp, consumedOps: consumedOps,
+                metadata: pattern.metadata, operandShapes: &operandShapes
+            )
+
+        default:
+            // Unsupported fusion — fall back to original translation
+            return try translateOp(rootOp, operandShapes: &operandShapes)
+        }
+    }
+
+    // MARK: - LayerNorm Fusion
+
+    private func translateFusedLayerNorm(
+        resultName: String, outputShape: [Int],
+        rootOp: HLOOperation, consumedOps: [HLOOperation],
+        metadata: PatternMetadata,
+        operandShapes: inout [String: [Int]]
+    ) -> [CoreMLOp] {
+        // Find the input: first operand of the earliest consumed op, or root's first operand
+        let inputName: String
+        if let earliest = consumedOps.sorted(by: { $0.result < $1.result }).first {
+            inputName = coreMLName(earliest.operands[0])
+        } else {
+            inputName = coreMLName(rootOp.operands[0])
+        }
+
+        let epsilon = metadata.epsilon ?? 1e-5
+        let axes = [outputShape.count - 1]  // Normalize over last axis
+
+        return [CoreMLOp(
+            result: resultName, op: "layer_norm", shape: outputShape,
+            params: [
+                ("x", .variable(inputName)),
+                ("axes", .intArray(axes)),
+                ("epsilon", .floatValue(Double(epsilon))),
+            ]
+        )]
+    }
+
+    // MARK: - RMSNorm Fusion
+
+    private func translateFusedRMSNorm(
+        resultName: String, outputShape: [Int],
+        rootOp: HLOOperation, consumedOps: [HLOOperation],
+        metadata: PatternMetadata,
+        operandShapes: inout [String: [Int]]
+    ) -> [CoreMLOp] {
+        // RMSNorm pattern: reduce → rsqrt → mul
+        // The original input is the first operand of the reduce op
+        let inputName: String
+        if let reduceOp = consumedOps.first(where: { $0.kind == .reduce }) {
+            inputName = coreMLName(reduceOp.operands[0])
+        } else {
+            inputName = coreMLName(rootOp.operands[0])
+        }
+
+        let epsilon = metadata.epsilon ?? 1e-5
+        let axes = [outputShape.count - 1]
+
+        // CoreML doesn't have native rms_norm, so emit: x * rsqrt(reduce_mean(x^2) + eps)
+        // But we can use layer_norm with no bias/gamma as a close approximation,
+        // or emit the decomposed but still fused sequence
+        let sqName = resultName + "_sq"
+        let meanName = resultName + "_mean"
+        let epsName = resultName + "_eps"
+        let addEpsName = resultName + "_add_eps"
+        let rsqrtName = resultName + "_rsqrt"
+
+        return [
+            // x^2
+            CoreMLOp(result: sqName, op: "mul", shape: outputShape,
+                     params: [("x", .variable(inputName)), ("y", .variable(inputName))]),
+            // mean(x^2, axis=-1, keepdims=true)
+            CoreMLOp(result: meanName, op: "reduce_mean", shape: outputShape,
+                     params: [("x", .variable(sqName)), ("axes", .intArray(axes)), ("keep_dims", .boolValue(true))]),
+            // epsilon constant
+            CoreMLOp(result: epsName, op: "const", shape: [],
+                     params: [("val", .floatValue(Double(epsilon)))]),
+            // mean + epsilon
+            CoreMLOp(result: addEpsName, op: "add", shape: outputShape,
+                     params: [("x", .variable(meanName)), ("y", .variable(epsName))]),
+            // rsqrt(mean + epsilon)
+            CoreMLOp(result: rsqrtName, op: "rsqrt", shape: outputShape,
+                     params: [("x", .variable(addEpsName))]),
+            // x * rsqrt(...)
+            CoreMLOp(result: resultName, op: "mul", shape: outputShape,
+                     params: [("x", .variable(inputName)), ("y", .variable(rsqrtName))]),
+        ]
+    }
+
+    // MARK: - GELU Fusion
+
+    private func translateFusedGELU(
+        resultName: String, outputShape: [Int],
+        rootOp: HLOOperation,
+        operandShapes: inout [String: [Int]]
+    ) -> [CoreMLOp] {
+        let inputName = coreMLName(rootOp.operands[0])
+
+        return [CoreMLOp(
+            result: resultName, op: "gelu", shape: outputShape,
+            params: [("x", .variable(inputName))]
+        )]
+    }
+
+    // MARK: - SiLU Fusion
+
+    private func translateFusedSiLU(
+        resultName: String, outputShape: [Int],
+        rootOp: HLOOperation, consumedOps: [HLOOperation],
+        operandShapes: inout [String: [Int]]
+    ) -> [CoreMLOp] {
+        // SiLU = x * sigmoid(x)
+        // The root is the multiply, consumed is the sigmoid
+        let inputName: String
+        if let sigmoidOp = consumedOps.first(where: { $0.kind == .logistic }) {
+            inputName = coreMLName(sigmoidOp.operands[0])
+        } else {
+            inputName = coreMLName(rootOp.operands[0])
+        }
+
+        let sigmoidName = resultName + "_sigmoid"
+        return [
+            CoreMLOp(result: sigmoidName, op: "sigmoid", shape: outputShape,
+                     params: [("x", .variable(inputName))]),
+            CoreMLOp(result: resultName, op: "mul", shape: outputShape,
+                     params: [("x", .variable(inputName)), ("y", .variable(sigmoidName))]),
+        ]
+    }
+
+    // MARK: - MatMul+Bias+Activation Fusion
+
+    private func translateFusedMatMulBiasAct(
+        resultName: String, outputShape: [Int],
+        rootOp: HLOOperation, consumedOps: [HLOOperation],
+        metadata: PatternMetadata,
+        operandShapes: inout [String: [Int]]
+    ) -> [CoreMLOp] {
+        // Find the matmul in consumed ops or root
+        let matmulOp = consumedOps.first(where: { $0.kind == .dot || $0.kind == .dotGeneral }) ?? rootOp
+        let lhsName = coreMLName(matmulOp.operands[0])
+        let rhsName = coreMLName(matmulOp.operands[1])
+
+        var ops: [CoreMLOp] = []
+
+        // Emit matmul
+        let matmulResultName = (rootOp.kind == .dot || rootOp.kind == .dotGeneral)
+            ? resultName : resultName + "_matmul"
+        let matmulShape = matmulOp.resultType.shape
+
+        ops.append(CoreMLOp(
+            result: matmulResultName, op: "matmul", shape: matmulShape,
+            params: [
+                ("x", .variable(lhsName)),
+                ("y", .variable(rhsName)),
+                ("transpose_x", .boolValue(false)),
+                ("transpose_y", .boolValue(false)),
+            ]
+        ))
+
+        // If root is not the matmul, check for bias add
+        if rootOp.kind == .add {
+            let biasOperand = rootOp.operands.first(where: { $0 != matmulOp.result })
+            let biasName = coreMLName(biasOperand ?? rootOp.operands[1])
+            ops.append(CoreMLOp(
+                result: resultName, op: "add", shape: outputShape,
+                params: [("x", .variable(matmulResultName)), ("y", .variable(biasName))]
+            ))
+        }
+
+        return ops
+    }
+
+    // MARK: - FFN Fusion
+
+    private func translateFusedFFN(
+        resultName: String, outputShape: [Int],
+        rootOp: HLOOperation, consumedOps: [HLOOperation],
+        metadata: PatternMetadata,
+        operandShapes: inout [String: [Int]]
+    ) -> [CoreMLOp] {
+        // FFN pattern: matmul → activation → matmul
+        // Emit two linear ops with activation between them.
+        // This keeps them in a single CoreML program for deep-chain ANE benefit.
+        let allOps = (consumedOps + [rootOp]).sorted { a, b in
+            // Sort by result name to get topological order
+            a.result < b.result
+        }
+
+        // Find matmul ops and activation
+        let matmuls = allOps.filter { $0.kind == .dot || $0.kind == .dotGeneral }
+
+        if matmuls.count >= 2 {
+            let firstMatmul = matmuls[0]
+            let secondMatmul = matmuls[1]
+
+            var ops: [CoreMLOp] = []
+
+            // First matmul
+            let firstResultName = resultName + "_ffn_fc1"
+            ops.append(CoreMLOp(
+                result: firstResultName, op: "matmul",
+                shape: firstMatmul.resultType.shape,
+                params: [
+                    ("x", .variable(coreMLName(firstMatmul.operands[0]))),
+                    ("y", .variable(coreMLName(firstMatmul.operands[1]))),
+                    ("transpose_x", .boolValue(false)),
+                    ("transpose_y", .boolValue(false)),
+                ]
+            ))
+
+            // Activation (if any)
+            let activationName = resultName + "_ffn_act"
+            let activationType = metadata.activation ?? "gelu"
+            let milActivation: String
+            switch activationType {
+            case "relu": milActivation = "relu"
+            case "silu", "swish": milActivation = "silu"
+            default: milActivation = "gelu"
+            }
+
+            // For silu, we need sigmoid + mul
+            if milActivation == "silu" {
+                let sigName = activationName + "_sig"
+                ops.append(CoreMLOp(
+                    result: sigName, op: "sigmoid",
+                    shape: firstMatmul.resultType.shape,
+                    params: [("x", .variable(firstResultName))]
+                ))
+                ops.append(CoreMLOp(
+                    result: activationName, op: "mul",
+                    shape: firstMatmul.resultType.shape,
+                    params: [("x", .variable(firstResultName)), ("y", .variable(sigName))]
+                ))
+            } else {
+                ops.append(CoreMLOp(
+                    result: activationName, op: milActivation,
+                    shape: firstMatmul.resultType.shape,
+                    params: [("x", .variable(firstResultName))]
+                ))
+            }
+
+            // Second matmul
+            ops.append(CoreMLOp(
+                result: resultName, op: "matmul", shape: outputShape,
+                params: [
+                    ("x", .variable(activationName)),
+                    ("y", .variable(coreMLName(secondMatmul.operands[1]))),
+                    ("transpose_x", .boolValue(false)),
+                    ("transpose_y", .boolValue(false)),
+                ]
+            ))
+
+            return ops
+        }
+
+        // Fallback: emit ops individually
+        var ops: [CoreMLOp] = []
+        for op in allOps {
+            let translated = try? translateOp(op, operandShapes: &operandShapes)
+            if let translated = translated {
+                ops.append(contentsOf: translated)
+            }
+        }
+        return ops
+    }
+
     // MARK: - Operation Translation
 
     private func translateOp(

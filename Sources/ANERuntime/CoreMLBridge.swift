@@ -57,10 +57,14 @@ public final class CoreMLBridge: @unchecked Sendable {
             weightsData: weightsData
         )
 
-        // Compile with CoreML
+        // Compile with CoreML (guarded by watchdog)
         let compiledPath: URL
         do {
-            compiledPath = try MLModel.compileModel(at: packagePath)
+            compiledPath = try ANEWatchdog.withTimeout {
+                try MLModel.compileModel(at: packagePath)
+            }
+        } catch let error as ANEError {
+            throw error
         } catch {
             throw ANEError.coreMLCompilationFailed(
                 "MLModel.compileModel failed: \(error.localizedDescription)"
@@ -130,7 +134,9 @@ public final class CoreMLBridge: @unchecked Sendable {
         }
 
         let provider = try MLDictionaryFeatureProvider(dictionary: featureDict)
-        let prediction = try program.model.prediction(from: provider)
+        let prediction = try ANEWatchdog.withTimeout {
+            try program.model.prediction(from: provider)
+        }
 
         // Extract output — use first feature
         guard let outputName = prediction.featureNames.first,
@@ -140,6 +146,49 @@ public final class CoreMLBridge: @unchecked Sendable {
         }
 
         // Convert MLMultiArray to [Float]
+        let count = outputArray.count
+        var result = [Float](repeating: 0, count: count)
+        let outPtr = outputArray.dataPointer.bindMemory(to: Float.self, capacity: count)
+        for i in 0..<count {
+            result[i] = outPtr[i]
+        }
+        return result
+    }
+
+    /// Executes a compiled CoreML program with pre-built MLMultiArray inputs.
+    ///
+    /// This avoids the Float array → MLMultiArray copy on the input path,
+    /// enabling zero-copy execution when inputs are backed by shared memory
+    /// (e.g., IOSurface-backed Metal buffers).
+    ///
+    /// - Parameters:
+    ///   - program: A compiled CoreMLProgram.
+    ///   - multiArrayInputs: Named MLMultiArray inputs.
+    /// - Returns: Output as flat Float32 array.
+    public func execute(
+        _ program: CoreMLProgram,
+        multiArrayInputs: [(name: String, array: MLMultiArray)]
+    ) throws -> [Float] {
+        guard program.isValid else {
+            throw ANEError.executionFailed("CoreML program has been released")
+        }
+
+        var featureDict: [String: MLFeatureValue] = [:]
+        for input in multiArrayInputs {
+            featureDict[input.name] = MLFeatureValue(multiArray: input.array)
+        }
+
+        let provider = try MLDictionaryFeatureProvider(dictionary: featureDict)
+        let prediction = try ANEWatchdog.withTimeout {
+            try program.model.prediction(from: provider)
+        }
+
+        guard let outputName = prediction.featureNames.first,
+              let outputValue = prediction.featureValue(for: outputName),
+              let outputArray = outputValue.multiArrayValue else {
+            throw ANEError.executionFailed("No output from CoreML prediction")
+        }
+
         let count = outputArray.count
         var result = [Float](repeating: 0, count: count)
         let outPtr = outputArray.dataPointer.bindMemory(to: Float.self, capacity: count)
