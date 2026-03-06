@@ -6,6 +6,8 @@
 import CPJRTApi
 import Metal
 import Foundation
+import ANERuntime
+import MetalHLO
 
 /// Concrete backing storage for opaque PJRT_DeviceDescription pointers.
 final class PJRTDeviceDescriptionImpl: @unchecked Sendable {
@@ -20,6 +22,12 @@ final class PJRTDeviceDescriptionImpl: @unchecked Sendable {
     let cDebugString: UnsafeMutablePointer<CChar>
     let cDisplayString: UnsafeMutablePointer<CChar>
 
+    // Device attributes (stable C arrays for PJRT_NamedValue)
+    let attributes: UnsafeMutableBufferPointer<PJRT_NamedValue>
+    let numAttributes: Int
+    private let attrNamePtrs: [UnsafeMutablePointer<CChar>]
+    private let attrStringPtrs: [UnsafeMutablePointer<CChar>]
+
     init(device: MTLDevice, id: Int32) {
         self.id = id
         self.processIndex = 0
@@ -29,12 +37,69 @@ final class PJRTDeviceDescriptionImpl: @unchecked Sendable {
         self.cKind = strdup(kind)!
         self.cDebugString = strdup(debugString)!
         self.cDisplayString = strdup(displayString)!
+
+        // Build device attributes
+        let aneInfo = ANEAvailability().probe()
+        let policy = ProcessInfo.processInfo.environment["METALHLO_DEVICE_POLICY"] ?? "auto"
+
+        var names: [UnsafeMutablePointer<CChar>] = []
+        var stringValues: [UnsafeMutablePointer<CChar>] = []
+        var namedValues: [PJRT_NamedValue] = []
+
+        // Attribute: ane_available (bool)
+        let aneAvailName = strdup("ane_available")!
+        names.append(aneAvailName)
+        var aneAvailAttr = PJRT_NamedValue()
+        aneAvailAttr.struct_size = MemoryLayout<PJRT_NamedValue>.size
+        aneAvailAttr.name = UnsafePointer(aneAvailName)
+        aneAvailAttr.name_size = strlen(aneAvailName)
+        aneAvailAttr.type = PJRT_NamedValue_kBool
+        aneAvailAttr.bool_value = aneInfo.isAvailable
+        aneAvailAttr.value_size = 1
+        namedValues.append(aneAvailAttr)
+
+        // Attribute: device_policy (string)
+        let policyName = strdup("device_policy")!
+        let policyValue = strdup(policy)!
+        names.append(policyName)
+        stringValues.append(policyValue)
+        var policyAttr = PJRT_NamedValue()
+        policyAttr.struct_size = MemoryLayout<PJRT_NamedValue>.size
+        policyAttr.name = UnsafePointer(policyName)
+        policyAttr.name_size = strlen(policyName)
+        policyAttr.type = PJRT_NamedValue_kString
+        policyAttr.string_value = UnsafePointer(policyValue)
+        policyAttr.value_size = strlen(policyValue)
+        namedValues.append(policyAttr)
+
+        // Attribute: ane_core_count (int64)
+        if aneInfo.isAvailable {
+            let coreName = strdup("ane_core_count")!
+            names.append(coreName)
+            var coreAttr = PJRT_NamedValue()
+            coreAttr.struct_size = MemoryLayout<PJRT_NamedValue>.size
+            coreAttr.name = UnsafePointer(coreName)
+            coreAttr.name_size = strlen(coreName)
+            coreAttr.type = PJRT_NamedValue_kInt64
+            coreAttr.int64_value = Int64(aneInfo.coreCount)
+            coreAttr.value_size = 1
+            namedValues.append(coreAttr)
+        }
+
+        self.numAttributes = namedValues.count
+        self.attributes = .allocate(capacity: max(namedValues.count, 1))
+        for (i, v) in namedValues.enumerated() { attributes[i] = v }
+        self.attrNamePtrs = names
+        self.attrStringPtrs = stringValues
     }
 
     deinit {
         free(cKind)
         free(cDebugString)
         free(cDisplayString)
+        attributes.deallocate()
+        for ptr in attrNamePtrs { free(ptr) }
+        for ptr in attrStringPtrs { free(ptr) }
     }
 }
 
@@ -79,12 +144,12 @@ func pjrt_device_description_process_index(
 func pjrt_device_description_attributes(
     _ args: UnsafeMutablePointer<PJRT_DeviceDescription_Attributes_Args>?
 ) -> UnsafeMutablePointer<PJRT_Error>? {
-    guard let args = args else {
+    guard let args = args, let descPtr = args.pointee.device_description else {
         return makeError(PJRT_Error_Code_INVALID_ARGUMENT, "NULL args")
     }
-    // No custom attributes for now
-    args.pointee.num_attributes = 0
-    args.pointee.attributes = nil
+    let desc = fromOpaque(OpaquePointer(descPtr), as: PJRTDeviceDescriptionImpl.self)
+    args.pointee.num_attributes = desc.numAttributes
+    args.pointee.attributes = UnsafePointer(desc.attributes.baseAddress)
     return nil
 }
 

@@ -384,12 +384,13 @@ struct CAPITests {
 
     @Test("Compile config initialization")
     func testCompileConfigInit() {
-        var config = MHLOCompileConfig(optimization_level: 0, enable_caching: false, enable_debug_info: false)
+        var config = MHLOCompileConfig(optimization_level: 0, enable_caching: false, enable_debug_info: false, device_policy: 0)
         mhlo_compile_config_init(&config)
 
         #expect(config.optimization_level == 2)  // O2 default
         #expect(config.enable_caching == true)
         #expect(config.enable_debug_info == false)
+        #expect(config.device_policy == 0)  // MHLO_DEVICE_GPU_ONLY (backward compatible default)
     }
 
     @Test("Compile with configuration")
@@ -399,7 +400,7 @@ struct CAPITests {
         #expect(status == 0)
 
         // Initialize config
-        var config = MHLOCompileConfig(optimization_level: 0, enable_caching: false, enable_debug_info: false)
+        var config = MHLOCompileConfig(optimization_level: 0, enable_caching: false, enable_debug_info: false, device_policy: 0)
         mhlo_compile_config_init(&config)
         config.optimization_level = 3  // O3
 
@@ -533,6 +534,218 @@ struct CAPITests {
         #expect(stats.total_execution_time_ms == 0)
 
         // Cleanup
+        mhlo_buffer_destroy(bufferA)
+        mhlo_buffer_destroy(bufferB)
+        mhlo_executable_destroy(executable)
+        mhlo_client_destroy(client)
+    }
+
+    // MARK: - Device Policy Tests
+
+    @Test("ANE availability check does not crash")
+    func testANEAvailable() {
+        // Just verify it returns a valid bool without crashing
+        let available = mhlo_ane_available()
+        // Result is hardware-dependent, just check it's a valid bool
+        #expect(available == true || available == false)
+    }
+
+    @Test("Compile with each device policy")
+    func testCompileWithDevicePolicy() throws {
+        var client: OpaquePointer?
+        var status = mhlo_client_create(&client)
+        #expect(status == 0)
+
+        let mlir = """
+        module @policy_test {
+          func.func @main(%a: tensor<4xf32>, %b: tensor<4xf32>) -> (tensor<4xf32>) {
+            %0 = stablehlo.add %a, %b : tensor<4xf32>
+            return %0 : tensor<4xf32>
+          }
+        }
+        """
+
+        // Test each device policy value
+        let policies: [Int32] = [0, 1, 2, 3, 4]  // GPU_ONLY, ANE_ONLY, AUTO, PREFER_ANE, PREFER_GPU
+        for policy in policies {
+            var config = MHLOCompileConfig(optimization_level: 0, enable_caching: false, enable_debug_info: false, device_policy: 0)
+            mhlo_compile_config_init(&config)
+            config.device_policy = policy
+
+            var executable: OpaquePointer?
+            status = mhlo_compile_with_config(client, mlir, &config, &executable)
+            #expect(status == 0, "Compile failed for device_policy=\(policy)")
+            #expect(executable != nil)
+
+            if let executable = executable {
+                mhlo_executable_destroy(executable)
+            }
+        }
+
+        mhlo_client_destroy(client)
+    }
+
+    @Test("Execute with profile")
+    func testExecuteWithProfile() throws {
+        var client: OpaquePointer?
+        var status = mhlo_client_create(&client)
+        #expect(status == 0)
+
+        let mlir = """
+        module @profile_test {
+          func.func @main(%a: tensor<4xf32>, %b: tensor<4xf32>) -> (tensor<4xf32>) {
+            %0 = stablehlo.add %a, %b : tensor<4xf32>
+            return %0 : tensor<4xf32>
+          }
+        }
+        """
+
+        // Compile with AUTO policy to exercise heterogeneous path
+        var config = MHLOCompileConfig(optimization_level: 0, enable_caching: false, enable_debug_info: false, device_policy: 0)
+        mhlo_compile_config_init(&config)
+        config.device_policy = 2  // MHLO_DEVICE_AUTO
+
+        var executable: OpaquePointer?
+        status = mhlo_compile_with_config(client, mlir, &config, &executable)
+        #expect(status == 0)
+
+        // Create input buffers
+        let aData: [Float] = [1.0, 2.0, 3.0, 4.0]
+        let bData: [Float] = [5.0, 6.0, 7.0, 8.0]
+        let shape: [Int64] = [4]
+
+        var bufferA: OpaquePointer?
+        var bufferB: OpaquePointer?
+
+        status = aData.withUnsafeBytes { dataPtr in
+            shape.withUnsafeBufferPointer { shapePtr in
+                mhlo_buffer_create(client, dataPtr.baseAddress, dataPtr.count, shapePtr.baseAddress, 1, 1, &bufferA)
+            }
+        }
+        #expect(status == 0)
+
+        status = bData.withUnsafeBytes { dataPtr in
+            shape.withUnsafeBufferPointer { shapePtr in
+                mhlo_buffer_create(client, dataPtr.baseAddress, dataPtr.count, shapePtr.baseAddress, 1, 1, &bufferB)
+            }
+        }
+        #expect(status == 0)
+
+        // Execute with profile
+        var inputs: [OpaquePointer?] = [bufferA, bufferB]
+        var outputs: [OpaquePointer?] = [nil]
+        var numOutputs: Int32 = 0
+        var profile = MHLOExecutionProfile(
+            partition_count: 0,
+            gpu_partition_count: 0,
+            ane_partition_count: 0,
+            gpu_time_ms: 0,
+            ane_time_ms: 0,
+            transfer_time_ms: 0,
+            total_time_ms: 0,
+            used_ane: false
+        )
+
+        status = inputs.withUnsafeBufferPointer { inputsPtr in
+            outputs.withUnsafeMutableBufferPointer { outputsPtr in
+                mhlo_execute_with_profile(
+                    executable,
+                    inputsPtr.baseAddress,
+                    2,
+                    outputsPtr.baseAddress,
+                    &numOutputs,
+                    &profile
+                )
+            }
+        }
+        #expect(status == 0)
+        #expect(numOutputs == 1)
+
+        // Profile should have valid data
+        #expect(profile.partition_count >= 1)
+        #expect(profile.gpu_partition_count >= 0)
+        #expect(profile.ane_partition_count >= 0)
+        #expect(profile.total_time_ms >= 0)
+        #expect(profile.gpu_partition_count + profile.ane_partition_count == profile.partition_count)
+
+        // Verify output is correct
+        if let output = outputs[0] {
+            var result = [Float](repeating: 0, count: 4)
+            status = result.withUnsafeMutableBytes { resultPtr in
+                mhlo_buffer_to_host(output, resultPtr.baseAddress, resultPtr.count)
+            }
+            #expect(status == 0)
+            #expect(result == [6.0, 8.0, 10.0, 12.0])
+            mhlo_buffer_destroy(output)
+        }
+
+        // Cleanup
+        mhlo_buffer_destroy(bufferA)
+        mhlo_buffer_destroy(bufferB)
+        mhlo_executable_destroy(executable)
+        mhlo_client_destroy(client)
+    }
+
+    @Test("Execute with profile NULL skips profiling")
+    func testExecuteWithProfileNull() throws {
+        var client: OpaquePointer?
+        var status = mhlo_client_create(&client)
+        #expect(status == 0)
+
+        let mlir = """
+        module @profile_null {
+          func.func @main(%a: tensor<4xf32>, %b: tensor<4xf32>) -> (tensor<4xf32>) {
+            %0 = stablehlo.add %a, %b : tensor<4xf32>
+            return %0 : tensor<4xf32>
+          }
+        }
+        """
+
+        var executable: OpaquePointer?
+        status = mhlo_compile(client, mlir, &executable)
+        #expect(status == 0)
+
+        let data: [Float] = [1.0, 2.0, 3.0, 4.0]
+        let shape: [Int64] = [4]
+        var bufferA: OpaquePointer?
+        var bufferB: OpaquePointer?
+
+        status = data.withUnsafeBytes { dataPtr in
+            shape.withUnsafeBufferPointer { shapePtr in
+                mhlo_buffer_create(client, dataPtr.baseAddress, dataPtr.count, shapePtr.baseAddress, 1, 1, &bufferA)
+            }
+        }
+        #expect(status == 0)
+
+        status = data.withUnsafeBytes { dataPtr in
+            shape.withUnsafeBufferPointer { shapePtr in
+                mhlo_buffer_create(client, dataPtr.baseAddress, dataPtr.count, shapePtr.baseAddress, 1, 1, &bufferB)
+            }
+        }
+        #expect(status == 0)
+
+        // Execute with NULL profile — should succeed without crash
+        var inputs: [OpaquePointer?] = [bufferA, bufferB]
+        var outputs: [OpaquePointer?] = [nil]
+        var numOutputs: Int32 = 0
+
+        status = inputs.withUnsafeBufferPointer { inputsPtr in
+            outputs.withUnsafeMutableBufferPointer { outputsPtr in
+                mhlo_execute_with_profile(
+                    executable,
+                    inputsPtr.baseAddress,
+                    2,
+                    outputsPtr.baseAddress,
+                    &numOutputs,
+                    nil
+                )
+            }
+        }
+        #expect(status == 0)
+        #expect(numOutputs == 1)
+
+        // Cleanup
+        if let output = outputs[0] { mhlo_buffer_destroy(output) }
         mhlo_buffer_destroy(bufferA)
         mhlo_buffer_destroy(bufferB)
         mhlo_executable_destroy(executable)

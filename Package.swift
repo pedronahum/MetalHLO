@@ -77,7 +77,7 @@ let package = Package(
         // MARK: - C API
         .target(
             name: "CMetalHLO",
-            dependencies: ["MetalHLO"],
+            dependencies: ["MetalHLO", "ANERuntime"],
             path: "Sources/CMetalHLO",
             publicHeadersPath: "include"
         ),
@@ -93,7 +93,7 @@ let package = Package(
         // MARK: - PJRT Plugin Implementation
         .target(
             name: "PJRTMetalHLO",
-            dependencies: ["MetalHLO", "MetalHLOCore", "CPJRTApi"],
+            dependencies: ["MetalHLO", "MetalHLOCore", "CPJRTApi", "ANERuntime"],
             path: "Sources/PJRTMetalHLO",
             linkerSettings: [
                 .linkedFramework("Metal"),

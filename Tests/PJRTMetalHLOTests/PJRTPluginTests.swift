@@ -317,6 +317,92 @@ struct PJRTPluginTests {
         destroyClient(clientPtr)
     }
 
+    @Test("Device attributes include ANE availability and device policy")
+    func deviceAttributes() {
+        let clientPtr = createClient()!
+
+        // Get devices
+        var devArgs = PJRT_Client_Devices_Args()
+        devArgs.struct_size = MemoryLayout<PJRT_Client_Devices_Args>.size
+        devArgs.client = clientPtr
+        let _ = pjrt_client_devices(&devArgs)
+        #expect(devArgs.num_devices >= 1)
+
+        // Get device description
+        let devicePtr = devArgs.devices![0]!
+        var descArgs = PJRT_Device_GetDescription_Args()
+        descArgs.struct_size = MemoryLayout<PJRT_Device_GetDescription_Args>.size
+        descArgs.device = devicePtr
+        let _ = pjrt_device_get_description(&descArgs)
+        let descPtr = descArgs.device_description!
+
+        // Get attributes
+        var attrArgs = PJRT_DeviceDescription_Attributes_Args()
+        attrArgs.struct_size = MemoryLayout<PJRT_DeviceDescription_Attributes_Args>.size
+        attrArgs.device_description = descPtr
+        let attrError = pjrt_device_description_attributes(&attrArgs)
+        #expect(attrError == nil)
+
+        // Should have at least 2 attributes: ane_available, device_policy
+        #expect(attrArgs.num_attributes >= 2)
+
+        // Check attribute names
+        var foundANE = false
+        var foundPolicy = false
+        if let attrs = attrArgs.attributes {
+            for i in 0..<attrArgs.num_attributes {
+                let attr = attrs[i]
+                let name = String(cString: attr.name!)
+                if name == "ane_available" {
+                    foundANE = true
+                    #expect(attr.type == PJRT_NamedValue_kBool)
+                }
+                if name == "device_policy" {
+                    foundPolicy = true
+                    #expect(attr.type == PJRT_NamedValue_kString)
+                }
+            }
+        }
+        #expect(foundANE, "Should have ane_available attribute")
+        #expect(foundPolicy, "Should have device_policy attribute")
+
+        destroyClient(clientPtr)
+    }
+
+    @Test("Compile uses auto device policy by default")
+    func compileDefaultDevicePolicy() {
+        // Verify compilation succeeds with default .auto policy
+        let clientPtr = createClient()!
+
+        let mlir = """
+            module @policy_test {
+              func.func @main(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>) -> (tensor<4xf32>) {
+                %0 = stablehlo.add %arg0, %arg1 : tensor<4xf32>
+                return %0 : tensor<4xf32>
+              }
+            }
+            """
+
+        let loadedExe = compile(client: clientPtr, mlir: mlir)
+        #expect(loadedExe != nil, "Compilation with auto policy should succeed")
+
+        if let exe = loadedExe {
+            // Execute to verify correctness
+            let bufA = createF32Buffer(client: clientPtr, data: [1, 2, 3, 4], shape: [4])!
+            let bufB = createF32Buffer(client: clientPtr, data: [10, 20, 30, 40], shape: [4])!
+            let outputs = execute(loadedExe: exe, inputs: [bufA, bufB], numOutputs: 1)
+            let result = readF32Buffer(outputs[0]!, count: 4)
+            #expect(result == [11.0, 22.0, 33.0, 44.0])
+
+            for output in outputs { if let o = output { destroyBuffer(o) } }
+            destroyBuffer(bufA)
+            destroyBuffer(bufB)
+            destroyLoadedExecutable(exe)
+        }
+
+        destroyClient(clientPtr)
+    }
+
     @Test("Executable serialize and deserialize round-trip")
     func executableSerializeAndDeserialize() {
         let clientPtr = createClient()!

@@ -285,6 +285,33 @@ final class PJRTLoadedExecutableImpl: @unchecked Sendable {
     }
 }
 
+// MARK: - Device Policy Resolution
+
+/// Resolves the device policy for PJRT compilation.
+///
+/// Checks the `METALHLO_DEVICE_POLICY` environment variable first, then
+/// defaults to `.auto` (cost-model decides GPU vs ANE partitioning).
+///
+/// Environment variable values (case-insensitive):
+///   - `gpu_only` / `gpuonly` — GPU only, no ANE
+///   - `ane_only` / `aneonly` — Force ANE for compatible ops
+///   - `auto` — Cost-model decides (default)
+///   - `prefer_ane` / `preferane` — Bias toward ANE
+///   - `prefer_gpu` / `prefergpu` — Bias toward GPU
+private func resolveDevicePolicy() -> DevicePolicy {
+    if let env = ProcessInfo.processInfo.environment["METALHLO_DEVICE_POLICY"] {
+        switch env.lowercased() {
+        case "gpu_only", "gpuonly": return .gpuOnly
+        case "ane_only", "aneonly": return .aneOnly
+        case "auto": return .auto
+        case "prefer_ane", "preferane": return .preferANE
+        case "prefer_gpu", "prefergpu": return .preferGPU
+        default: break
+        }
+    }
+    return .auto
+}
+
 // MARK: - Client Compile
 
 func pjrt_client_compile(
@@ -328,8 +355,10 @@ func pjrt_client_compile(
     }
 
     do {
-        // Use O2 optimization by default for the PJRT path
-        let config = CompilationConfig(optimizationLevel: .O2)
+        let config = CompilationConfig(
+            optimizationLevel: .O2,
+            devicePolicy: resolveDevicePolicy()
+        )
         let executable = try impl.client.compile(mlirSource, config: config)
 
         let meta = PJRTExecutableImpl(
@@ -681,7 +710,10 @@ func pjrt_executable_deserialize_and_load(
 
     // Re-compile
     do {
-        let config = CompilationConfig(optimizationLevel: .O2)
+        let config = CompilationConfig(
+            optimizationLevel: .O2,
+            devicePolicy: resolveDevicePolicy()
+        )
         let executable = try impl.client.compile(mlirSource, config: config)
 
         let meta = PJRTExecutableImpl(

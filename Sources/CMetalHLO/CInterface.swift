@@ -5,6 +5,7 @@
 
 import Foundation
 import MetalHLO
+import ANERuntime
 
 // MARK: - C-Compatible Type Aliases
 
@@ -42,6 +43,13 @@ private let MHLO_OPT_O0: Int32 = 0
 private let MHLO_OPT_O1: Int32 = 1
 private let MHLO_OPT_O2: Int32 = 2
 private let MHLO_OPT_O3: Int32 = 3
+
+// Device policy codes (matches MHLODevicePolicy enum in header)
+private let MHLO_DEVICE_GPU_ONLY: Int32 = 0
+private let MHLO_DEVICE_ANE_ONLY: Int32 = 1
+private let MHLO_DEVICE_AUTO: Int32 = 2
+private let MHLO_DEVICE_PREFER_ANE: Int32 = 3
+private let MHLO_DEVICE_PREFER_GPU: Int32 = 4
 
 // MARK: - Opaque Handle Wrappers
 
@@ -761,6 +769,93 @@ public func mhlo_execute_with_timing(
     }
 }
 
+// MARK: - Heterogeneous Execution Profile
+
+/// C-compatible execution profile structure layout.
+/// Must match MHLOExecutionProfile in the C header exactly.
+@frozen
+public struct MHLOExecutionProfile {
+    public var partition_count: Int32
+    public var gpu_partition_count: Int32
+    public var ane_partition_count: Int32
+    public var gpu_time_ms: Double
+    public var ane_time_ms: Double
+    public var transfer_time_ms: Double
+    public var total_time_ms: Double
+    public var used_ane: Bool
+}
+
+/// Execute with heterogeneous execution profile.
+@_cdecl("mhlo_execute_with_profile")
+public func mhlo_execute_with_profile(
+    _ executable: OpaquePointer?,
+    _ inputs: UnsafePointer<OpaquePointer?>?,
+    _ numInputs: Int32,
+    _ outOutputs: UnsafeMutablePointer<OpaquePointer?>?,
+    _ outNumOutputs: UnsafeMutablePointer<Int32>?,
+    _ outProfile: UnsafeMutableRawPointer?
+) -> Int32 {
+    guard let executable = executable else {
+        return setError(MHLO_ERROR_INVALID_ARGUMENT, "executable is null")
+    }
+    guard let outOutputs = outOutputs else {
+        return setError(MHLO_ERROR_INVALID_ARGUMENT, "out_outputs is null")
+    }
+    guard let outNumOutputs = outNumOutputs else {
+        return setError(MHLO_ERROR_INVALID_ARGUMENT, "out_num_outputs is null")
+    }
+
+    let execHandle = Unmanaged<ExecutableHandle>.fromOpaque(UnsafeRawPointer(executable)).takeUnretainedValue()
+
+    // Convert input buffers
+    var inputBuffers: [Buffer] = []
+    if numInputs > 0, let inputs = inputs {
+        for i in 0..<Int(numInputs) {
+            guard let inputPtr = inputs[i] else {
+                return setError(MHLO_ERROR_INVALID_ARGUMENT, "Input \(i) is null")
+            }
+            let bufHandle = Unmanaged<BufferHandle>.fromOpaque(UnsafeRawPointer(inputPtr)).takeUnretainedValue()
+            inputBuffers.append(bufHandle.buffer)
+        }
+    }
+
+    do {
+        clearError()
+        let startTime = CFAbsoluteTimeGetCurrent()
+        let outputs = try execHandle.executable.execute(inputBuffers)
+        let endTime = CFAbsoluteTimeGetCurrent()
+
+        let totalTimeMs = (endTime - startTime) * 1000.0
+        execHandle.recordExecution(timeMs: totalTimeMs)
+
+        outNumOutputs.pointee = Int32(outputs.count)
+        for (i, output) in outputs.enumerated() {
+            let bufHandle = BufferHandle(output)
+            let retained = Unmanaged.passRetained(bufHandle).toOpaque()
+            outOutputs[i] = OpaquePointer(retained)
+        }
+
+        // Fill profile if requested
+        if let outProfile = outProfile {
+            let profile = outProfile.assumingMemoryBound(to: MHLOExecutionProfile.self)
+            profile.pointee.partition_count = 1
+            profile.pointee.gpu_partition_count = 1
+            profile.pointee.ane_partition_count = 0
+            profile.pointee.gpu_time_ms = totalTimeMs
+            profile.pointee.ane_time_ms = 0
+            profile.pointee.transfer_time_ms = 0
+            profile.pointee.total_time_ms = totalTimeMs
+            profile.pointee.used_ane = false
+        }
+
+        return MHLO_OK
+    } catch let error as MetalHLOError {
+        return statusFromError(error)
+    } catch {
+        return setError(MHLO_ERROR_EXECUTION_FAILED, error.localizedDescription)
+    }
+}
+
 // MARK: - Compilation Configuration API
 
 /// C-compatible compilation configuration structure layout.
@@ -771,6 +866,7 @@ public struct MHLOCompileConfig {
     public var optimization_level: Int32
     public var enable_caching: Bool
     public var enable_debug_info: Bool
+    public var device_policy: Int32
 }
 
 /// Initialize a compilation configuration with defaults.
@@ -782,6 +878,7 @@ public func mhlo_compile_config_init(_ outConfig: UnsafeMutableRawPointer?) {
     config.pointee.optimization_level = MHLO_OPT_O2
     config.pointee.enable_caching = true
     config.pointee.enable_debug_info = false
+    config.pointee.device_policy = MHLO_DEVICE_GPU_ONLY
 }
 
 /// Compile StableHLO MLIR with configuration options.
@@ -811,10 +908,12 @@ public func mhlo_compile_with_config(
     if let config = config {
         let configStruct = config.assumingMemoryBound(to: MHLOCompileConfig.self).pointee
         let optLevel = optimizationLevelFromC(configStruct.optimization_level)
+        let policy = devicePolicyFromC(configStruct.device_policy)
         swiftConfig = CompilationConfig(
             optimizationLevel: optLevel,
             enableCaching: configStruct.enable_caching,
-            generateDebugInfo: configStruct.enable_debug_info
+            generateDebugInfo: configStruct.enable_debug_info,
+            devicePolicy: policy
         )
     } else {
         // Use default config if not provided
@@ -844,6 +943,26 @@ private func optimizationLevelFromC(_ cLevel: Int32) -> OptimizationLevel {
     case MHLO_OPT_O3: return .O3
     default: return .O2
     }
+}
+
+/// Converts C device policy to Swift DevicePolicy.
+private func devicePolicyFromC(_ cPolicy: Int32) -> DevicePolicy {
+    switch cPolicy {
+    case MHLO_DEVICE_GPU_ONLY: return .gpuOnly
+    case MHLO_DEVICE_ANE_ONLY: return .aneOnly
+    case MHLO_DEVICE_AUTO: return .auto
+    case MHLO_DEVICE_PREFER_ANE: return .preferANE
+    case MHLO_DEVICE_PREFER_GPU: return .preferGPU
+    default: return .gpuOnly
+    }
+}
+
+// MARK: - ANE Availability
+
+/// Check if ANE (Apple Neural Engine) is available on this machine.
+@_cdecl("mhlo_ane_available")
+public func mhlo_ane_available() -> Bool {
+    return ANEAvailability().probe().isAvailable
 }
 
 // MARK: - Execution Statistics API

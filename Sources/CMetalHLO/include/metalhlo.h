@@ -106,6 +106,15 @@ typedef enum {
     MHLO_OPT_O3 = 3,  // Aggressive optimization (multiple fusion passes)
 } MHLOOptimizationLevel;
 
+/// Device policy for GPU/ANE partitioning.
+typedef enum {
+    MHLO_DEVICE_GPU_ONLY = 0,    // GPU only (default, backward compatible)
+    MHLO_DEVICE_ANE_ONLY = 1,    // Force ANE for compatible ops
+    MHLO_DEVICE_AUTO = 2,        // Cost-model decides
+    MHLO_DEVICE_PREFER_ANE = 3,  // Bias toward ANE when cost is similar
+    MHLO_DEVICE_PREFER_GPU = 4,  // Bias toward GPU when cost is similar
+} MHLODevicePolicy;
+
 /// Compilation configuration.
 typedef struct {
     /// Optimization level (default: MHLO_OPT_O2).
@@ -114,11 +123,17 @@ typedef struct {
     bool enable_caching;
     /// Enable debug info generation (default: false).
     bool enable_debug_info;
+    /// Device policy for GPU/ANE partitioning (default: MHLO_DEVICE_GPU_ONLY).
+    MHLODevicePolicy device_policy;
 } MHLOCompileConfig;
 
 /// Initialize a compilation configuration with defaults.
 /// - Parameter out_config: Output configuration struct.
 void mhlo_compile_config_init(MHLOCompileConfig* out_config);
+
+/// Check if ANE (Apple Neural Engine) is available on this machine.
+/// - Returns: true if ANE is available, false otherwise.
+bool mhlo_ane_available(void);
 
 // ============================================================================
 // Compilation API
@@ -329,6 +344,49 @@ MHLOStatusCode mhlo_execute_with_timing(
     double* out_encode_time,
     double* out_gpu_time,
     double* out_total_time
+);
+
+// ============================================================================
+// Heterogeneous Execution Profile
+// ============================================================================
+
+/// Execution profile with GPU/ANE partition breakdown.
+typedef struct {
+    /// Total number of partitions in the execution plan.
+    int32_t partition_count;
+    /// Number of partitions executed on GPU.
+    int32_t gpu_partition_count;
+    /// Number of partitions executed on ANE.
+    int32_t ane_partition_count;
+    /// GPU execution time in milliseconds.
+    double gpu_time_ms;
+    /// ANE execution time in milliseconds.
+    double ane_time_ms;
+    /// Data transfer time between GPU and ANE in milliseconds.
+    double transfer_time_ms;
+    /// Total wall-clock execution time in milliseconds.
+    double total_time_ms;
+    /// Whether ANE was used in this execution.
+    bool used_ane;
+} MHLOExecutionProfile;
+
+/// Execute with heterogeneous execution profile.
+/// Provides breakdown of GPU vs ANE execution when using heterogeneous mode.
+/// - Parameters:
+///   - executable: The executable.
+///   - inputs: Array of input buffer handles.
+///   - num_inputs: Number of inputs.
+///   - out_outputs: Output array for output buffer handles.
+///   - out_num_outputs: Output number of outputs.
+///   - out_profile: Output profile struct (can be NULL to skip profiling).
+/// - Returns: MHLO_OK on success, error code otherwise.
+MHLOStatusCode mhlo_execute_with_profile(
+    MHLOExecutableRef executable,
+    const MHLOBufferRef* inputs,
+    int32_t num_inputs,
+    MHLOBufferRef* out_outputs,
+    int32_t* out_num_outputs,
+    MHLOExecutionProfile* out_profile
 );
 
 // ============================================================================
