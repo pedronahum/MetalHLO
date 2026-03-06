@@ -37,6 +37,13 @@ final class TensorTransferManager: @unchecked Sendable {
     /// Tensor types for all stored tensors.
     private var tensorTypes: [String: TensorType] = [:]
 
+    /// Tracks which tensors have been fully written and are safe to read.
+    /// In the level-based concurrent scheduler, all tensors from level N are
+    /// implicitly ready when level N+1 starts. This tracking supports future
+    /// finer-grained task-level schedulers that dispatch individual partitions
+    /// as soon as all their input tensors become available.
+    private var readyTensors: Set<String> = []
+
     init(device: MTLDevice) {
         self.device = device
     }
@@ -171,6 +178,31 @@ final class TensorTransferManager: @unchecked Sendable {
         return nil
     }
 
+    // MARK: - Readiness Tracking
+
+    /// Marks a tensor as fully written and safe to read from any device.
+    func markReady(name: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        readyTensors.insert(name)
+    }
+
+    /// Marks multiple tensors as ready atomically.
+    func markReady(names: some Sequence<String>) {
+        lock.lock()
+        defer { lock.unlock() }
+        for name in names {
+            readyTensors.insert(name)
+        }
+    }
+
+    /// Checks if a tensor has been marked as ready for consumption.
+    func isReady(name: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return readyTensors.contains(name)
+    }
+
     // MARK: - Query
 
     /// Checks if a tensor is available (in either GPU or CPU form).
@@ -197,6 +229,7 @@ final class TensorTransferManager: @unchecked Sendable {
         cpuArrays.removeAll()
         sharedBuffers.removeAll()
         tensorTypes.removeAll()
+        readyTensors.removeAll()
     }
 }
 

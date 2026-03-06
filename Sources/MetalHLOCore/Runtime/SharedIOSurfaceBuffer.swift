@@ -19,6 +19,12 @@ import CoreML
 
 /// A buffer backed by IOSurface that can be accessed as both a Metal
 /// buffer and a CoreML MLMultiArray without copying.
+///
+/// Memory coherence: On Apple Silicon, `storageModeShared` places the
+/// buffer in cache-coherent unified memory accessible by both GPU and ANE.
+/// No explicit GPU→ANE memory barrier is needed beyond ensuring the GPU
+/// command buffer has completed before ANE reads. In the level-based
+/// concurrent scheduler, this is guaranteed by `DispatchGroup.wait()`.
 final class SharedIOSurfaceBuffer: @unchecked Sendable {
 
     /// The underlying Metal buffer (IOSurface-backed via shared storage mode).

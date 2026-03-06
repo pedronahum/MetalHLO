@@ -14,11 +14,19 @@ import Foundation
 /// `BLOBFILE(offset=X, size=Y)`.
 internal final class MILWeightPacker {
 
+    /// A weight entry recording name, offset, and size within the blob.
+    struct WeightEntry {
+        let name: String
+        let offset: Int
+        let size: Int
+    }
+
     /// Constants with more elements than this use BLOBFILE instead of inline.
     static let inlineThreshold = 16
 
     private var blobData = Data()
     private var currentOffset = 0
+    private var weightEntries: [WeightEntry] = []
 
     /// Packs a ConstantValue and emits the appropriate MIL statement.
     ///
@@ -55,7 +63,7 @@ internal final class MILWeightPacker {
                 )
             } else {
                 let data = makeFP16Data(Array(repeating: Float(v), count: type.count))
-                let offset = appendBlob(data)
+                let offset = appendBlob(data, name: name)
                 builder.emitBlobConst(
                     name: name,
                     shape: shape,
@@ -74,7 +82,7 @@ internal final class MILWeightPacker {
                 )
             } else {
                 let data = makeFP16Data(values.map { Float($0) })
-                let offset = appendBlob(data)
+                let offset = appendBlob(data, name: name)
                 builder.emitBlobConst(
                     name: name,
                     shape: shape,
@@ -90,6 +98,12 @@ internal final class MILWeightPacker {
         return blobData
     }
 
+    /// Returns the layout of all BLOBFILE weight entries.
+    /// Used by MILWeightTemplate to patch weights without recompilation.
+    func getWeightLayout() -> [WeightEntry] {
+        return weightEntries
+    }
+
     /// Returns true if any weight data has been accumulated.
     var hasWeights: Bool {
         return !blobData.isEmpty
@@ -97,10 +111,11 @@ internal final class MILWeightPacker {
 
     // MARK: - Private
 
-    private func appendBlob(_ data: Data) -> Int {
+    private func appendBlob(_ data: Data, name: String) -> Int {
         let offset = currentOffset
         blobData.append(data)
         currentOffset += data.count
+        weightEntries.append(WeightEntry(name: name, offset: offset, size: data.count))
         return offset
     }
 

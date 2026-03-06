@@ -5,6 +5,7 @@
 
 import Testing
 import Foundation
+import Metal
 @testable import MetalHLOCore
 
 @Suite("Neural Engine Targeting Tests")
@@ -575,6 +576,316 @@ struct NeuralEngineTargetingTests {
             outputTypes: [TensorType(shape: [64, 64], elementType: .float32)],
             operations: operations,
             returnValues: ["neg_result"]
+        )
+    }
+
+    // MARK: - Concurrency Level Tests
+
+    @Test("buildConcurrencyLevels groups independent partitions")
+    func concurrencyLevelsIndependentPartitions() {
+        let partitioner = GPUANEPartitioner()
+
+        // Create a function with two independent chains:
+        // input -> dot_result (uses a, b)
+        // input -> exp_result (uses a)
+        // Both are independent, so they should be in the same concurrency level.
+        let function = createDiamondFunction()
+        let plan = partitioner.partition(function)
+
+        // Verify concurrency levels exist
+        #expect(!plan.concurrencyLevels.isEmpty)
+
+        // All partitions should be accounted for in levels
+        let allIndices = plan.concurrencyLevels.flatMap { $0 }
+        #expect(Set(allIndices).count == plan.partitions.count)
+    }
+
+    @Test("PartitionPlan hasConcurrentLevels")
+    func partitionPlanHasConcurrentLevels() {
+        // Single partition plan should not have concurrent levels
+        let singlePartition = GPUANEPartitioner.DevicePartition(
+            device: .gpu,
+            operationIds: ["op1"],
+            estimatedTimeMs: 1.0,
+            inputTensors: Set(),
+            outputTensors: Set()
+        )
+        let singlePlan = GPUANEPartitioner.PartitionPlan(
+            partitions: [singlePartition],
+            executionOrder: [0],
+            estimatedTotalTimeMs: 1.0,
+            estimatedTransferTimeMs: 0,
+            canPipeline: false
+        )
+        #expect(!singlePlan.hasConcurrentLevels)
+
+        // Plan with two partitions in same level should have concurrent levels
+        let partition1 = GPUANEPartitioner.DevicePartition(
+            device: .gpu, operationIds: ["op1"],
+            estimatedTimeMs: 1.0, inputTensors: Set(), outputTensors: Set()
+        )
+        let partition2 = GPUANEPartitioner.DevicePartition(
+            device: .ane, operationIds: ["op2"],
+            estimatedTimeMs: 1.0, inputTensors: Set(), outputTensors: Set()
+        )
+        let concurrentPlan = GPUANEPartitioner.PartitionPlan(
+            partitions: [partition1, partition2],
+            executionOrder: [0, 1],
+            concurrencyLevels: [[0, 1]],
+            estimatedTotalTimeMs: 1.0,
+            estimatedTransferTimeMs: 0,
+            canPipeline: true
+        )
+        #expect(concurrentPlan.hasConcurrentLevels)
+    }
+
+    @Test("Execution order covers all partitions")
+    func executionOrderCoversAllPartitions() {
+        let partitioner = GPUANEPartitioner()
+        let function = createLargeFunction()
+        let plan = partitioner.partition(function)
+
+        // Every partition index should appear exactly once in execution order
+        let orderSet = Set(plan.executionOrder)
+        #expect(orderSet.count == plan.partitions.count)
+        for i in 0..<plan.partitions.count {
+            #expect(orderSet.contains(i))
+        }
+
+        // Every partition should appear in exactly one concurrency level
+        let levelIndices = plan.concurrencyLevels.flatMap { $0 }
+        #expect(Set(levelIndices).count == plan.partitions.count)
+    }
+
+    // MARK: - Training Mode Tests
+
+    @Test("Training mode config defaults")
+    func trainingModeConfigDefaults() {
+        let executorConfig = HeterogeneousExecutor.Config.default
+        #expect(!executorConfig.trainingMode)
+
+        let partConfig = GPUANEPartitioner.Config.default
+        #expect(!partConfig.trainingMode)
+    }
+
+    @Test("Training mode biases forward ops toward ANE")
+    func trainingModeBiasesForwardOps() {
+        // With training mode, convolution should be more strongly biased toward ANE
+        let normalPartitioner = GPUANEPartitioner()
+        let trainingPartitioner = GPUANEPartitioner(config: GPUANEPartitioner.Config(
+            minOpsForANEPartition: 1,
+            maxTransferOverheadMs: 10.0,
+            enablePipelining: true,
+            balanceLoad: true,
+            trainingMode: true
+        ))
+
+        let function = createConvFunction()
+        let normalPlan = normalPartitioner.partition(function)
+        let trainingPlan = trainingPartitioner.partition(function)
+
+        // Both should produce valid plans
+        #expect(!normalPlan.partitions.isEmpty)
+        #expect(!trainingPlan.partitions.isEmpty)
+
+        // In training mode, convolution ops should be more likely on ANE
+        let trainingANEOps = trainingPlan.anePartitions.reduce(0) { $0 + $1.operationIds.count }
+        let normalANEOps = normalPlan.anePartitions.reduce(0) { $0 + $1.operationIds.count }
+        // Training mode should have at least as many ANE ops (bias toward ANE for forward ops)
+        #expect(trainingANEOps >= normalANEOps)
+    }
+
+    // MARK: - Weight Template Tests
+
+    @Test("MILWeightPacker tracks weight layout")
+    func milWeightPackerLayout() {
+        let packer = MILWeightPacker()
+        let builder = MILTextBuilder()
+
+        // Pack a large constant (above inline threshold)
+        let values = Array(repeating: 1.0, count: 32)
+        packer.packConstant(
+            name: "weight1",
+            value: .dense(values, TensorType(shape: [4, 8], elementType: .float32)),
+            resultType: TensorType(shape: [4, 8], elementType: .float32),
+            builder: builder
+        )
+
+        #expect(packer.hasWeights)
+        let layout = packer.getWeightLayout()
+        #expect(layout.count == 1)
+        #expect(layout[0].name == "weight1")
+        #expect(layout[0].offset == 0)
+        #expect(layout[0].size == 32 * 2)  // FP16 = 2 bytes per element
+    }
+
+    @Test("MILWeightPacker multiple weights have correct offsets")
+    func milWeightPackerMultipleWeights() {
+        let packer = MILWeightPacker()
+        let builder = MILTextBuilder()
+
+        let values1 = Array(repeating: 1.0, count: 32)
+        packer.packConstant(
+            name: "w1",
+            value: .dense(values1, TensorType(shape: [4, 8], elementType: .float32)),
+            resultType: TensorType(shape: [4, 8], elementType: .float32),
+            builder: builder
+        )
+
+        let values2 = Array(repeating: 2.0, count: 64)
+        packer.packConstant(
+            name: "w2",
+            value: .dense(values2, TensorType(shape: [8, 8], elementType: .float32)),
+            resultType: TensorType(shape: [8, 8], elementType: .float32),
+            builder: builder
+        )
+
+        let layout = packer.getWeightLayout()
+        #expect(layout.count == 2)
+
+        // First weight at offset 0
+        #expect(layout[0].name == "w1")
+        #expect(layout[0].offset == 0)
+
+        // Second weight starts after first
+        #expect(layout[1].name == "w2")
+        #expect(layout[1].offset == layout[0].size)
+
+        // Total blob size matches sum
+        let totalSize = packer.getWeightData().count
+        #expect(totalSize == layout[0].size + layout[1].size)
+    }
+
+    @Test("MILWeightPacker small constants are inline (no blob)")
+    func milWeightPackerInlineConstants() {
+        let packer = MILWeightPacker()
+        let builder = MILTextBuilder()
+
+        // Small constant (below threshold) should be inline, not in blob
+        packer.packConstant(
+            name: "small",
+            value: .scalar(1.0),
+            resultType: TensorType(shape: [], elementType: .float32),
+            builder: builder
+        )
+
+        #expect(!packer.hasWeights)
+        #expect(packer.getWeightLayout().isEmpty)
+    }
+
+    // MARK: - TensorTransferManager Readiness Tests
+
+    @Test("TensorTransferManager readiness tracking")
+    func tensorTransferManagerReadiness() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            return // Skip on systems without Metal
+        }
+        let manager = TensorTransferManager(device: device)
+
+        #expect(!manager.isReady(name: "tensor1"))
+
+        manager.markReady(name: "tensor1")
+        #expect(manager.isReady(name: "tensor1"))
+        #expect(!manager.isReady(name: "tensor2"))
+
+        manager.markReady(names: ["tensor2", "tensor3"])
+        #expect(manager.isReady(name: "tensor2"))
+        #expect(manager.isReady(name: "tensor3"))
+
+        manager.clear()
+        #expect(!manager.isReady(name: "tensor1"))
+    }
+
+    // MARK: - Additional Helper Functions
+
+    private func createDiamondFunction() -> HLOFunction {
+        // Diamond: input -> (branch1, branch2) -> merge
+        let inputs = [
+            HLOArgument(name: "a", type: TensorType(shape: [128, 128], elementType: .float32)),
+            HLOArgument(name: "b", type: TensorType(shape: [128, 128], elementType: .float32))
+        ]
+
+        let operations = [
+            // Branch 1: exp(a)
+            HLOOperation(
+                result: "branch1",
+                kind: .exponential,
+                operands: ["a"],
+                resultType: TensorType(shape: [128, 128], elementType: .float32),
+                attributes: HLOAttributes()
+            ),
+            // Branch 2: tanh(b)
+            HLOOperation(
+                result: "branch2",
+                kind: .tanh,
+                operands: ["b"],
+                resultType: TensorType(shape: [128, 128], elementType: .float32),
+                attributes: HLOAttributes()
+            ),
+            // Merge: branch1 + branch2
+            HLOOperation(
+                result: "merge",
+                kind: .add,
+                operands: ["branch1", "branch2"],
+                resultType: TensorType(shape: [128, 128], elementType: .float32),
+                attributes: HLOAttributes()
+            )
+        ]
+
+        return HLOFunction(
+            name: "diamond_func",
+            inputs: inputs,
+            outputTypes: [TensorType(shape: [128, 128], elementType: .float32)],
+            operations: operations,
+            returnValues: ["merge"]
+        )
+    }
+
+    private func createConvFunction() -> HLOFunction {
+        let inputs = [
+            HLOArgument(name: "input", type: TensorType(shape: [1, 3, 224, 224], elementType: .float32)),
+            HLOArgument(name: "kernel", type: TensorType(shape: [64, 3, 7, 7], elementType: .float32))
+        ]
+
+        var attrs = HLOAttributes()
+        attrs.convolutionDimensionNumbers = ConvolutionDimensionNumbers(
+            inputBatchDimension: 0,
+            inputFeatureDimension: 1,
+            inputSpatialDimensions: [2, 3],
+            kernelInputFeatureDimension: 1,
+            kernelOutputFeatureDimension: 0,
+            kernelSpatialDimensions: [2, 3],
+            outputBatchDimension: 0,
+            outputFeatureDimension: 1,
+            outputSpatialDimensions: [2, 3]
+        )
+        attrs.windowStrides = [2, 2]
+        attrs.convPadding = [[3, 3], [3, 3]]
+        attrs.featureGroupCount = 1
+
+        let operations = [
+            HLOOperation(
+                result: "conv_result",
+                kind: .convolution,
+                operands: ["input", "kernel"],
+                resultType: TensorType(shape: [1, 64, 112, 112], elementType: .float32),
+                attributes: attrs
+            ),
+            HLOOperation(
+                result: "relu_result",
+                kind: .maximum,
+                operands: ["conv_result", "conv_result"],
+                resultType: TensorType(shape: [1, 64, 112, 112], elementType: .float32),
+                attributes: HLOAttributes()
+            )
+        ]
+
+        return HLOFunction(
+            name: "conv_func",
+            inputs: inputs,
+            outputTypes: [TensorType(shape: [1, 64, 112, 112], elementType: .float32)],
+            operations: operations,
+            returnValues: ["relu_result"]
         )
     }
 

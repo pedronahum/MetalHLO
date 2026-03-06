@@ -102,6 +102,63 @@ public final class CoreMLBridge: @unchecked Sendable {
         )
     }
 
+    /// Compiles a CoreML model as a weight template that supports weight swapping.
+    ///
+    /// The model is compiled once via `MLModel.compileModel()`. Subsequent weight
+    /// changes use `MILWeightTemplate.updateWeights()` which patches weight.bin
+    /// and reloads via `MLModel(contentsOf:)` — no recompilation needed.
+    ///
+    /// - Parameters:
+    ///   - inputs: Input names and shapes.
+    ///   - operations: CoreML operations.
+    ///   - returnVar: The return variable name.
+    ///   - weightsData: Initial weight blob data.
+    ///   - weightLayout: Map of weight name → (offset, size) in the blob.
+    /// - Returns: A MILWeightTemplate for this model.
+    public func compileTemplate(
+        inputs: [(name: String, shape: [Int])],
+        operations: [CoreMLOp],
+        returnVar: String,
+        weightsData: Data,
+        weightLayout: [String: (offset: Int, size: Int)]
+    ) throws -> MILWeightTemplate {
+        // Compile normally first (this counts as one compilation)
+        let program = try compile(
+            inputs: inputs,
+            operations: operations,
+            returnVar: returnVar,
+            weightsData: weightsData
+        )
+
+        return MILWeightTemplate(
+            compiledModelPath: program.compiledModelPath,
+            sourcePackagePath: program.sourcePackagePath,
+            model: program.model,
+            weightLayout: weightLayout,
+            inputNames: program.inputNames,
+            inputShapes: program.inputShapes,
+            outputShape: program.outputShape
+        )
+    }
+
+    /// Executes a weight template's current model with Float32 input arrays.
+    public func execute(
+        _ template: MILWeightTemplate,
+        inputs: [(name: String, data: [Float], shape: [Int])]
+    ) throws -> [Float] {
+        // Wrap the template's model in a temporary CoreMLProgram for execution
+        let program = CoreMLProgram(
+            id: "template",
+            model: template.currentModel,
+            inputNames: template.inputNames,
+            inputShapes: template.inputShapes,
+            outputShape: template.outputShape,
+            compiledModelPath: template.compiledModelPath,
+            sourcePackagePath: template.sourcePackagePath
+        )
+        return try execute(program, inputs: inputs)
+    }
+
     /// Executes a compiled CoreML program with Float32 input arrays.
     ///
     /// - Parameters:

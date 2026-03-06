@@ -447,12 +447,18 @@ public final class GPUANEPartitioner: @unchecked Sendable {
         public var balanceLoad: Bool              // Try to balance load between devices
         public var aneSRAMCapacityBytes: Int      // ANE SRAM capacity for partition splitting
 
+        /// When true, biases forward-pass ops (conv, matmul, activations) toward ANE
+        /// and backward-pass ops (transpose→dot patterns, reductions feeding gradients)
+        /// toward GPU for FP32 precision.
+        public var trainingMode: Bool
+
         public static let `default` = Config(
             minOpsForANEPartition: 3,
             maxTransferOverheadMs: 1.0,
             enablePipelining: true,
             balanceLoad: true,
-            aneSRAMCapacityBytes: 32 * 1024 * 1024
+            aneSRAMCapacityBytes: 32 * 1024 * 1024,
+            trainingMode: false
         )
 
         public init(
@@ -460,13 +466,15 @@ public final class GPUANEPartitioner: @unchecked Sendable {
             maxTransferOverheadMs: Double,
             enablePipelining: Bool,
             balanceLoad: Bool,
-            aneSRAMCapacityBytes: Int = 32 * 1024 * 1024
+            aneSRAMCapacityBytes: Int = 32 * 1024 * 1024,
+            trainingMode: Bool = false
         ) {
             self.minOpsForANEPartition = minOpsForANEPartition
             self.maxTransferOverheadMs = maxTransferOverheadMs
             self.enablePipelining = enablePipelining
             self.balanceLoad = balanceLoad
             self.aneSRAMCapacityBytes = aneSRAMCapacityBytes
+            self.trainingMode = trainingMode
         }
     }
 
@@ -500,6 +508,7 @@ public final class GPUANEPartitioner: @unchecked Sendable {
     public struct PartitionPlan: Sendable {
         public let partitions: [DevicePartition]
         public let executionOrder: [Int]        // Indices into partitions array
+        public let concurrencyLevels: [[Int]]   // Groups of partition indices runnable in parallel
         public let estimatedTotalTimeMs: Double
         public let estimatedTransferTimeMs: Double
         public let canPipeline: Bool
@@ -512,15 +521,24 @@ public final class GPUANEPartitioner: @unchecked Sendable {
             partitions.filter { $0.device == .ane }
         }
 
+        /// Whether any concurrency level has multiple partitions (true parallelism possible).
+        public var hasConcurrentLevels: Bool {
+            concurrencyLevels.contains { $0.count > 1 }
+        }
+
         public init(
             partitions: [DevicePartition],
             executionOrder: [Int],
+            concurrencyLevels: [[Int]] = [],
             estimatedTotalTimeMs: Double,
             estimatedTransferTimeMs: Double,
             canPipeline: Bool
         ) {
             self.partitions = partitions
             self.executionOrder = executionOrder
+            self.concurrencyLevels = concurrencyLevels.isEmpty
+                ? [Array(0..<partitions.count)]  // Default: all in one level (sequential)
+                : concurrencyLevels
             self.estimatedTotalTimeMs = estimatedTotalTimeMs
             self.estimatedTransferTimeMs = estimatedTransferTimeMs
             self.canPipeline = canPipeline
@@ -550,7 +568,13 @@ public final class GPUANEPartitioner: @unchecked Sendable {
         // Assign operations to devices
         var assignments: [String: ExecutionDevice] = [:]
         for opAnalysis in analysis.operationAnalyses {
-            assignments[opAnalysis.operationId] = opAnalysis.preferredDevice
+            if config.trainingMode {
+                assignments[opAnalysis.operationId] = trainingBiasedDevice(
+                    opAnalysis, opMap: opMap
+                )
+            } else {
+                assignments[opAnalysis.operationId] = opAnalysis.preferredDevice
+            }
         }
 
         // Group consecutive operations on same device into partitions
@@ -565,8 +589,10 @@ public final class GPUANEPartitioner: @unchecked Sendable {
         // Recalculate cross-device tensors after splitting
         let finalPartitions = calculateCrossDeviceTensors(memoryAwarePartitions, dependencies: dependencies)
 
-        // Determine execution order
-        let executionOrder = determineExecutionOrder(finalPartitions, dependencies: dependencies)
+        // Build concurrency levels (also produces execution order)
+        let (executionOrder, concurrencyLevels) = buildConcurrencyLevels(
+            finalPartitions, dependencies: dependencies
+        )
 
         // Calculate timing estimates using actual tensor sizes
         let totalTime = finalPartitions.reduce(0.0) { $0 + $1.estimatedTimeMs }
@@ -576,6 +602,7 @@ public final class GPUANEPartitioner: @unchecked Sendable {
         return PartitionPlan(
             partitions: finalPartitions,
             executionOrder: executionOrder,
+            concurrencyLevels: concurrencyLevels,
             estimatedTotalTimeMs: totalTime + transferTime,
             estimatedTransferTimeMs: transferTime,
             canPipeline: canPipeline
@@ -591,6 +618,42 @@ public final class GPUANEPartitioner: @unchecked Sendable {
         }
 
         return dependencies
+    }
+
+    /// Applies training-mode bias to device assignment.
+    ///
+    /// Forward-pass ops (conv, matmul, activations) are biased toward ANE.
+    /// Backward-pass heuristic: transpose→dot patterns (weight gradients) and
+    /// reductions (gradient accumulation) are biased toward GPU for FP32 precision.
+    private func trainingBiasedDevice(
+        _ opAnalysis: ANEOperationAnalysis,
+        opMap: [String: HLOOperation]
+    ) -> ExecutionDevice {
+        if opAnalysis.compatibility == .incompatible {
+            return .gpu
+        }
+
+        // Forward-pass ops: bias toward ANE (0.7x ANE time = prefer ANE)
+        let forwardOps: Set<HLOOpKind> = [
+            .convolution, .dot, .dotGeneral,
+            .tanh, .logistic, .exponential, .sqrt, .rsqrt
+        ]
+
+        // Backward-pass indicators: bias toward GPU (1.5x ANE time = prefer GPU)
+        let backwardOps: Set<HLOOpKind> = [.reduce]
+
+        let aneTime = opAnalysis.estimatedANETime
+        let gpuTime = opAnalysis.estimatedGPUTime
+
+        if forwardOps.contains(opAnalysis.operationType) {
+            // Lower ANE cost for forward ops
+            return (aneTime * 0.7) < gpuTime ? .ane : .gpu
+        } else if backwardOps.contains(opAnalysis.operationType) {
+            // Raise ANE cost for backward-indicator ops
+            return (aneTime * 1.5) < gpuTime ? .ane : .gpu
+        }
+
+        return opAnalysis.preferredDevice
     }
 
     /// Creates partitions from device assignments
@@ -755,14 +818,76 @@ public final class GPUANEPartitioner: @unchecked Sendable {
         }
     }
 
-    /// Determines execution order respecting dependencies
-    private func determineExecutionOrder(
+    /// Builds a partition-level dependency DAG and groups partitions into
+    /// concurrency levels using Kahn's algorithm.
+    ///
+    /// Partitions within the same level have no mutual dependencies and
+    /// can execute in parallel (e.g., a GPU partition and an ANE partition
+    /// that don't share any tensors).
+    private func buildConcurrencyLevels(
         _ partitions: [DevicePartition],
         dependencies: [String: Set<String>]
-    ) -> [Int] {
-        // For now, just execute in order
-        // A more sophisticated implementation would enable parallelism
-        return Array(0..<partitions.count)
+    ) -> (executionOrder: [Int], levels: [[Int]]) {
+        let n = partitions.count
+        guard n > 0 else { return ([], []) }
+
+        // Build op → partition index mapping
+        var opToPartition: [String: Int] = [:]
+        for (i, partition) in partitions.enumerated() {
+            for opId in partition.operationIds {
+                opToPartition[opId] = i
+            }
+        }
+
+        // Build partition-level predecessor sets
+        var predecessors: [Set<Int>] = Array(repeating: Set(), count: n)
+        for (i, partition) in partitions.enumerated() {
+            for opId in partition.operationIds {
+                if let deps = dependencies[opId] {
+                    for dep in deps {
+                        if let depPartition = opToPartition[dep], depPartition != i {
+                            predecessors[i].insert(depPartition)
+                        }
+                    }
+                }
+            }
+        }
+
+        // Kahn's algorithm: group partitions by concurrency level
+        var inDegree = predecessors.map { $0.count }
+        var resolved = Set<Int>()
+        var levels: [[Int]] = []
+
+        while resolved.count < n {
+            // Find all partitions with zero unresolved predecessors
+            var level: [Int] = []
+            for i in 0..<n {
+                if !resolved.contains(i) && inDegree[i] == 0 {
+                    level.append(i)
+                }
+            }
+
+            if level.isEmpty {
+                // Cycle detected (shouldn't happen in valid HLO) — fall back to sequential
+                let remaining = (0..<n).filter { !resolved.contains($0) }
+                levels.append(remaining)
+                break
+            }
+
+            levels.append(level)
+            for i in level {
+                resolved.insert(i)
+                // Decrement in-degree of successors
+                for j in 0..<n {
+                    if predecessors[j].contains(i) {
+                        inDegree[j] -= 1
+                    }
+                }
+            }
+        }
+
+        let executionOrder = levels.flatMap { $0 }
+        return (executionOrder, levels)
     }
 
     /// Calculates estimated transfer time between devices using actual tensor sizes.
@@ -955,23 +1080,32 @@ public final class HeterogeneousExecutor: @unchecked Sendable {
         public var enableCPUFallback: Bool
         public var enablePipelining: Bool
 
+        /// When true, biases the cost model to route forward-pass ops (conv, matmul,
+        /// activations) toward ANE and backward-pass ops (gradient accumulation,
+        /// high-precision reductions) toward GPU. Also enables weight template
+        /// caching to avoid hitting the ~115 ANE compilation limit.
+        public var trainingMode: Bool
+
         public static let `default` = Config(
             enableANE: true,
             enableGPU: true,
             enableCPUFallback: true,
-            enablePipelining: false
+            enablePipelining: false,
+            trainingMode: false
         )
 
         public init(
             enableANE: Bool,
             enableGPU: Bool,
             enableCPUFallback: Bool,
-            enablePipelining: Bool = false
+            enablePipelining: Bool = false,
+            trainingMode: Bool = false
         ) {
             self.enableANE = enableANE
             self.enableGPU = enableGPU
             self.enableCPUFallback = enableCPUFallback
             self.enablePipelining = enablePipelining
+            self.trainingMode = trainingMode
         }
     }
 
@@ -983,11 +1117,17 @@ public final class HeterogeneousExecutor: @unchecked Sendable {
     private var stats: ExecutionStats
     private let lock = NSLock()
 
-    /// Dedicated queue for ANE (CoreML) execution in pipelined mode.
+    /// Dedicated queue for ANE (CoreML) execution in pipelined/concurrent mode.
     private let aneQueue = DispatchQueue(label: "com.metalHLO.ane", qos: .userInitiated)
+
+    /// Dedicated queue for GPU (MPSGraph) execution in concurrent mode.
+    private let gpuQueue = DispatchQueue(label: "com.metalHLO.gpu", qos: .userInitiated)
 
     /// Cache of compiled CoreML programs keyed by partition op hash.
     private var aneCache: [String: ANERuntime.CoreMLProgram] = [:]
+
+    /// Cache of weight templates for training weight swapping without recompilation.
+    private var aneTemplateCache: [String: ANERuntime.MILWeightTemplate] = [:]
 
     /// Number of consecutive ANE failures (reset on success).
     private var consecutiveANEFailures: Int = 0
@@ -1041,7 +1181,9 @@ public final class HeterogeneousExecutor: @unchecked Sendable {
         let partitionResults: [PartitionResult]
         var localStats = ExecutionStats()
 
-        if config.enablePipelining && plan.canPipeline {
+        if config.enablePipelining && plan.hasConcurrentLevels {
+            partitionResults = try executeConcurrent(plan: plan, function: function, stats: &localStats)
+        } else if config.enablePipelining && plan.canPipeline {
             partitionResults = try executePipelined(plan: plan, function: function, stats: &localStats)
         } else {
             partitionResults = try executeSequential(plan: plan, function: function, stats: &localStats)
@@ -1124,6 +1266,88 @@ public final class HeterogeneousExecutor: @unchecked Sendable {
         }
 
         return partitionResults
+    }
+
+    /// Executes partitions concurrently using dependency-aware scheduling.
+    ///
+    /// Uses the partition plan's concurrency levels: partitions within the same
+    /// level have no mutual data dependencies and are dispatched to their
+    /// respective device queues (GPU or ANE) simultaneously. Between levels,
+    /// a `DispatchGroup.wait()` barrier ensures all outputs are ready.
+    private func executeConcurrent(
+        plan: GPUANEPartitioner.PartitionPlan,
+        function: HLOFunction,
+        stats localStats: inout ExecutionStats
+    ) throws -> [PartitionResult] {
+        final class ConcurrentState: @unchecked Sendable {
+            let lock = NSLock()
+            var results: [PartitionResult?]
+            var error: Error?
+
+            init(count: Int) {
+                self.results = Array(repeating: nil, count: count)
+            }
+        }
+        let state = ConcurrentState(count: plan.partitions.count)
+
+        for level in plan.concurrencyLevels {
+            if level.count == 1 {
+                // Single partition — execute inline, no dispatch overhead
+                let partitionIndex = level[0]
+                let partition = plan.partitions[partitionIndex]
+                let result = try executePartitionWithFallback(partition, function: function)
+                state.results[partitionIndex] = result
+            } else {
+                // Multiple independent partitions — dispatch concurrently
+                let group = DispatchGroup()
+
+                for partitionIndex in level {
+                    let partition = plan.partitions[partitionIndex]
+                    let queue = (partition.device == .ane) ? aneQueue : gpuQueue
+
+                    group.enter()
+                    queue.async { [self] in
+                        defer { group.leave() }
+                        do {
+                            let result = try self.executePartitionWithFallback(
+                                partition, function: function
+                            )
+                            state.lock.lock()
+                            state.results[partitionIndex] = result
+                            state.lock.unlock()
+                        } catch {
+                            state.lock.lock()
+                            if state.error == nil { state.error = error }
+                            state.lock.unlock()
+                        }
+                    }
+                }
+
+                group.wait()
+                if let error = state.error { throw error }
+            }
+        }
+
+        // Collect results in execution order and update stats
+        var orderedResults: [PartitionResult] = []
+        for partitionIndex in plan.executionOrder {
+            if let result = state.results[partitionIndex] {
+                orderedResults.append(result)
+                localStats.partitionsExecuted += 1
+                localStats.operationsExecuted += plan.partitions[partitionIndex].operationIds.count
+
+                switch result.device {
+                case .gpu:
+                    localStats.gpuTimeMs += result.executionTimeMs
+                case .ane:
+                    localStats.aneTimeMs += result.executionTimeMs
+                case .cpu:
+                    break
+                }
+            }
+        }
+
+        return orderedResults
     }
 
     /// Executes partitions with GPU/ANE pipelining.
@@ -1268,17 +1492,21 @@ public final class HeterogeneousExecutor: @unchecked Sendable {
 
         do {
             let result = try executePartition(partition, function: function)
-            // Reset failure counter on ANE success
+            // Reset failure counter on ANE success (thread-safe for concurrent execution)
             if partition.device == .ane {
+                lock.lock()
                 consecutiveANEFailures = 0
+                lock.unlock()
             }
             return result
         } catch {
             if partition.device == .ane && config.enableCPUFallback {
+                lock.lock()
                 consecutiveANEFailures += 1
                 if consecutiveANEFailures >= maxConsecutiveANEFailures {
                     aneDisabled = true
                 }
+                lock.unlock()
                 let gpuPartition = GPUANEPartitioner.DevicePartition(
                     device: .gpu,
                     operationIds: partition.operationIds,
@@ -1448,9 +1676,10 @@ public final class HeterogeneousExecutor: @unchecked Sendable {
         stats = ExecutionStats()
     }
 
-    /// Clears cached ANE compilations.
+    /// Clears cached ANE compilations and weight templates.
     public func clearCache() {
         aneCache.removeAll()
+        aneTemplateCache.removeAll()
         coreMLBridge.clearCache()
     }
 }
