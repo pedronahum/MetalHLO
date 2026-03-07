@@ -995,6 +995,18 @@ public final class Analyzer: @unchecked Sendable {
     private func detectMatMulBiasActPatterns(_ function: HLOFunction, definingOps: [TensorID: (op: HLOOperation, index: Int)]) -> [DetectedPattern] {
         var patterns: [DetectedPattern] = []
 
+        // Build use count map: how many operations use each result
+        var useCount: [TensorID: Int] = [:]
+        for op in function.operations {
+            for operand in op.operands {
+                useCount[operand, default: 0] += 1
+            }
+        }
+        // Also count return value uses
+        for retVal in function.returnValues {
+            useCount[retVal, default: 0] += 1
+        }
+
         for (index, op) in function.operations.enumerated() {
             // Look for activation(matmul + bias) or activation(matmul)
             let isActivation = op.kind == .tanh || op.kind == .logistic ||
@@ -1010,6 +1022,23 @@ public final class Analyzer: @unchecked Sendable {
                     guard let matmulDef = definingOps[inputDef.op.operands[0]],
                           matmulDef.op.kind == .dot || matmulDef.op.kind == .dotGeneral else { continue }
 
+                    // Safety: don't match if intermediate results are used outside the pattern.
+                    // E.g., in SiLU (x * sigmoid(x)), the add result %h1_bias is used by both
+                    // the logistic AND the multiply. Fusing dot+add+logistic would leave the
+                    // multiply with a dangling reference to %h1_bias.
+                    let intermediateIndices = [matmulDef.index, inputDef.index]
+                    let hasExternalUses = intermediateIndices.contains { idx in
+                        let result = function.operations[idx].result
+                        // Count how many pattern ops use this result
+                        let patternIndices = Set([matmulDef.index, inputDef.index, index])
+                        let usesInPattern = function.operations.enumerated().filter { (i, otherOp) in
+                            patternIndices.contains(i) && otherOp.operands.contains(result)
+                        }.count
+                        let totalUses = useCount[result] ?? 0
+                        return totalUses > usesInPattern
+                    }
+                    if hasExternalUses { continue }
+
                     patterns.append(DetectedPattern(
                         type: .matmulBiasActivation,
                         operationIndices: [matmulDef.index, inputDef.index, index],
@@ -1019,6 +1048,11 @@ public final class Analyzer: @unchecked Sendable {
                 }
                 // Check for direct matmul
                 else if inputDef.op.kind == .dot || inputDef.op.kind == .dotGeneral {
+                    // Safety: don't match if the matmul result is used outside the pattern
+                    let matmulUses = useCount[inputDef.op.result] ?? 0
+                    let usesInPattern = op.operands.filter { $0 == inputDef.op.result }.count
+                    if matmulUses > usesInPattern { continue }
+
                     patterns.append(DetectedPattern(
                         type: .matmulBiasActivation,
                         operationIndices: [inputDef.index, index],

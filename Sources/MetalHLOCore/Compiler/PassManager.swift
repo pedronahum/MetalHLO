@@ -618,9 +618,19 @@ final class AttentionFusionPass: OptimizationPass, @unchecked Sendable {
             // Replace the root operation with the fused one
             newOperations[rootIdx] = fusedOp
 
-            // Mark intermediate operations for removal
-            opsToRemove.insert(qkMatmulIdx)
-            opsToRemove.insert(softmaxIdx)
+            // Mark intermediate operations for removal, but only if their results
+            // aren't used by operations outside the pattern
+            let patternIndexSet: Set<Int> = [qkMatmulIdx, softmaxIdx, rootIdx]
+            for idx in [qkMatmulIdx, softmaxIdx] {
+                let result = function.operations[idx].result
+                let hasExternalUse = function.operations.enumerated().contains { (i, otherOp) in
+                    !patternIndexSet.contains(i) && otherOp.operands.contains(result)
+                }
+                let isReturnValue = function.returnValues.contains(result)
+                if !hasExternalUse && !isReturnValue {
+                    opsToRemove.insert(idx)
+                }
+            }
             changed = true
         }
 
@@ -755,9 +765,19 @@ final class FFNFusionPass: OptimizationPass, @unchecked Sendable {
             // Replace the root operation with the fused one
             newOperations[rootIdx] = fusedOp
 
-            // Mark intermediate operations for removal
-            opsToRemove.insert(upMatmulIdx)
-            opsToRemove.insert(activationIdx)
+            // Mark intermediate operations for removal, but only if their results
+            // aren't used by operations outside the pattern
+            let patternIndexSet: Set<Int> = [upMatmulIdx, activationIdx, rootIdx]
+            for idx in [upMatmulIdx, activationIdx] {
+                let result = function.operations[idx].result
+                let hasExternalUse = function.operations.enumerated().contains { (i, otherOp) in
+                    !patternIndexSet.contains(i) && otherOp.operands.contains(result)
+                }
+                let isReturnValue = function.returnValues.contains(result)
+                if !hasExternalUse && !isReturnValue {
+                    opsToRemove.insert(idx)
+                }
+            }
             changed = true
         }
 
@@ -895,9 +915,18 @@ final class NormFusionPass: OptimizationPass, @unchecked Sendable {
             // Replace the root operation
             newOperations[rootIdx] = fusedOp
 
-            // Mark intermediate operations for removal
+            // Mark intermediate operations for removal, but only if their results
+            // aren't used by operations outside the pattern
+            let patternIndexSet = Set(pattern.operationIndices)
             for idx in pattern.operationIndices where idx != rootIdx {
-                opsToRemove.insert(idx)
+                let result = function.operations[idx].result
+                let hasExternalUse = function.operations.enumerated().contains { (i, otherOp) in
+                    !patternIndexSet.contains(i) && otherOp.operands.contains(result)
+                }
+                let isReturnValue = function.returnValues.contains(result)
+                if !hasExternalUse && !isReturnValue {
+                    opsToRemove.insert(idx)
+                }
             }
             changed = true
         }
@@ -988,9 +1017,18 @@ final class GELUFusionPass: OptimizationPass, @unchecked Sendable {
             // Replace the root operation with the fused one
             newOperations[rootIdx] = fusedOp
 
-            // Mark all intermediate operations for removal (except root which is replaced)
+            // Mark intermediate operations for removal, but only if their results
+            // aren't used by operations outside the pattern
+            let patternIndexSet = Set(pattern.operationIndices)
             for idx in pattern.operationIndices where idx != rootIdx {
-                opsToRemove.insert(idx)
+                let result = function.operations[idx].result
+                let hasExternalUse = function.operations.enumerated().contains { (i, otherOp) in
+                    !patternIndexSet.contains(i) && otherOp.operands.contains(result)
+                }
+                let isReturnValue = function.returnValues.contains(result)
+                if !hasExternalUse && !isReturnValue {
+                    opsToRemove.insert(idx)
+                }
             }
             changed = true
         }
@@ -1118,9 +1156,19 @@ final class MatMulBiasActFusionPass: OptimizationPass, @unchecked Sendable {
             // Replace the root operation
             newOperations[rootIdx] = fusedOp
 
-            // Mark intermediate operations for removal
+            // Mark intermediate operations for removal, but only if their results
+            // aren't used by operations outside the pattern
+            let patternIndexSet = Set(pattern.operationIndices)
             for idx in pattern.operationIndices where idx != rootIdx {
-                opsToRemove.insert(idx)
+                let result = function.operations[idx].result
+                let hasExternalUse = function.operations.enumerated().contains { (i, otherOp) in
+                    !patternIndexSet.contains(i) && otherOp.operands.contains(result)
+                }
+                // Also check return values
+                let isReturnValue = function.returnValues.contains(result)
+                if !hasExternalUse && !isReturnValue {
+                    opsToRemove.insert(idx)
+                }
             }
             changed = true
         }
