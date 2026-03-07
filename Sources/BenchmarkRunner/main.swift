@@ -12,6 +12,7 @@ import MetalHLO
 struct BenchmarkCLI {
     enum Command {
         case run(filter: String?, category: String?, quick: Bool, output: String?, optLevel: Int?, allOptLevels: Bool)
+        case compare(filter: String?, category: String?, quick: Bool, output: String?)
         case list
         case help
     }
@@ -29,6 +30,7 @@ struct BenchmarkCLI {
         var output: String?
         var optLevel: Int?
         var allOptLevels = false
+        var compare = false
 
         var iterator = args.makeIterator()
         while let arg = iterator.next() {
@@ -37,6 +39,8 @@ struct BenchmarkCLI {
                 return .help
             case "-l", "--list":
                 return .list
+            case "--compare":
+                compare = true
             case "-f", "--filter":
                 filter = iterator.next()
             case "-c", "--category":
@@ -67,6 +71,10 @@ struct BenchmarkCLI {
             }
         }
 
+        if compare {
+            return .compare(filter: filter, category: category, quick: quick, output: output)
+        }
+
         return .run(filter: filter, category: category, quick: quick, output: output, optLevel: optLevel, allOptLevels: allOptLevels)
     }
 
@@ -80,7 +88,7 @@ struct BenchmarkCLI {
         OPTIONS:
             -h, --help          Show this help message
             -l, --list          List all available benchmarks
-            -c, --category CAT  Run only benchmarks in category (matrix, reduction, arithmetic, convolution, normalization)
+            -c, --category CAT  Run only benchmarks in category
             -f, --filter PAT    Run only benchmarks matching pattern
             -q, --quick         Quick mode (fewer iterations)
             -o, --output PATH   Write results to JSON file
@@ -89,12 +97,15 @@ struct BenchmarkCLI {
             -O2                 Standard optimization (default)
             -O3                 Aggressive optimization
             --all-opt-levels    Run benchmarks with all optimization levels (O0-O3)
+            --compare           Compare backends: MPSGraph vs O2 vs O3 vs GPU+ANE
 
         EXAMPLES:
             benchmark-runner                    Run all benchmarks at O2
             benchmark-runner -q                 Quick run of all benchmarks
             benchmark-runner -O3                Run with aggressive optimization
             benchmark-runner --all-opt-levels   Compare all optimization levels
+            benchmark-runner --compare -q       Compare all backends (quick mode)
+            benchmark-runner --compare -c matrix Compare backends for matrix ops
             benchmark-runner -c matrix          Run only matrix benchmarks
             benchmark-runner -f GEMM            Run benchmarks matching "GEMM"
             benchmark-runner -o results.json    Save results to JSON file
@@ -133,6 +144,354 @@ struct BenchmarkCLI {
     }
 }
 
+// MARK: - Backend Configuration
+
+struct BackendConfig {
+    let name: String
+    let shortName: String
+    let optimizationLevel: OptimizationLevel
+    let devicePolicy: DevicePolicy
+    let useMPSGraph: Bool  // true = use default client.compile(mlir) without config
+
+    static let allBackends: [BackendConfig] = [
+        BackendConfig(name: "MPSGraph (default)", shortName: "MPSGraph", optimizationLevel: .O2, devicePolicy: .gpuOnly, useMPSGraph: true),
+        BackendConfig(name: "Metal O2", shortName: "O2", optimizationLevel: .O2, devicePolicy: .gpuOnly, useMPSGraph: false),
+        BackendConfig(name: "Metal O3", shortName: "O3", optimizationLevel: .O3, devicePolicy: .gpuOnly, useMPSGraph: false),
+        BackendConfig(name: "GPU+ANE auto", shortName: "ANE", optimizationLevel: .O2, devicePolicy: .auto, useMPSGraph: false),
+    ]
+}
+
+/// Result for a single benchmark across one backend.
+struct BackendResult {
+    let backendName: String
+    let meanMs: Double
+    let stdDevMs: Double
+    let p95Ms: Double
+    let failed: Bool
+    let error: String?
+
+    static func failure(backend: String, error: String) -> BackendResult {
+        BackendResult(backendName: backend, meanMs: 0, stdDevMs: 0, p95Ms: 0, failed: true, error: error)
+    }
+}
+
+/// Comparison result for one benchmark across all backends.
+struct ComparisonEntry {
+    let benchmarkID: String
+    let benchmarkName: String
+    let category: String
+    let operation: String
+    let results: [BackendResult]
+
+    var baselineMeanMs: Double? {
+        results.first(where: { !$0.failed })?.meanMs
+    }
+
+    func speedup(for result: BackendResult) -> Double? {
+        guard let baseline = baselineMeanMs, baseline > 0, !result.failed else { return nil }
+        return baseline / result.meanMs
+    }
+
+    var bestResult: BackendResult? {
+        results.filter { !$0.failed }.min(by: { $0.meanMs < $1.meanMs })
+    }
+}
+
+// MARK: - Compare Mode
+
+func runComparison(filter: String?, category: String?, quick: Bool, output: String?) async {
+    print("""
+    ╔════════════════════════════════════════════════════════════╗
+    ║      MetalHLO Multi-Backend Comparison                     ║
+    ╚════════════════════════════════════════════════════════════╝
+    """)
+
+    let hw = HardwareInfo.current()
+    print("Hardware: \(hw.chipName)")
+    print("Memory: \(hw.totalMemoryBytes / (1024 * 1024 * 1024)) GB")
+    print("OS: \(hw.osVersion)")
+    print()
+
+    let config: BenchmarkConfig = quick ? .quick : .standard
+    print("Mode: \(quick ? "Quick" : "Standard") (\(config.warmupIterations) warmup, \(config.measurementIterations) measurements)")
+    print()
+
+    // Get benchmarks
+    var benchmarks = OperationBenchmarks.allWithModels()
+
+    if let category = category {
+        benchmarks = benchmarks.filter { $0.category == category }
+        print("Filtered to category: \(category)")
+    }
+
+    if let filter = filter {
+        benchmarks = benchmarks.filter {
+            $0.id.localizedCaseInsensitiveContains(filter) ||
+            $0.name.localizedCaseInsensitiveContains(filter) ||
+            $0.operation.localizedCaseInsensitiveContains(filter)
+        }
+        print("Filtered by pattern: \(filter)")
+    }
+
+    if benchmarks.isEmpty {
+        print("No benchmarks match the specified criteria.")
+        return
+    }
+
+    let backends = BackendConfig.allBackends
+    print("Backends: \(backends.map { $0.name }.joined(separator: ", "))")
+    print("Benchmarks: \(benchmarks.count)")
+    print()
+
+    let startTime = Date()
+    var comparisons: [ComparisonEntry] = []
+
+    // Create a single runner and reuse it for all backends
+    let runner: BenchmarkRunner
+    do {
+        runner = try BenchmarkRunner(config: config)
+        runner.verbose = false
+    } catch {
+        print("Error: Failed to create benchmark runner: \(error)")
+        return
+    }
+
+    for (benchIdx, benchmark) in benchmarks.enumerated() {
+        let progress = Double(benchIdx) / Double(benchmarks.count) * 100
+        print("[\(String(format: "%3.0f", progress))%] \(benchmark.id)", terminator: "")
+        fflush(stdout)
+
+        var backendResults: [BackendResult] = []
+
+        for backend in backends {
+            do {
+                runner.useMPSGraph = backend.useMPSGraph
+                runner.optimizationLevel = backend.optimizationLevel
+                runner.devicePolicy = backend.devicePolicy
+
+                let result = try runner.run(benchmark)
+                let meanMs = result.gpuTime.mean * 1000
+                let stdMs = result.gpuTime.stdDev * 1000
+                let p95Ms = result.gpuTime.p95 * 1000
+
+                backendResults.append(BackendResult(
+                    backendName: backend.shortName,
+                    meanMs: meanMs,
+                    stdDevMs: stdMs,
+                    p95Ms: p95Ms,
+                    failed: false,
+                    error: nil
+                ))
+                print(" [\(backend.shortName):OK]", terminator: "")
+                fflush(stdout)
+            } catch {
+                backendResults.append(.failure(backend: backend.shortName, error: "\(error)"))
+                print(" [\(backend.shortName):FAIL]", terminator: "")
+                fflush(stdout)
+            }
+        }
+        print()  // newline after all backends
+
+        comparisons.append(ComparisonEntry(
+            benchmarkID: benchmark.id,
+            benchmarkName: benchmark.name,
+            category: benchmark.category,
+            operation: benchmark.operation,
+            results: backendResults
+        ))
+    }
+
+    let elapsed = Date().timeIntervalSince(startTime)
+
+    // Print comparison table
+    print()
+    print(String(repeating: "=", count: 110))
+    print()
+
+    let backendNames = backends.map { $0.shortName }
+    printComparisonTable(comparisons: comparisons, backendNames: backendNames)
+
+    // Print summary
+    print(String(repeating: "=", count: 110))
+    print("Summary:")
+    print("  Benchmarks: \(comparisons.count)")
+    print("  Total time: \(String(format: "%.1f", elapsed)) seconds")
+    print()
+
+    // Count wins per backend
+    var wins: [String: Int] = [:]
+    for comp in comparisons {
+        if let best = comp.bestResult {
+            wins[best.backendName, default: 0] += 1
+        }
+    }
+    print("  Wins by backend:")
+    for (name, count) in wins.sorted(by: { $0.value > $1.value }) {
+        print("    \(name): \(count)")
+    }
+    print()
+
+    // Save results
+    let outputBase = output ?? "/tmp/benchmark_comparison"
+    saveComparisonResults(comparisons: comparisons, backendNames: backendNames, basePath: outputBase, hw: hw)
+}
+
+func printComparisonTable(comparisons: [ComparisonEntry], backendNames: [String]) {
+    let grouped = Dictionary(grouping: comparisons) { $0.category }
+
+    for (cat, entries) in grouped.sorted(by: { $0.key < $1.key }) {
+        print("\(cat.uppercased())")
+        print(String(repeating: "-", count: 110))
+
+        // Header
+        var header = "Benchmark".padding(toLength: 18, withPad: " ", startingAt: 0)
+        for name in backendNames {
+            header += "\(name) (ms)".padding(toLength: 16, withPad: " ", startingAt: 0)
+        }
+        header += "Best Speedup"
+        print(header)
+        print(String(repeating: "-", count: 110))
+
+        for entry in entries.sorted(by: { $0.benchmarkID < $1.benchmarkID }) {
+            var line = entry.benchmarkID.padding(toLength: 18, withPad: " ", startingAt: 0)
+
+            for result in entry.results {
+                if result.failed {
+                    line += "FAIL".padding(toLength: 16, withPad: " ", startingAt: 0)
+                } else {
+                    let val = String(format: "%.3f", result.meanMs)
+                    let std = String(format: "%.3f", result.stdDevMs)
+                    line += "\(val)±\(std)".padding(toLength: 16, withPad: " ", startingAt: 0)
+                }
+            }
+
+            // Best speedup vs baseline (first backend)
+            if let baseline = entry.baselineMeanMs, baseline > 0, let best = entry.bestResult {
+                let speedup = baseline / best.meanMs
+                if speedup > 1.01 {
+                    line += String(format: "%.2fx (%@)", speedup, best.backendName)
+                } else if speedup < 0.99 {
+                    line += String(format: "%.2fx (%@)", speedup, best.backendName)
+                } else {
+                    line += "~1.00x"
+                }
+            }
+
+            print(line)
+        }
+        print()
+    }
+}
+
+func saveComparisonResults(comparisons: [ComparisonEntry], backendNames: [String], basePath: String, hw: HardwareInfo) {
+    // Save markdown
+    var md = "# MetalHLO Multi-Backend Comparison\n\n"
+    md += "**Date:** \(ISO8601DateFormatter().string(from: Date()))\n"
+    md += "**Hardware:** \(hw.chipName)\n"
+    md += "**Memory:** \(hw.totalMemoryBytes / (1024 * 1024 * 1024)) GB\n"
+    md += "**OS:** \(hw.osVersion)\n\n"
+    md += "## Results\n\n"
+
+    let grouped = Dictionary(grouping: comparisons) { $0.category }
+
+    for (cat, entries) in grouped.sorted(by: { $0.key < $1.key }) {
+        md += "### \(cat.capitalized)\n\n"
+        md += "| Benchmark |"
+        for name in backendNames {
+            md += " \(name) (ms) |"
+        }
+        md += " Best Speedup |\n"
+
+        md += "|-----------|"
+        for _ in backendNames {
+            md += "------------|"
+        }
+        md += "--------------|\n"
+
+        for entry in entries.sorted(by: { $0.benchmarkID < $1.benchmarkID }) {
+            md += "| \(entry.benchmarkID) |"
+
+            for result in entry.results {
+                if result.failed {
+                    md += " FAIL |"
+                } else {
+                    md += " \(String(format: "%.3f", result.meanMs)) |"
+                }
+            }
+
+            if let baseline = entry.baselineMeanMs, baseline > 0, let best = entry.bestResult {
+                let speedup = baseline / best.meanMs
+                md += " \(String(format: "%.2fx", speedup)) (\(best.backendName)) |"
+            } else {
+                md += " N/A |"
+            }
+            md += "\n"
+        }
+        md += "\n"
+    }
+
+    // Wins summary
+    md += "## Backend Wins\n\n"
+    var wins: [String: Int] = [:]
+    for comp in comparisons {
+        if let best = comp.bestResult {
+            wins[best.backendName, default: 0] += 1
+        }
+    }
+    md += "| Backend | Wins |\n|---------|------|\n"
+    for (name, count) in wins.sorted(by: { $0.value > $1.value }) {
+        md += "| \(name) | \(count) |\n"
+    }
+
+    let mdPath = basePath.hasSuffix(".md") ? basePath : "\(basePath).md"
+    do {
+        try md.write(toFile: mdPath, atomically: true, encoding: .utf8)
+        print("Comparison saved to: \(mdPath)")
+    } catch {
+        print("Error saving comparison: \(error)")
+    }
+
+    // Save JSON
+    let jsonPath = basePath.hasSuffix(".json") ? basePath : "\(basePath).json"
+    var jsonEntries: [[String: Any]] = []
+    for entry in comparisons {
+        var jsonEntry: [String: Any] = [
+            "id": entry.benchmarkID,
+            "name": entry.benchmarkName,
+            "category": entry.category,
+            "operation": entry.operation,
+        ]
+        var backendData: [String: Any] = [:]
+        for result in entry.results {
+            if result.failed {
+                backendData[result.backendName] = ["failed": true, "error": result.error ?? "unknown"]
+            } else {
+                backendData[result.backendName] = [
+                    "mean_ms": result.meanMs,
+                    "std_dev_ms": result.stdDevMs,
+                    "p95_ms": result.p95Ms,
+                ]
+            }
+        }
+        jsonEntry["backends"] = backendData
+        jsonEntries.append(jsonEntry)
+    }
+
+    let jsonRoot: [String: Any] = [
+        "date": ISO8601DateFormatter().string(from: Date()),
+        "hardware": hw.chipName,
+        "results": jsonEntries,
+    ]
+
+    do {
+        let data = try JSONSerialization.data(withJSONObject: jsonRoot, options: [.prettyPrinted, .sortedKeys])
+        try data.write(to: URL(fileURLWithPath: jsonPath))
+        print("JSON saved to: \(jsonPath)")
+    } catch {
+        print("Error saving JSON: \(error)")
+    }
+}
+
 // MARK: - Main
 
 func main() async {
@@ -144,6 +503,9 @@ func main() async {
 
     case .list:
         BenchmarkCLI.listBenchmarks()
+
+    case .compare(let filter, let category, let quick, let output):
+        await runComparison(filter: filter, category: category, quick: quick, output: output)
 
     case .run(let filter, let category, let quick, let output, let optLevel, let allOptLevels):
         if allOptLevels {
@@ -231,12 +593,9 @@ func runBenchmarks(filter: String?, category: String?, quick: Bool, output: Stri
     print(String(repeating: "=", count: 70))
 
     // Progress tracking
-    var completed = 0
-    let total = benchmarks.count
     let startTime = Date()
 
     runner.onProgress = { index, count, id in
-        completed = index
         let progress = Double(index) / Double(count) * 100
         print("[\(String(format: "%3.0f", progress))%] Running: \(id)")
     }
@@ -261,7 +620,6 @@ func runBenchmarks(filter: String?, category: String?, quick: Bool, output: Stri
     for (cat, results) in grouped.sorted(by: { $0.key < $1.key }) {
         print("\(cat.uppercased())")
         print(String(repeating: "-", count: 70))
-        // Use Swift string formatting instead of C-style %s
         let header = "ID".padding(toLength: 16, withPad: " ", startingAt: 0) +
                      "Operation".padding(toLength: 20, withPad: " ", startingAt: 0) +
                      "Mean (ms)".padding(toLength: 12, withPad: " ", startingAt: 0) +

@@ -168,6 +168,9 @@ public final class Executable: @unchecked Sendable {
         case .integrated(_, let executor):
             return try executeWithTimingIntegrated(inputs, executor: executor)
         case .heterogeneous(let function, let executor):
+            // Reset stats before execution so we measure a single call,
+            // not cumulative time across all previous executions.
+            executor.resetStats()
             let buffers = try executeHeterogeneous(inputs, function: function, executor: executor)
             let stats = executor.getStats()
             let timing = ExecutionTiming(

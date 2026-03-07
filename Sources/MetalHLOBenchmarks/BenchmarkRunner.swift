@@ -48,6 +48,12 @@ public final class BenchmarkRunner: @unchecked Sendable {
     /// Optimization level for compilation.
     public var optimizationLevel: OptimizationLevel = .O2
 
+    /// Device execution policy for heterogeneous GPU+ANE execution.
+    public var devicePolicy: DevicePolicy = .gpuOnly
+
+    /// Use MPSGraph backend (default compile path without CompilationConfig).
+    public var useMPSGraph: Bool = false
+
     /// Progress callback: (currentIndex, totalCount, benchmarkID)
     public var onProgress: ((Int, Int, String) -> Void)?
 
@@ -65,9 +71,14 @@ public final class BenchmarkRunner: @unchecked Sendable {
             print("Running benchmark: \(benchmark.id)")
         }
 
-        // Compile the program with the specified optimization level
-        let compileConfig = CompilationConfig(optimizationLevel: optimizationLevel)
-        let executable = try client.compile(benchmark.mlirProgram, config: compileConfig)
+        // Compile the program
+        let executable: Executable
+        if useMPSGraph {
+            executable = try client.compile(benchmark.mlirProgram)
+        } else {
+            let compileConfig = CompilationConfig(optimizationLevel: optimizationLevel, devicePolicy: devicePolicy)
+            executable = try client.compile(benchmark.mlirProgram, config: compileConfig)
+        }
 
         // Create inputs
         let inputs = try benchmark.createInputs(client: client)
