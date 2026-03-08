@@ -121,16 +121,31 @@ public struct TestDataGenerator: Sendable {
     // MARK: - Buffer Creation Helpers
 
     /// Create a buffer with uniform Float32 data.
+    /// For large tensors (>64MB), fills the MTLBuffer directly to avoid
+    /// allocating a temporary Swift array that doubles memory usage.
     public func createUniformFloat32Buffer(
         client: Client,
         shape: [Int]
     ) throws -> Buffer {
         let count = shape.reduce(1, *)
+        let byteSize = count * MemoryLayout<Float>.stride
+
+        if byteSize >= 64 * 1024 * 1024 {
+            return try client.createBufferDirect(shape: shape) { ptr in
+                let floats = ptr.bindMemory(to: Float.self)
+                var rng = Xorshift64(state: seed)
+                for i in 0..<count {
+                    floats[i] = rng.nextFloat()
+                }
+            }
+        }
+
         let data = uniformFloat32(count: count)
         return try client.createBuffer(data, shape: shape)
     }
 
     /// Create a buffer with uniform Float32 data in range.
+    /// For large tensors (>64MB), fills the MTLBuffer directly.
     public func createUniformFloat32Buffer(
         client: Client,
         shape: [Int],
@@ -138,6 +153,19 @@ public struct TestDataGenerator: Sendable {
         max: Float
     ) throws -> Buffer {
         let count = shape.reduce(1, *)
+        let byteSize = count * MemoryLayout<Float>.stride
+
+        if byteSize >= 64 * 1024 * 1024 {
+            let range = max - min
+            return try client.createBufferDirect(shape: shape) { ptr in
+                let floats = ptr.bindMemory(to: Float.self)
+                var rng = Xorshift64(state: seed)
+                for i in 0..<count {
+                    floats[i] = min + rng.nextFloat() * range
+                }
+            }
+        }
+
         let data = uniformFloat32(count: count, min: min, max: max)
         return try client.createBuffer(data, shape: shape)
     }

@@ -394,6 +394,9 @@ public final class CodeGenerator: @unchecked Sendable {
 
         case .fusedRoPE(let config):
             return generateRoPESource(config, inputShapes: inputShapes)
+
+        case .fusedSoftmax(let axis):
+            return generateSoftmaxSource(axis: axis, inputShapes: inputShapes)
         }
     }
 
@@ -3419,6 +3422,103 @@ public final class CodeGenerator: @unchecked Sendable {
         return (source, "kernel_layer_norm", TuningConfig(blockSize: 256))
     }
 
+    /// Generates numerically stable softmax kernel.
+    /// softmax(x)_i = exp(x_i - max(x)) / sum(exp(x_j - max(x)))
+    private func generateSoftmaxSource(axis: Int, inputShapes: [[Int]]) -> (String, String, TuningConfig?) {
+        let inputShape = inputShapes.first ?? []
+        let rank = inputShape.count
+        // Resolve negative axis
+        let resolvedAxis = axis < 0 ? rank + axis : axis
+        let reductionSize = rank > 0 ? inputShape[resolvedAxis] : 1
+        // Batch = product of all dims except the reduction axis
+        let batchSize = inputShape.enumerated().filter { $0.offset != resolvedAxis }.map { $0.element }.reduce(1, *)
+
+        let source: String
+        if resolvedAxis == rank - 1 {
+            // Common case: softmax over last axis. Each threadgroup row handles one batch element.
+            source = """
+            #include <metal_stdlib>
+            using namespace metal;
+
+            constant uint REDUCTION_SIZE = \(reductionSize);
+
+            kernel void kernel_softmax(
+                device const float* input [[buffer(0)]],
+                device float* output [[buffer(1)]],
+                uint2 gid [[thread_position_in_grid]])
+            {
+                uint batch = gid.y;
+                uint offset = batch * REDUCTION_SIZE;
+
+                // Pass 1: find max for numerical stability
+                float maxVal = -INFINITY;
+                for (uint i = 0; i < REDUCTION_SIZE; i++) {
+                    maxVal = max(maxVal, input[offset + i]);
+                }
+
+                // Pass 2: compute exp(x - max) and accumulate sum
+                float sumExp = 0.0f;
+                for (uint i = 0; i < REDUCTION_SIZE; i++) {
+                    sumExp += exp(input[offset + i] - maxVal);
+                }
+
+                // Pass 3: normalize
+                float invSum = 1.0f / sumExp;
+                for (uint i = gid.x; i < REDUCTION_SIZE; i += \(256)) {
+                    output[offset + i] = exp(input[offset + i] - maxVal) * invSum;
+                }
+            }
+            """
+        } else {
+            // General case: softmax over arbitrary axis
+            var innerStride = 1
+            for d in (resolvedAxis + 1)..<rank {
+                innerStride *= inputShape[d]
+            }
+            let axisStride = innerStride
+            let outerStride = reductionSize * innerStride
+
+            source = """
+            #include <metal_stdlib>
+            using namespace metal;
+
+            constant uint REDUCTION_SIZE = \(reductionSize);
+
+            kernel void kernel_softmax(
+                device const float* input [[buffer(0)]],
+                device float* output [[buffer(1)]],
+                uint tid [[thread_position_in_grid]])
+            {
+                if (tid >= \(batchSize)) return;
+
+                uint inner = tid % \(innerStride);
+                uint outer = tid / \(innerStride);
+                uint base = outer * \(outerStride) + inner;
+
+                // Pass 1: find max
+                float maxVal = -INFINITY;
+                for (uint i = 0; i < REDUCTION_SIZE; i++) {
+                    maxVal = max(maxVal, input[base + i * \(axisStride)]);
+                }
+
+                // Pass 2: exp and sum
+                float sumExp = 0.0f;
+                for (uint i = 0; i < REDUCTION_SIZE; i++) {
+                    sumExp += exp(input[base + i * \(axisStride)] - maxVal);
+                }
+
+                // Pass 3: normalize
+                float invSum = 1.0f / sumExp;
+                for (uint i = 0; i < REDUCTION_SIZE; i++) {
+                    output[base + i * \(axisStride)] = exp(input[base + i * \(axisStride)] - maxVal) * invSum;
+                }
+            }
+            """
+        }
+
+        return (source, "kernel_softmax", TuningConfig(blockSize: 256))
+    }
+
     /// Generates MatMul + Bias + Activation source.
     private func generateMatMulBiasActSource(_ config: MatMulConfig, inputShapes: [[Int]]) -> (String, String, TuningConfig?) {
         let activationCode: String
@@ -4192,6 +4292,22 @@ public final class CodeGenerator: @unchecked Sendable {
         case .fusedGELU, .fusedSiLU:
             // GELU and SiLU kernels are NOT vectorized - they use tid directly
             return DispatchConfig.dispatch1D(elements: totalElements, threadgroupSize: 256)
+
+        case .fusedSoftmax(let axis):
+            // Softmax over last axis: dispatch as 2D (threads across reduction dim, rows across batch)
+            let rank = outputShape.count
+            let resolvedAxis = axis < 0 ? rank + axis : axis
+            if resolvedAxis == rank - 1 && outputShape.count >= 2 {
+                let batch = outputShape.dropLast().reduce(1, *)
+                return DispatchConfig(
+                    gridSize: MTLSize(width: (256 + 255) / 256, height: batch, depth: 1),
+                    threadgroupSize: MTLSize(width: 256, height: 1, depth: 1)
+                )
+            } else {
+                // General axis: 1D dispatch over batch elements
+                let batchSize = outputShape.enumerated().filter { $0.offset != resolvedAxis }.map { $0.element }.reduce(1, *)
+                return DispatchConfig.dispatch1D(elements: batchSize, threadgroupSize: 256)
+            }
 
         default:
             break

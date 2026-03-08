@@ -256,6 +256,9 @@ public enum FusedOpType: Sendable, Hashable {
 
     /// Fused rotary position embedding.
     case fusedRoPE(RoPEConfig)
+
+    /// Fused softmax (numerically stable: exp(x - max) / sum(exp(x - max))).
+    case fusedSoftmax(axis: Int)
 }
 
 /// Configuration for fused attention.
@@ -534,6 +537,10 @@ public struct FusedOp: Sendable {
         case "fused_residual_chain":
             // Residual chains are essentially elementwise adds
             return .fusedElementwise([.add])
+
+        case FusedSoftmaxHandler.targetName:
+            let axis = (config["axis"] as? Int) ?? -1
+            return .fusedSoftmax(axis: axis)
 
         case FusedFFNHandler.targetName:
             // Parse FFN configuration

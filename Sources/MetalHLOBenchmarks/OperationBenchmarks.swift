@@ -356,7 +356,7 @@ public enum OperationBenchmarks {
         let binaryConfigs: [(id: String, op: String, stablehloOp: String, shape: [Int])] = [
             ("ARITH-B-001", "add", "add", [1024, 1024]),
             ("ARITH-B-002", "add", "add", [4096, 4096]),
-            ("ARITH-B-003", "add", "add", [16384, 16384]),  // Large add
+            ("ARITH-B-003", "add", "add", [8192, 8192]),  // Large add (256MB/tensor)
             ("ARITH-B-004", "multiply", "multiply", [1024, 1024]),
             ("ARITH-B-005", "multiply", "multiply", [4096, 4096]),
             ("ARITH-B-006", "divide", "divide", [1024, 1024]),

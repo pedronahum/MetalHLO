@@ -579,6 +579,12 @@ public final class LayoutAssignment: @unchecked Sendable {
         var result: [Int: TensorLayout] = [:]
 
         switch op.kind {
+        case .customCall:
+            // Don't assign layouts to fused custom_call ops — they manage
+            // their own data layout internally. Inserting transposes around
+            // them breaks the fused kernel's expected input format.
+            break
+
         case .convolution:
             result[0] = getInputLayoutForConvolution(op)
             result[1] = getKernelLayoutForConvolution(op)

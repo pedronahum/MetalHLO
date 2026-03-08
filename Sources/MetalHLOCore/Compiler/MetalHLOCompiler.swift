@@ -255,21 +255,10 @@ public final class MetalHLOCompiler: @unchecked Sendable {
             return passManager.runAllPasses(module: function, analysis: analysis)
 
         case .O3:
-            // Aggressive optimization: multiple iterations until convergence
-            var currentFunction = function
-            var currentAnalysis = analysis
-
-            for _ in 0..<3 {
-                let module = passManager.runAllPasses(module: currentFunction, analysis: currentAnalysis)
-                let newFunction = reconstructFunction(from: module)
-                if newFunction.operations.count == currentFunction.operations.count {
-                    break
-                }
-                currentFunction = newFunction
-                currentAnalysis = analyzer.analyze(currentFunction)
-            }
-
-            return passManager.runAllPasses(module: currentFunction, analysis: currentAnalysis)
+            // Aggressive optimization: all passes including pattern fusion,
+            // cross-layer fusion, layout optimization, and scheduling.
+            // Single pass — iterating corrupts fused ops during reconstruction.
+            return passManager.runAllPasses(module: function, analysis: analysis)
         }
     }
 
@@ -615,6 +604,8 @@ public final class MetalHLOCompiler: @unchecked Sendable {
             case .fusedTransformerBlock:
                 kind = .customCall
             case .fusedRoPE:
+                kind = .customCall
+            case .fusedSoftmax:
                 kind = .customCall
             }
 

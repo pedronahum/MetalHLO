@@ -6,6 +6,7 @@
 import Foundation
 import MetalHLOBenchmarks
 import MetalHLO
+import MetalHLOCore
 
 // MARK: - CLI Argument Parsing
 
@@ -264,31 +265,37 @@ func runComparison(filter: String?, category: String?, quick: Bool, output: Stri
         var backendResults: [BackendResult] = []
 
         for backend in backends {
-            do {
-                runner.useMPSGraph = backend.useMPSGraph
-                runner.optimizationLevel = backend.optimizationLevel
-                runner.devicePolicy = backend.devicePolicy
+            // autoreleasepool ensures Metal buffers and intermediate arrays are
+            // freed between backend runs, preventing OOM on memory-constrained devices.
+            autoreleasepool {
+                do {
+                    runner.useMPSGraph = backend.useMPSGraph
+                    runner.optimizationLevel = backend.optimizationLevel
+                    runner.devicePolicy = backend.devicePolicy
 
-                let result = try runner.run(benchmark)
-                let meanMs = result.gpuTime.mean * 1000
-                let stdMs = result.gpuTime.stdDev * 1000
-                let p95Ms = result.gpuTime.p95 * 1000
+                    let result = try runner.run(benchmark)
+                    let meanMs = result.gpuTime.mean * 1000
+                    let stdMs = result.gpuTime.stdDev * 1000
+                    let p95Ms = result.gpuTime.p95 * 1000
 
-                backendResults.append(BackendResult(
-                    backendName: backend.shortName,
-                    meanMs: meanMs,
-                    stdDevMs: stdMs,
-                    p95Ms: p95Ms,
-                    failed: false,
-                    error: nil
-                ))
-                print(" [\(backend.shortName):OK]", terminator: "")
-                fflush(stdout)
-            } catch {
-                backendResults.append(.failure(backend: backend.shortName, error: "\(error)"))
-                print(" [\(backend.shortName):FAIL]", terminator: "")
-                fflush(stdout)
+                    backendResults.append(BackendResult(
+                        backendName: backend.shortName,
+                        meanMs: meanMs,
+                        stdDevMs: stdMs,
+                        p95Ms: p95Ms,
+                        failed: false,
+                        error: nil
+                    ))
+                    print(" [\(backend.shortName):OK]", terminator: "")
+                    fflush(stdout)
+                } catch {
+                    backendResults.append(.failure(backend: backend.shortName, error: "\(error)"))
+                    print(" [\(backend.shortName):FAIL]", terminator: "")
+                    fflush(stdout)
+                }
             }
+            // Clear pooled large tensor buffers to reclaim GPU memory
+            GlobalLargeTensorPool.clear()
         }
         print()  // newline after all backends
 

@@ -343,4 +343,19 @@ public final class Client: @unchecked Sendable {
         let storage = try executor.createBufferStorage(shape: shape, elementType: coreElementType)
         return Buffer(storage: storage)
     }
+
+    /// Creates a float32 buffer and fills it in-place via a closure.
+    /// This avoids allocating an intermediate Swift array, which is critical
+    /// for large tensors where a temporary copy would double memory usage.
+    public func createBufferDirect(
+        shape: [Int],
+        fill: (UnsafeMutableRawBufferPointer) -> Void
+    ) throws -> Buffer {
+        let largeTensor = try LargeTensorStorage(device: device, shape: shape, elementType: .float32)
+        largeTensor.withUnsafeMutableBytes { ptr in
+            fill(ptr)
+        }
+        let storage = BufferStorage(largeTensor: largeTensor, device: device)
+        return Buffer(storage: storage)
+    }
 }

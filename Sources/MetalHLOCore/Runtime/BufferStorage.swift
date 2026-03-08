@@ -87,6 +87,15 @@ public final class BufferStorage: @unchecked Sendable {
 
     // MARK: - Initialization
 
+    /// Creates storage wrapping a pre-filled LargeTensorStorage.
+    /// Use this to avoid creating intermediate Swift arrays for large tensors.
+    public init(largeTensor: LargeTensorStorage, device: MTLDevice) {
+        self.shape = largeTensor.shape
+        self.elementType = largeTensor.elementType
+        self.device = device
+        self.storage = .largeTensor(largeTensor)
+    }
+
     /// Creates storage from Float data (optimized fast path).
     /// This avoids expensive per-element type conversion.
     /// For large tensors, uses direct MTLBuffer allocation.

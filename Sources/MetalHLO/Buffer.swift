@@ -44,7 +44,7 @@ public final class Buffer: @unchecked Sendable {
 
     // MARK: - Initialization
 
-    internal init(storage: BufferStorage) {
+    public init(storage: BufferStorage) {
         self.storage = storage
     }
 
