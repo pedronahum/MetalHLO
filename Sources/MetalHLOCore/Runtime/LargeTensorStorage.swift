@@ -31,8 +31,9 @@ public final class LargeTensorStorage: @unchecked Sendable {
     // MARK: - Threshold Configuration
 
     /// Threshold in bytes above which tensors use direct MTLBuffer allocation.
-    /// Default: 64MB - below this, Swift Data overhead is negligible.
-    public static nonisolated(unsafe) var threshold: Int = 64 * 1024 * 1024
+    /// Set to 0 so all tensors use MTLBuffer on Apple Silicon unified memory,
+    /// enabling the zero-copy MPSGraphTensorData execution path at every size.
+    public static nonisolated(unsafe) var threshold: Int = 0
 
     // MARK: - Properties
 
