@@ -196,6 +196,14 @@ public struct GELUPattern: HLOPattern {
             let curr = queue.removeFirst()
             if visited.contains(curr.result) { continue }
             visited.insert(curr.result)
+
+            // Stop at non-elementwise boundaries (matmul, reduce, etc.).
+            // Treat the boundary op's result as the GELU input — do NOT absorb it.
+            guard GELUPattern.elementwiseKinds.contains(curr.kind) else {
+                if inputOperand == nil { inputOperand = curr.result }
+                continue
+            }
+
             matchedOps.append(curr)
             if let idx = definingOps[curr.result]?.index {
                 matchedIndices.append(idx)
@@ -216,7 +224,6 @@ public struct GELUPattern: HLOPattern {
                 }
             }
 
-            guard GELUPattern.elementwiseKinds.contains(curr.kind) else { continue }
             for operand in curr.operands {
                 if let def = definingOps[operand]?.op {
                     queue.append(def)
@@ -559,7 +566,20 @@ public struct AttentionPattern: HLOPattern {
               qkDotOp.kind == .dotGeneral else { return nil }
 
         let qOperand = qkDotOp.operands[0]  // Q
-        let kOperand = qkDotOp.operands[1]  // K
+        let kRaw = qkDotOp.operands[1]      // K or K^T (may have explicit transpose)
+
+        // Unwrap an explicit K transpose: MPSGraph scaledDotProductAttention takes K
+        // in natural orientation [batch, heads, seq_k, head_dim] and handles K^T
+        // internally. If the MLIR uses an explicit transpose before the dot, absorb
+        // it into the pattern and pass the original K to the custom_call.
+        // For square head_dim == seq_k shapes the transposed tensor has the same shape,
+        // so this bug only manifests when head_dim ≠ seq_k (e.g. [4,16,256,64]).
+        var kOperand = kRaw
+        var kTransposeOp: HLOOperation? = nil
+        if let kDef = definingOps[kRaw]?.op, kDef.kind == .transpose {
+            kTransposeOp = kDef
+            kOperand = kDef.operands[0]
+        }
 
         // Verify V is external (not from within this pattern)
         // V should be the second operand of the final dot
@@ -572,6 +592,12 @@ public struct AttentionPattern: HLOPattern {
         // Add Q@K dot
         if let idx = definingOps[qkDotOp.result]?.index {
             matchedOps.append(qkDotOp)
+            matchedIndices.append(idx)
+        }
+
+        // Absorb K transpose (if present) — native SDPA handles K^T internally
+        if let kt = kTransposeOp, let idx = definingOps[kt.result]?.index {
+            matchedOps.append(kt)
             matchedIndices.append(idx)
         }
 
