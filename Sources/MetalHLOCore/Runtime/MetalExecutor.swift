@@ -230,14 +230,30 @@ public final class MetalExecutor: @unchecked Sendable {
         // The command queue handles concurrent command buffer submission safely.
 
         // Create input tensor data
+        // When an MTLBuffer is available (large tensors), create MPSGraphTensorData
+        // directly from the buffer to avoid GPU→CPU→GPU round-trip copies.
         var inputDict: [MPSGraphTensor: MPSGraphTensorData] = [:]
         for (tensor, storage) in zip(compiled.inputTensors, inputs) {
-            let tensorData = MPSGraphTensorData(
-                device: mpsDevice,
-                data: storage.data,
-                shape: storage.shape.map { NSNumber(value: $0) },
-                dataType: storage.elementType.mpsDataType
-            )
+            let tensorData: MPSGraphTensorData
+            let shape = storage.shape.map { NSNumber(value: $0) }
+            let dataType = storage.elementType.mpsDataType
+
+            if let buffer = storage.metalBuffer {
+                // Fast path: write from MTLBuffer's unified memory directly into MPSNDArray.
+                // This avoids the toData() heap allocation + Data-based constructor double-copy.
+                let descriptor = MPSNDArrayDescriptor(dataType: dataType, shape: shape)
+                let ndarray = MPSNDArray(device: buffer.device, descriptor: descriptor)
+                ndarray.writeBytes(buffer.contents(), strideBytes: nil)
+                tensorData = MPSGraphTensorData(ndarray)
+            } else {
+                // Small tensor path: copy from Data (small enough that overhead is negligible)
+                tensorData = MPSGraphTensorData(
+                    device: mpsDevice,
+                    data: storage.data,
+                    shape: shape,
+                    dataType: dataType
+                )
+            }
             inputDict[tensor] = tensorData
         }
 
@@ -247,36 +263,24 @@ public final class MetalExecutor: @unchecked Sendable {
         // runAsync allows better pipelining than graph.run() which is synchronous
         let inputDataArray = compiled.inputTensors.compactMap { inputDict[$0] }
 
-        let results: [MPSGraphTensor: MPSGraphTensorData]
-        do {
-            // Use synchronous run() to ensure GPU work completes before reading results.
-            // runAsync returns immediately with placeholder data, causing reads to return zeros.
-            let outputDataArray = compiled.executable.run(
-                with: commandQueue,
-                inputs: inputDataArray,
-                results: nil,
-                executionDescriptor: nil
-            )
-
-            // Map outputs back to tensor dictionary
-            var resultDict: [MPSGraphTensor: MPSGraphTensorData] = [:]
-            for (tensor, data) in zip(compiled.outputTensors, outputDataArray) {
-                resultDict[tensor] = data
-            }
-            results = resultDict
-        }
+        // Execute: synchronous run() ensures GPU work completes before reading results.
+        let outputDataArray = compiled.executable.run(
+            with: commandQueue,
+            inputs: inputDataArray,
+            results: nil,
+            executionDescriptor: nil
+        )
 
         let gpuEndTime = CFAbsoluteTimeGetCurrent()
 
-        // Convert results to buffer storages
+        // Convert results to buffer storages.
+        // For large outputs, read directly into a pre-allocated MTLBuffer (shared memory)
+        // so the next operation can use writeBytes from it without a heap round-trip.
         var outputStorages: [BufferStorage] = []
-        for (index, outputTensor) in compiled.outputTensors.enumerated() {
-            guard let resultData = results[outputTensor] else {
-                throw ExecutorError.executionFailed("Missing output for tensor at index \(index)")
-            }
+        for (index, _) in compiled.outputTensors.enumerated() {
             let outputType = compiled.outputTypes[index]
             let storage = try BufferStorage(
-                tensorData: resultData,
+                tensorData: outputDataArray[index],
                 type: outputType,
                 device: device
             )

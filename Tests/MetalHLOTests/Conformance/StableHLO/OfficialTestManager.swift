@@ -66,7 +66,7 @@ public final class OfficialTestManager: @unchecked Sendable {
         // First, try to find bundled tests in the project directory
         // This file is at: Tests/MetalHLOTests/Conformance/StableHLO/OfficialTestManager.swift
         // Test files are at: Tests/MetalHLOTests/Conformance/StableHLO/{category}/
-        let thisFile = URL(fileURLWithPath: #file)
+        let thisFile = URL(fileURLWithPath: #filePath)
         self.bundledTestsDir = thisFile.deletingLastPathComponent()
 
         // Fallback cache in ~/.cache/metalhlo/stablehlo-tests/

@@ -276,6 +276,16 @@ public final class InterpretTestRunner: @unchecked Sendable {
             return "Complex types not supported by MPS"
         }
 
+        // Skip bitcast_convert with i1/i64 types - MPSGraph doesn't support these types
+        // and attempting to create graph operations with them causes a Metal framework crash
+        // (signal 6/11) rather than a clean error
+        if testCase.operation == "bitcast_convert" {
+            if testCase.inputs.contains(where: { $0.elementType == "i1" || $0.elementType == "i64" })
+                || testCase.mlir.contains("tensor<64xi1>") || testCase.mlir.contains("tensor<i64>") {
+                return "bitcast_convert with i1/i64 types crashes MPSGraph (unsupported types)"
+            }
+        }
+
         // Skip i1 (boolean) for bitwise operations - MPS doesn't support bitwise on i1
         // Skip unsigned integer bitwise operations - MPS treats all integers as signed,
         // causing incorrect results for unsigned max values (e.g., 255 for ui8 becomes -1)
