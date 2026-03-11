@@ -24,6 +24,10 @@ public final class BufferStorage: @unchecked Sendable {
         case data(Data)
         /// Direct MTLBuffer storage (for large tensors).
         case largeTensor(LargeTensorStorage)
+        /// Deferred MPSNDArray storage — zero-copy output from MPSGraph.
+        /// Data is only extracted (via readBytes) when the user reads it.
+        /// When fed into the next MPSGraph execution, this is zero-copy.
+        case mpsNDArray(MPSNDArray)
     }
 
     // MARK: - Properties
@@ -47,6 +51,11 @@ public final class BufferStorage: @unchecked Sendable {
             return data
         case .largeTensor(let largeTensor):
             return largeTensor.toData()
+        case .mpsNDArray(let ndarray):
+            let byteCount = (elementType == .int1 ? count : count * elementType.byteSize)
+            var bytes = [UInt8](repeating: 0, count: byteCount)
+            ndarray.readBytes(&bytes, strideBytes: nil)
+            return Data(bytes)
         }
     }
 
@@ -57,6 +66,18 @@ public final class BufferStorage: @unchecked Sendable {
             return nil
         case .largeTensor(let largeTensor):
             return largeTensor.buffer
+        case .mpsNDArray:
+            return nil
+        }
+    }
+
+    /// Returns the underlying MPSNDArray if using deferred storage.
+    public var mpsNDArray: MPSNDArray? {
+        switch storage {
+        case .mpsNDArray(let ndarray):
+            return ndarray
+        default:
+            return nil
         }
     }
 
@@ -65,6 +86,7 @@ public final class BufferStorage: @unchecked Sendable {
         switch storage {
         case .data: return false
         case .largeTensor: return true
+        case .mpsNDArray: return false
         }
     }
 
@@ -82,6 +104,8 @@ public final class BufferStorage: @unchecked Sendable {
             return data.count
         case .largeTensor(let largeTensor):
             return largeTensor.byteCount
+        case .mpsNDArray:
+            return count * elementType.byteSize
         }
     }
 
@@ -266,7 +290,11 @@ public final class BufferStorage: @unchecked Sendable {
         }
     }
 
-    /// Creates storage from MPSGraph tensor data.
+    /// Creates storage from MPSGraph tensor data (zero-copy).
+    ///
+    /// Stores the MPSNDArray directly without extracting bytes. When this
+    /// storage feeds into the next MPSGraph execution, the data stays on-device
+    /// with no copies. Bytes are only extracted lazily if the user reads the data.
     public init(
         tensorData: MPSGraphTensorData,
         type: TensorType,
@@ -275,27 +303,7 @@ public final class BufferStorage: @unchecked Sendable {
         self.shape = type.shape
         self.elementType = type.elementType
         self.device = device
-
-        // Extract data from tensor
-        let byteCount = type.byteCount
-
-        // Use large tensor storage for large outputs
-        if byteCount >= LargeTensorStorage.threshold {
-            if let largeTensor = try? LargeTensorStorage(device: device, shape: type.shape, elementType: type.elementType) {
-                // Read directly into the large tensor buffer
-                tensorData.mpsndarray().readBytes(largeTensor.buffer.contents(), strideBytes: nil)
-                self.storage = .largeTensor(largeTensor)
-            } else {
-                // Fallback to Data
-                var bytes = [UInt8](repeating: 0, count: byteCount)
-                tensorData.mpsndarray().readBytes(&bytes, strideBytes: nil)
-                self.storage = .data(Data(bytes))
-            }
-        } else {
-            var bytes = [UInt8](repeating: 0, count: byteCount)
-            tensorData.mpsndarray().readBytes(&bytes, strideBytes: nil)
-            self.storage = .data(Data(bytes))
-        }
+        self.storage = .mpsNDArray(tensorData.mpsndarray())
     }
 
     // MARK: - Data Conversion
@@ -392,6 +400,14 @@ public final class BufferStorage: @unchecked Sendable {
             }
         case .largeTensor(let largeTensor):
             return largeTensor.toArray(as: type)
+        case .mpsNDArray(let ndarray):
+            let byteCount = (elementType == .int1 ? count : count * elementType.byteSize)
+            var bytes = [UInt8](repeating: 0, count: byteCount)
+            ndarray.readBytes(&bytes, strideBytes: nil)
+            return bytes.withUnsafeBytes { buffer in
+                let typedBuffer = buffer.bindMemory(to: T.self)
+                return Array(typedBuffer)
+            }
         }
     }
 
@@ -408,16 +424,27 @@ public final class BufferStorage: @unchecked Sendable {
             return data
         case .largeTensor(let largeTensor):
             return largeTensor.toData()
+        case .mpsNDArray(let ndarray):
+            let byteCount = (elementType == .int1 ? count : count * elementType.byteSize)
+            var bytes = [UInt8](repeating: 0, count: byteCount)
+            ndarray.readBytes(&bytes, strideBytes: nil)
+            return Data(bytes)
         }
     }
 
-    /// Provides direct read access to buffer contents (zero-copy for large tensors).
+    /// Provides direct read access to buffer contents.
+    /// For mpsNDArray storage, this extracts bytes first (deferred copy).
     public func withUnsafeBytes<R>(_ body: (UnsafeRawBufferPointer) throws -> R) rethrows -> R {
         switch storage {
         case .data(let data):
             return try data.withUnsafeBytes(body)
         case .largeTensor(let largeTensor):
             return try largeTensor.withUnsafeBytes(body)
+        case .mpsNDArray(let ndarray):
+            let byteCount = (elementType == .int1 ? count : count * elementType.byteSize)
+            var bytes = [UInt8](repeating: 0, count: byteCount)
+            ndarray.readBytes(&bytes, strideBytes: nil)
+            return try bytes.withUnsafeBytes(body)
         }
     }
 }

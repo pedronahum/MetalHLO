@@ -238,9 +238,11 @@ public final class MetalExecutor: @unchecked Sendable {
             let shape = storage.shape.map { NSNumber(value: $0) }
             let dataType = storage.elementType.mpsDataType
 
-            if let buffer = storage.metalBuffer {
+            if let ndarray = storage.mpsNDArray {
+                // Zero-copy: reuse the MPSNDArray from a previous execution directly.
+                tensorData = MPSGraphTensorData(ndarray)
+            } else if let buffer = storage.metalBuffer {
                 // Zero-copy: MPSGraphTensorData aliases the MTLBuffer directly.
-                // On Apple Silicon unified memory, no data movement occurs.
                 tensorData = MPSGraphTensorData(buffer, shape: shape, dataType: dataType)
             } else {
                 // Small tensor path: copy from Data (small enough that overhead is negligible)
