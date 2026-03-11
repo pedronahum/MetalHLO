@@ -82,8 +82,14 @@ public final class Client: @unchecked Sendable {
             )
         }
 
+        // Run pattern-based optimizer: fuses attention, softmax, GELU, layerNorm
+        // before lowering to MPSGraph so the compiler sees fused custom_calls.
+        let optimizer = HLOOptimizer()
+        let optimizedFunction = optimizer.optimize(module.function)
+        let optimizedModule = HLOModule(name: module.name, function: optimizedFunction)
+
         // Compile HLOModule to MPSGraph executable
-        let compiled = try executor.compile(module: module)
+        let compiled = try executor.compile(module: optimizedModule)
 
         return Executable(compiled: compiled, executor: executor)
     }
