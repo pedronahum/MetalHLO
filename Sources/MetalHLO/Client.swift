@@ -84,7 +84,20 @@ public final class Client: @unchecked Sendable {
 
         // Run pattern-based optimizer: fuses attention, softmax, GELU, layerNorm
         // before lowering to MPSGraph so the compiler sees fused custom_calls.
-        let optimizer = HLOOptimizer()
+        // Restrict to pattern-only passes — structural transforms (TransposeMatmulFolding,
+        // LayoutAssignment, SiblingFusion, HorizontalFusion) assume the integrated
+        // executor and corrupt the graph for the MPSGraph backend.
+        let optimizerConfig = HLOOptimizerConfig(
+            enableFusion: true,
+            enableConstantFolding: false,
+            enableProducerConsumerFusion: false,
+            enableSiblingFusion: false,
+            enableHorizontalFusion: false,
+            enableLayoutAssignment: false,
+            enableTransposeMatmulFolding: false,
+            emitFusedCustomCalls: true
+        )
+        let optimizer = HLOOptimizer(config: optimizerConfig)
         let optimizedFunction = optimizer.optimize(module.function)
         let optimizedModule = HLOModule(name: module.name, function: optimizedFunction)
 
