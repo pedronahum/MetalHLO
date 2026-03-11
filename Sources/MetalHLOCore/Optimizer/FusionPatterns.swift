@@ -140,6 +140,15 @@ public struct GELUPattern: HLOPattern {
 
     public init() {}
 
+    /// Op kinds that are safe to descend into during GELU BFS.
+    /// We must NOT cross matmul, reduce, gather, or other non-elementwise
+    /// boundaries — otherwise the pattern absorbs preceding ops and the
+    /// replacement custom_call drops them from the graph.
+    private static let elementwiseKinds: Set<HLOOpKind> = [
+        .tanh, .multiply, .add, .subtract, .negate,
+        .power, .exponential, .sqrt, .constant, .broadcastInDim, .convert
+    ]
+
     public func match(
         at op: HLOOperation,
         index: Int,
@@ -149,15 +158,13 @@ public struct GELUPattern: HLOPattern {
         // GELU ends with multiply (0.5 * x * ...)
         guard op.kind == .multiply else { return nil }
 
-        // Look for tanh in the chain
-        var current = op
         var visited: Set<String> = []
         var foundTanh = false
         var tanhOp: HLOOperation?
         var matchedOps: [HLOOperation] = []
         var matchedIndices: [Int] = []
 
-        // BFS to find tanh
+        // BFS to find tanh — only descend into elementwise ops.
         var queue: [HLOOperation] = [op]
         while !queue.isEmpty {
             let curr = queue.removeFirst()
@@ -169,6 +176,7 @@ public struct GELUPattern: HLOPattern {
                 tanhOp = curr
             }
 
+            guard GELUPattern.elementwiseKinds.contains(curr.kind) else { continue }
             for operand in curr.operands {
                 if let def = definingOps[operand]?.op {
                     queue.append(def)
@@ -176,23 +184,12 @@ public struct GELUPattern: HLOPattern {
             }
         }
 
-        guard foundTanh, let tanh = tanhOp else { return nil }
+        guard foundTanh, let _ = tanhOp else { return nil }
 
-        // Look for the characteristic pattern:
-        // - Multiple multiplies
-        // - An add with 1
-        // - Power of 3 or multiply chain for x^3
-
-        // For simplicity, we'll check for:
-        // 1. tanh exists
-        // 2. There's a multiply with 0.5 constant
-        // 3. There's a power with 3 or multiple multiplies
-
-        var hasPowerOf3 = false
         var hasHalfConstant = false
         var inputOperand: String?
 
-        // Re-traverse to collect pattern
+        // Re-traverse to collect matched ops — same elementwise-only bound.
         visited.removeAll()
         queue = [op]
         while !queue.isEmpty {
@@ -206,11 +203,7 @@ public struct GELUPattern: HLOPattern {
                 matchedIndices.append(index)
             }
 
-            if curr.kind == .power {
-                hasPowerOf3 = true
-            }
             if curr.kind == .constant {
-                // Check for 0.5 constant
                 if let constVal = curr.attributes.constantValue {
                     switch constVal {
                     case .scalar(let v) where abs(v - 0.5) < 0.01:
@@ -223,18 +216,18 @@ public struct GELUPattern: HLOPattern {
                 }
             }
 
+            guard GELUPattern.elementwiseKinds.contains(curr.kind) else { continue }
             for operand in curr.operands {
                 if let def = definingOps[operand]?.op {
                     queue.append(def)
                 } else if inputOperand == nil {
-                    // This operand comes from outside - it's the input
                     inputOperand = operand
                 }
             }
         }
 
         // Require tanh and 0.5 constant for GELU detection
-        guard foundTanh && hasHalfConstant else { return nil }
+        guard hasHalfConstant else { return nil }
 
         return PatternMatch(
             operations: matchedOps,
