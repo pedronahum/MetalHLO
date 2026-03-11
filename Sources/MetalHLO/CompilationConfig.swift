@@ -247,7 +247,9 @@ public enum OptimizationPass: String, CaseIterable, Sendable {
         return passes
     }
 
-    /// Passes that run at O3 (aggressive optimization) - all passes.
+    /// Passes that run at O3 (aggressive optimization).
+    /// All passes are enabled. TransposeFolding, ElementwiseChainFusion, and
+    /// ResidualChainFusion are registered but intentionally no-ops (see PassManager.swift).
     public static var aggressivePasses: Set<String> {
         Set(allPassNames)
     }

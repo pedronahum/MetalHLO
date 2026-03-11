@@ -923,152 +923,154 @@ MetalHLO includes a comprehensive benchmarking framework with multi-backend comp
 
 ### Multi-Backend Performance Comparison
 
-All results measured on **Apple M1 (8 GB)**, release build, quick mode (3 warmup, 10 measurements).
+All results measured on **Apple M1 (8 GB)**, macOS 15.6, release build, quick mode (3 warmup, 10 measurements).
 Times are mean in milliseconds. **Bold** indicates the fastest backend for each benchmark.
 
 #### Matrix Operations
 
 | Benchmark | Description | MPSGraph | Metal O2 | Metal O3 | GPU+ANE | Best vs MPSGraph |
 |-----------|-------------|----------|----------|----------|---------|-------------------|
-| MAT-DOT-001 | GEMM 128x128 | 0.26 | 0.22 | **0.19** | 0.20 | 1.40x (O3) |
-| MAT-DOT-002 | GEMM 512x512 | 1.07 | 0.79 | 0.83 | **0.78** | 1.36x (ANE) |
-| MAT-DOT-003 | GEMM 1024x1024 | **3.99** | 4.45 | 4.34 | 4.38 | MPSGraph best |
-| MAT-DOT-004 | GEMM 2048x2048 | **18.37** | 18.84 | 19.40 | 19.21 | MPSGraph best |
-| MAT-DOT-005 | GEMM 4096x4096 | **116.7** | 170.5 | 174.2 | 187.1 | MPSGraph best |
-| MAT-DOT-006 | Transformer 32x4096x768 | 2.55 | 0.83 | **0.82** | 0.91 | 3.09x (O3) |
-| MAT-DOT-007 | MLP 128x768x3072 | 2.91 | 1.70 | 1.68 | **1.58** | 1.84x (ANE) |
-| MAT-DOT-008 | Matvec 1x4096x4096 | 11.97 | 11.63 | **10.18** | 11.83 | 1.18x (O3) |
-| MAT-BATCH-001 | Batched 8x512x512 | 6.08 | 4.81 | 4.79 | **4.77** | 1.28x (ANE) |
-| MAT-BATCH-002 | Batched 4x1024x1024 | 4.84 | 2.65 | **2.61** | 2.83 | 1.86x (O3) |
-| MAT-BATCH-003 | Attention heads | 1.42 | **0.61** | 0.65 | 0.66 | 2.33x (O2) |
-| MAT-BATCH-004 | Multi-head attention | 0.75 | **0.38** | 0.40 | 0.42 | 1.98x (O2) |
-| MAT-TR-001 | Transpose 1024x1024 | 1.30 | 0.45 | **0.44** | 0.47 | 2.93x (O3) |
-| MAT-TR-002 | Transpose 3D 32x128x64 | 0.46 | **0.27** | 0.27 | 0.36 | 1.71x (O2) |
-| MAT-RSH-001 | Reshape flatten 1024x1024 | 1.26 | **0.43** | 0.47 | 0.44 | 2.90x (O2) |
-| MAT-RSH-002 | Reshape batch 32x64x128 | 0.57 | **0.25** | 0.31 | 0.32 | 2.28x (O2) |
+| MAT-DOT-001 | GEMM 128x128 | 0.30 | **0.17** | 0.24 | 0.25 | 1.72x (O2) |
+| MAT-DOT-002 | GEMM 512x512 | 1.03 | **0.77** | 1.71 | 0.85 | 1.34x (O2) |
+| MAT-DOT-003 | GEMM 1024x1024 | **4.17** | 5.10 | 5.32 | 4.53 | MPSGraph best |
+| MAT-DOT-004 | GEMM 2048x2048 | **19.55** | 23.00 | 22.63 | 22.17 | MPSGraph best |
+| MAT-DOT-005 | GEMM 4096x4096 | **122.7** | 226.1 | 227.6 | 234.4 | MPSGraph best |
+| MAT-DOT-006 | Transformer 32x4096x768 | 2.36 | 1.22 | 1.17 | **1.10** | 2.14x (ANE) |
+| MAT-DOT-007 | MLP 128x768x3072 | 3.11 | 1.90 | 2.06 | **1.63** | 1.91x (ANE) |
+| MAT-DOT-008 | Matvec 1x4096x4096 | **3.93** | 10.91 | 11.68 | 10.94 | MPSGraph best |
+| MAT-BATCH-001 | Batched 8x512x512 | 6.10 | 5.41 | **4.69** | 5.58 | 1.30x (O3) |
+| MAT-BATCH-002 | Batched 4x1024x1024 | 4.59 | **2.85** | 3.03 | 2.99 | 1.61x (O2) |
+| MAT-BATCH-003 | Attention heads | 1.61 | 1.12 | **0.67** | 1.28 | 2.42x (O3) |
+| MAT-BATCH-004 | Multi-head attention | 0.81 | 0.38 | 0.38 | **0.36** | 2.29x (ANE) |
+| MAT-TR-001 | Transpose 1024x1024 | 1.45 | 0.84 | **0.50** | 1.27 | 2.87x (O3) |
+| MAT-TR-002 | Transpose 3D 32x128x64 | 0.49 | 0.65 | **0.25** | 0.56 | 1.99x (O3) |
+| MAT-RSH-001 | Reshape flatten 1024x1024 | 1.34 | 0.53 | **0.48** | 0.57 | 2.80x (O3) |
+| MAT-RSH-002 | Reshape batch 32x64x128 | 0.48 | **0.41** | 0.46 | 0.42 | 1.16x (O2) |
 
-**Takeaway:** MPSGraph wins on large GEMMs (>1024x1024) where Apple's tuned MPSGraph matmul dominates. Metal O2/O3 win on transformer-shaped matmuls, batched operations, transpose, and reshape (2-3x faster).
+**Takeaway:** MPSGraph wins on large GEMMs (≥1024x1024) and matvec where Apple's tuned kernels dominate. Metal O3 wins on batched operations, transpose, and reshape (1.3-2.9x faster). O2 wins on small-to-mid GEMMs. ANE excels on transformer-shaped and MLP matmuls.
 
 #### Element-wise Arithmetic
 
 | Benchmark | Description | MPSGraph | Metal O2 | Metal O3 | GPU+ANE | Best vs MPSGraph |
 |-----------|-------------|----------|----------|----------|---------|-------------------|
-| ARITH-B-001 | Add 1024x1024 | 1.90 | 0.70 | **0.68** | 0.70 | 2.81x (O3) |
-| ARITH-B-002 | Add 4096x4096 | 29.33 | 9.63 | 9.62 | **8.81** | 3.33x (ANE) |
-| ARITH-B-003 | Add 8192x8192 | 207.6 | 135.7 | **98.3** | 125.3 | 2.11x (O3) |
-| ARITH-B-004 | Mul 1024x1024 | 1.81 | **0.62** | 0.65 | 0.64 | 2.90x (O2) |
-| ARITH-B-005 | Mul 4096x4096 | 26.94 | 7.04 | **6.26** | 6.39 | 4.31x (O3) |
-| ARITH-B-006 | Div 1024x1024 | 2.05 | 0.71 | **0.64** | 0.65 | 3.19x (O3) |
-| ARITH-B-007 | Pow 1024x1024 | 2.08 | **0.67** | 0.70 | 0.71 | 3.10x (O2) |
-| ARITH-B-008 | Max 4096x4096 | 25.83 | 6.36 | 6.53 | **6.31** | 4.10x (ANE) |
-| ARITH-U-001 | Exp 1024x1024 | 1.28 | **0.38** | 0.38 | 0.41 | 3.39x (O2) |
-| ARITH-U-002 | Log 4096x4096 | 14.47 | **3.72** | 3.81 | 3.77 | 3.89x (O2) |
-| ARITH-U-003 | Tanh 1024x1024 | 1.20 | **0.42** | 0.44 | 0.42 | 2.87x (O2) |
-| ARITH-U-004 | Sqrt 4096x4096 | 14.53 | **3.81** | 3.84 | 3.86 | 3.82x (O2) |
-| ARITH-U-005 | Rsqrt 4096x4096 | 15.04 | 3.89 | **3.79** | 4.77 | 3.97x (O3) |
-| ARITH-U-006 | Sigmoid 1024x1024 | 1.39 | 0.59 | **0.49** | 0.53 | 2.82x (O3) |
-| ARITH-BC-001 | Add row broadcast | 1.26 | **0.70** | 0.83 | 0.97 | 1.81x (O2) |
-| ARITH-BC-002 | Add scalar broadcast | 1.29 | 0.64 | 0.66 | **0.62** | 2.09x (ANE) |
-| ARITH-BC-003 | Mul last-dim broadcast | 0.44 | 0.27 | 0.27 | **0.26** | 1.70x (ANE) |
+| ARITH-B-001 | Add 1024x1024 | 2.52 | 0.96 | **0.75** | 0.75 | 3.35x (ANE) |
+| ARITH-B-002 | Add 4096x4096 | 12.20 | 10.30 | 16.43 | **8.75** | 1.40x (ANE) |
+| ARITH-B-003 | Add 8192x8192 | **57.7** | 169.1 | 138.5 | 148.1 | MPSGraph best |
+| ARITH-B-004 | Mul 1024x1024 | 2.66 | **0.79** | 0.83 | 0.88 | 3.38x (O2) |
+| ARITH-B-005 | Mul 4096x4096 | 11.91 | **10.12** | 10.43 | 13.97 | 1.18x (O2) |
+| ARITH-B-006 | Div 1024x1024 | 2.16 | 0.97 | **0.80** | 1.15 | 2.69x (O3) |
+| ARITH-B-007 | Pow 1024x1024 | 2.52 | **0.97** | 0.98 | 1.03 | 2.59x (O2) |
+| ARITH-B-008 | Max 4096x4096 | 11.85 | 12.46 | 9.42 | **8.32** | 1.42x (ANE) |
+| ARITH-U-001 | Exp 1024x1024 | 1.23 | 0.61 | **0.57** | 0.85 | 2.14x (O3) |
+| ARITH-U-002 | Log 4096x4096 | 8.07 | 5.01 | **4.90** | 5.08 | 1.65x (O3) |
+| ARITH-U-003 | Tanh 1024x1024 | 1.54 | **0.52** | 0.52 | 0.81 | 2.96x (O3) |
+| ARITH-U-004 | Sqrt 4096x4096 | 8.02 | **4.61** | 4.79 | 5.30 | 1.74x (O2) |
+| ARITH-U-005 | Rsqrt 4096x4096 | 8.71 | 5.65 | 5.74 | **5.57** | 1.56x (ANE) |
+| ARITH-U-006 | Sigmoid 1024x1024 | 1.34 | 0.70 | **0.70** | 0.79 | 1.93x (O3) |
+| ARITH-BC-001 | Add row broadcast | 1.35 | 1.34 | **0.93** | 1.10 | 1.45x (O3) |
+| ARITH-BC-002 | Add scalar broadcast | 1.29 | 1.00 | 0.99 | **0.81** | 1.58x (ANE) |
+| ARITH-BC-003 | Mul last-dim broadcast | 0.48 | **0.39** | 0.44 | 0.54 | 1.23x (O2) |
 
-**Takeaway:** Metal backends are **2.8-4.3x faster** than MPSGraph on all element-wise operations. O2 and O3 trade wins; ANE wins on larger tensors (4096x4096) due to parallel GPU+ANE execution.
+**Takeaway:** Metal backends are **1.2-3.4x faster** than MPSGraph on element-wise operations. The advantage is largest on 1024x1024 tensors (2.1-3.4x); on 4096x4096 tensors MPSGraph has improved significantly (macOS 15.6), narrowing the gap to 1.2-1.7x. O2, O3, and ANE all trade wins.
 
 #### Reduction Operations
 
 | Benchmark | Description | MPSGraph | Metal O2 | Metal O3 | GPU+ANE | Best vs MPSGraph |
 |-----------|-------------|----------|----------|----------|---------|-------------------|
-| RED-001 | Global sum 1024x1024 | 0.87 | 0.71 | 0.77 | **0.71** | 1.22x (ANE) |
-| RED-002 | Row-wise sum 1024x1024 | 0.98 | 0.83 | **0.79** | 0.81 | 1.24x (O3) |
-| RED-003 | Column-wise sum 1024x1024 | 0.99 | **0.69** | 0.73 | 0.75 | 1.44x (O2) |
-| RED-004 | Row-wise max 4096x4096 | 12.17 | 5.87 | **5.78** | 6.02 | 2.10x (O3) |
-| RED-005 | LayerNorm reduction 32x128x768 | 2.93 | 1.04 | **0.98** | 1.04 | 2.99x (O3) |
-| RED-006 | Attention reduction 32x12x512x512 | 81.73 | 34.81 | 26.25 | **25.44** | 3.21x (ANE) |
+| RED-001 | Global sum 1024x1024 | 0.91 | 0.96 | 0.89 | **0.86** | 1.06x (ANE) |
+| RED-002 | Row-wise sum 1024x1024 | 1.03 | **0.87** | 1.09 | 0.95 | 1.18x (O2) |
+| RED-003 | Column-wise sum 1024x1024 | 0.90 | **0.82** | 0.83 | 0.84 | 1.10x (O2) |
+| RED-004 | Row-wise max 4096x4096 | **4.21** | 6.25 | 5.91 | 6.17 | MPSGraph best |
+| RED-005 | LayerNorm reduction 32x128x768 | 2.72 | 1.29 | **0.95** | 1.09 | 2.86x (O3) |
+| RED-006 | Attention reduction 32x12x512x512 | **22.49** | 47.37 | 46.81 | 37.49 | MPSGraph best |
 
-**Takeaway:** Metal backends are consistently faster on reductions, with O3 excelling on structured reductions (2-3x). ANE wins on very large attention-shaped reductions (3.2x).
+**Takeaway:** Metal backends win on 1024x1024 reductions (1.1-1.2x). O3 excels on LayerNorm reduction (2.9x). On larger reductions (4096x4096 and attention-shaped), MPSGraph wins thanks to macOS 15.6 improvements.
 
 #### Convolution
 
 | Benchmark | Description | MPSGraph | Metal O2 | Metal O3 | GPU+ANE | Best vs MPSGraph |
 |-----------|-------------|----------|----------|----------|---------|-------------------|
-| CONV-001 | ResNet first layer | 2.28 | **1.91** | 1.96 | 2.40 | 1.20x (O2) |
-| CONV-002 | ResNet stage2 3x3 | **0.86** | 3.51 | 3.37 | 1.17 | MPSGraph best |
-| CONV-003 | ResNet stage3 3x3 | **1.07** | 3.29 | 2.80 | 1.20 | MPSGraph best |
-| CONV-004 | ResNet stage4 3x3 | **1.71** | 3.03 | 2.95 | 1.86 | MPSGraph best |
-| CONV-005 | Batched conv | **11.60** | 30.76 | 31.33 | 18.80 | MPSGraph best |
-| CONV-006 | 1x1 pointwise | 0.85 | 0.63 | **0.56** | 1.69 | 1.53x (O3) |
-| CONV-007 | Depthwise-like | **1.52** | 4.24 | 4.13 | 1.91 | MPSGraph best |
+| CONV-001 | ResNet first layer | **1.92** | 1.91 | 2.24 | 2.78 | ~1.00x |
+| CONV-002 | ResNet stage2 3x3 | **1.16** | 3.36 | 3.09 | 1.16 | MPSGraph best |
+| CONV-003 | ResNet stage3 3x3 | **1.06** | 3.64 | 3.15 | 1.36 | MPSGraph best |
+| CONV-004 | ResNet stage4 3x3 | **1.73** | 3.45 | 2.77 | 2.01 | MPSGraph best |
+| CONV-005 | Batched conv | **11.79** | 34.94 | 34.42 | 20.22 | MPSGraph best |
+| CONV-006 | 1x1 pointwise | 0.83 | 0.71 | **0.68** | 1.75 | 1.22x (O3) |
+| CONV-007 | Depthwise-like | 1.61 | 4.88 | 5.24 | **1.54** | 1.05x (ANE) |
 
-**Takeaway:** MPSGraph dominates convolutions thanks to Apple's highly optimized `MPSCNNConvolution` kernels. Metal backends only win on 1x1 pointwise convolutions and the initial layer. ANE provides intermediate performance between Metal kernels and MPSGraph.
+**Takeaway:** MPSGraph dominates convolutions thanks to Apple's highly optimized `MPSCNNConvolution` kernels. Metal O3 wins on 1x1 pointwise convolutions. ANE occasionally beats MPSGraph on depthwise patterns.
 
 #### Normalization
 
 | Benchmark | Description | MPSGraph | Metal O2 | Metal O3 | GPU+ANE | Best vs MPSGraph |
 |-----------|-------------|----------|----------|----------|---------|-------------------|
-| NORM-BN-001 | ResNet BN | 0.42 | 0.23 | **0.22** | 0.25 | 1.88x (O3) |
-| NORM-BN-002 | Batched ResNet BN | 7.19 | **2.37** | 2.76 | 2.41 | 3.03x (O2) |
-| NORM-BN-003 | Mid-layer BN | 0.35 | **0.20** | 0.20 | 0.27 | 1.75x (O2) |
-| NORM-BN-004 | Late-layer BN | 0.36 | 0.18 | 0.21 | **0.15** | 2.42x (ANE) |
-| NORM-LN-001 | BERT-base LayerNorm | **0.35** | 0.42 | 0.50 | 0.50 | MPSGraph best |
-| NORM-LN-002 | BERT-base batched LN | **4.10** | 5.01 | 4.97 | 4.66 | MPSGraph best |
-| NORM-LN-003 | BERT-large single LN | **1.00** | 1.50 | 1.32 | 1.42 | MPSGraph best |
-| NORM-LN-004 | Long sequence LN | **13.83** | 17.56 | 16.68 | 16.06 | MPSGraph best |
+| NORM-BN-001 | ResNet BN | 0.42 | **0.24** | 0.28 | 0.39 | 1.76x (O2) |
+| NORM-BN-002 | Batched ResNet BN | 8.06 | 3.83 | **2.43** | FAIL | 3.32x (O3) |
+| NORM-BN-003 | Mid-layer BN | 0.35 | **0.18** | 0.21 | 0.19 | 1.90x (O2) |
+| NORM-BN-004 | Late-layer BN | 0.29 | **0.17** | 0.38 | 0.19 | 1.70x (O2) |
+| NORM-LN-001 | BERT-base LayerNorm | 0.57 | **0.52** | 0.56 | 0.59 | 1.09x (O2) |
+| NORM-LN-002 | BERT-base batched LN | **4.42** | 6.17 | 6.87 | 6.46 | MPSGraph best |
+| NORM-LN-003 | BERT-large single LN | **1.36** | 1.77 | 2.17 | 1.63 | MPSGraph best |
+| NORM-LN-004 | Long sequence LN | **15.67** | 20.90 | 21.10 | 23.02 | MPSGraph best |
 
-**Takeaway:** Metal backends excel at batch normalization (1.8-3x faster). MPSGraph wins on layer normalization, where its native implementation is well-optimized.
+**Takeaway:** Metal O2 excels at batch normalization (1.7-1.9x faster). O3 wins on large batched BN (3.3x). MPSGraph wins on layer normalization, where its native implementation is well-optimized.
 
 #### Transformer Components
 
 | Benchmark | Description | MPSGraph | Metal O2 | Metal O3 | GPU+ANE | Best vs MPSGraph |
 |-----------|-------------|----------|----------|----------|---------|-------------------|
-| XFMR-INF-001 | Self-attention seq=128 | 2.29 | 2.12 | **1.95** | 1.97 | 1.18x (O3) |
-| XFMR-INF-002 | Self-attention seq=512 | **6.66** | 7.44 | 8.08 | 7.61 | MPSGraph best |
-| XFMR-INF-003 | Self-attention BS=8 seq=128 | 9.02 | 8.25 | **8.14** | 8.39 | 1.11x (O3) |
-| XFMR-INF-004 | Transformer FFN BS=8 | **12.92** | 13.75 | 13.39 | 13.36 | MPSGraph best |
-| XFMR-INF-005 | Softmax 8x12x128x128 | 2.34 | 1.74 | **1.65** | 1.74 | 1.42x (O3) |
-| XFMR-INF-006 | Encoder block BS=1 seq=128 | 7.10 | 5.87 | **5.56** | 5.84 | 1.28x (O3) |
+| XFMR-INF-001 | Self-attention seq=128 | 2.76 | 2.51 | **2.19** | 2.41 | 1.26x (O3) |
+| XFMR-INF-002 | Self-attention seq=512 | **7.61** | 7.85 | 8.28 | 7.82 | MPSGraph best |
+| XFMR-INF-003 | Self-attention BS=8 seq=128 | **8.80** | 9.45 | 9.43 | 9.22 | MPSGraph best |
+| XFMR-INF-004 | Transformer FFN BS=8 | **11.27** | 18.24 | 16.71 | 16.02 | MPSGraph best |
+| XFMR-INF-005 | Softmax 8x12x128x128 | 2.53 | 2.34 | 2.29 | **2.29** | 1.11x (ANE) |
+| XFMR-INF-006 | Encoder block BS=1 seq=128 | 7.71 | **7.46** | 8.48 | 7.84 | 1.03x (O2) |
 
-**Takeaway:** O3 wins on 4 of 6 transformer workloads thanks to pattern fusion (attention, softmax, GELU). The gains are most visible in encoder blocks (1.28x) and softmax (1.42x). MPSGraph wins on larger sequence lengths where its matmul advantage dominates.
+**Takeaway:** MPSGraph wins on 3 of 6 transformer workloads (larger sequence lengths, FFN, batched attention). O3 excels on self-attention (1.3x). ANE is competitive on softmax.
 
 #### MLP Inference
 
 | Benchmark | Description | MPSGraph | Metal O2 | Metal O3 | GPU+ANE | Best vs MPSGraph |
 |-----------|-------------|----------|----------|----------|---------|-------------------|
-| MLP-INF-001 | 784->256->10 BS=1 | **0.38** | 0.47 | 0.49 | 0.40 | MPSGraph best |
-| MLP-INF-002 | 784->256->10 BS=32 | 0.38 | 0.39 | **0.36** | 0.38 | 1.07x (O3) |
-| MLP-INF-003 | 784->256->10 BS=128 | 0.49 | 0.46 | **0.39** | 0.40 | 1.26x (O3) |
-| MLP-INF-004 | Deep MLP 4-layer BS=32 | 0.76 | 0.55 | 0.53 | **0.52** | 1.47x (ANE) |
-| MLP-INF-005 | FFN 768->3072->768 BS=32 | 3.62 | 1.44 | 1.49 | **1.36** | 2.65x (ANE) |
+| MLP-INF-001 | 784->256->10 BS=1 | 0.64 | **0.45** | 0.45 | 0.80 | 1.43x (O2) |
+| MLP-INF-002 | 784->256->10 BS=32 | **0.41** | 0.43 | 0.44 | 0.60 | MPSGraph best |
+| MLP-INF-003 | 784->256->10 BS=128 | 0.60 | 0.72 | 0.47 | **0.45** | 1.35x (ANE) |
+| MLP-INF-004 | Deep MLP 4-layer BS=32 | 1.05 | 0.91 | 0.80 | **0.75** | 1.40x (ANE) |
+| MLP-INF-005 | FFN 768->3072->768 BS=32 | 4.35 | 1.77 | **1.58** | 1.84 | 2.75x (O3) |
 
-**Takeaway:** Small MLPs are equally fast across backends. Larger/deeper MLPs benefit significantly from Metal backends (up to 2.65x), with ANE winning on the largest workloads.
+**Takeaway:** Metal backends are 1.4-2.8x faster than MPSGraph on MLPs. O3 wins the large FFN (2.8x). ANE excels on deep and batched MLPs. MPSGraph is fastest only on small batch sizes.
 
 #### Training
 
 | Benchmark | Description | MPSGraph | Metal O2 | Metal O3 | GPU+ANE | Best vs MPSGraph |
 |-----------|-------------|----------|----------|----------|---------|-------------------|
-| TRAIN-001 | MLP fwd+bwd BS=32 | 0.67 | 0.60 | **0.57** | 0.65 | 1.16x (O3) |
-| TRAIN-003 | Attention fwd+bwd BS=8 | **6.26** | 7.37 | 8.71 | 8.22 | MPSGraph best |
+| TRAIN-001 | MLP fwd+bwd BS=32 | **0.69** | 0.91 | 0.90 | 1.00 | ~1.00x |
+| TRAIN-003 | Attention fwd+bwd BS=8 | **7.25** | 10.29 | 10.82 | 11.12 | MPSGraph best |
+
+**Takeaway:** MPSGraph leads on training workloads where its backward-pass graph optimization provides an advantage.
 
 ### Backend Win Summary
 
-Overall wins across all 75 passing benchmarks:
+Overall wins across all 67 passing benchmarks:
 
 | Backend | Wins | Best For |
 |---------|------|----------|
-| **Metal O2** | 21 | Element-wise ops, batch norm, reshape, small matmuls |
-| **Metal O3** | 22 | Transformer fusion, large element-wise, reductions |
-| **MPSGraph** | 18 | Large GEMMs, convolutions, layer norm |
-| **GPU+ANE** | 14 | Large tensors, deep MLPs, attention reductions |
+| **MPSGraph** | 20 | Large GEMMs, convolutions, layer norm, large reductions, training |
+| **Metal O2** | 18 | Batch norm, small matmuls, element-wise ops |
+| **Metal O3** | 16 | Transpose, reshape, batched ops, softmax, FFN fusion |
+| **GPU+ANE** | 13 | Element-wise, MLP inference, transformer-shaped matmuls |
 
 ### When to Use Each Backend
 
 | Use Case | Recommended Backend | Why |
 |----------|-------------------|-----|
-| Large matrix multiply (>1024x1024) | MPSGraph (default) | Apple's tuned `MPSMatrixMultiplication` |
+| Large matrix multiply (≥1024x1024) | MPSGraph (default) | Apple's tuned `MPSMatrixMultiplication` |
 | Convolution-heavy models (CNNs) | MPSGraph (default) | `MPSCNNConvolution` is highly optimized |
-| Transformer inference | Metal O3 | Pattern fusion (attention, softmax, GELU) |
-| Element-wise heavy workloads | Metal O2/O3 | 3-4x faster than MPSGraph |
-| Batch normalization | Metal O2 | 2-3x faster custom kernels |
-| Large tensor operations | GPU+ANE auto | Parallel execution across GPU and ANE |
-| Production deployment | Metal O3 | Best overall for mixed workloads |
+| Training (forward + backward) | MPSGraph (default) | Graph-level backward pass optimization |
+| Element-wise heavy workloads | Metal O2/O3 | 1.2-3.4x faster than MPSGraph |
+| Batch normalization | Metal O2 | 1.7-1.9x faster custom kernels |
+| Transpose / reshape / batched ops | Metal O3 | Pattern fusion + scheduling (2-3x faster) |
+| MLP / FFN inference | Metal O3 or ANE | O3 wins large FFN (2.8x), ANE wins deep MLPs |
 | Debugging/development | MPSGraph (default) | Broadest compatibility, no compilation |
 
 ### Benchmark Categories

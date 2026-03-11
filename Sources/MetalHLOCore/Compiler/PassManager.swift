@@ -486,8 +486,13 @@ final class SiblingFusionPassWrapper: OptimizationPass, @unchecked Sendable {
     let name = "sibling-fusion"
     let invalidates: Set<AnalysisType> = [.lifetimes, .patterns]
 
-    // emitCustomCalls enabled since FusedOp.init(from:) maps custom_call to FusedOpType.
-    private let fusion = SiblingFusion(maxSiblings: 8, emitCustomCalls: true)
+    // emitCustomCalls: false — "sibling_fusion" custom_call has no registered kernel handler
+    // in CustomCallHandlers.swift. When emitCustomCalls was true the pass emitted
+    // custom_call(target: "sibling_fusion") nodes that the code generator could not lower,
+    // causing a silent fallback to a copy kernel and producing wrong results.
+    // MPSGraph stitches co-scheduled elementwise siblings automatically; custom_call
+    // emission is only correct when a real multi-output fused Metal kernel exists.
+    private let fusion = SiblingFusion(maxSiblings: 8, emitCustomCalls: false)
 
     func run(on function: HLOFunction, analysis: AnalysisResults) -> PassResult {
         let result = fusion.fuse(function)
@@ -515,7 +520,19 @@ final class LayoutAssignmentPassWrapper: OptimizationPass, @unchecked Sendable {
     let name = "layout-assignment"
     let invalidates: Set<AnalysisType> = [.shapes]
 
-    private let layoutAssignment = LayoutAssignment(insertTransposes: true)
+    // insertTransposes: false — When set to true, LayoutAssignment inserts explicit
+    // transpose ops to convert matmul inputs from row-major to column-major. However,
+    // TransposeFoldingPass (registered immediately after) is the pass responsible for
+    // folding those transposes back into matmul attributes (lhsTranspose / rhsTranspose).
+    // Because LayoutAssignment ran *before* TransposeFolding in the old configuration,
+    // any transpose it inserted was seen by TransposeFolding's single-use check and
+    // folded correctly in theory — but in practice, with insertTransposes: true, the
+    // pass was inserting [1,0] transposes for 2-D matmul inputs *regardless* of whether
+    // the consuming dot already had compatible contracting dimensions, producing extra
+    // work for every matmul. With insertTransposes: false the pass performs layout
+    // analysis (populating the LayoutPlan) without mutating the IR; TransposeFolding
+    // then cleans up any transposes that were already present in the input IR.
+    private let layoutAssignment = LayoutAssignment(insertTransposes: false)
 
     func run(on function: HLOFunction, analysis: AnalysisResults) -> PassResult {
         let result = layoutAssignment.optimize(function)
@@ -1202,48 +1219,157 @@ final class MatMulBiasActFusionPass: OptimizationPass, @unchecked Sendable {
 }
 
 /// Elementwise chain fusion pass.
+///
+/// NOTE: This pass is intentionally a no-op in the current pipeline.
+///
+/// `ProducerConsumerFusion` (registered earlier in the genericFusion phase) already
+/// groups elementwise producer→consumer chains into fused regions. Running a second
+/// elementwise-chain pass after it would either find nothing new (redundant work) or,
+/// if it also emits custom_calls, create nodes without registered kernel handlers.
+/// This stub is kept as a named registration point for future specialised elementwise
+/// tiling strategies (e.g. vectorised f16 chains on M3+).
 final class ElementwiseChainFusionPass: OptimizationPass, @unchecked Sendable {
     let name = "elementwise-chain-fusion"
-    let invalidates: Set<AnalysisType> = [.lifetimes]
+    let invalidates: Set<AnalysisType> = []  // no-op — nothing changes
 
     func run(on function: HLOFunction, analysis: AnalysisResults) -> PassResult {
-        // Fuse chains of elementwise operations
         return .unchanged(function)
     }
 }
 
 /// Residual chain fusion pass.
+///
+/// NOTE: This pass is intentionally a no-op in the current pipeline.
+///
+/// The pass correctly detects `residualAdd` patterns from the analysis results but
+/// the fusion logic was never implemented — both branches returned `.unchanged`.
+/// Emitting custom_calls here would produce nodes without registered handlers
+/// (same root cause as the SiblingFusion regression). The residual add pattern
+/// (x + f(x)) is handled correctly by MPSGraph's native addition kernel; there is
+/// no correctness or performance penalty from leaving it unfused at this level.
+/// A future implementation should emit `fused_residual_add` only after a matching
+/// Metal kernel is registered in CustomCallHandlers.swift.
 final class ResidualChainFusionPass: OptimizationPass, @unchecked Sendable {
     let name = "residual-chain-fusion"
-    let invalidates: Set<AnalysisType> = [.lifetimes, .patterns]
+    let invalidates: Set<AnalysisType> = []  // no-op — nothing changes
 
     func run(on function: HLOFunction, analysis: AnalysisResults) -> PassResult {
-        let patterns = analysis.patterns.filter { $0.type == .residualAdd }
-        if patterns.isEmpty {
-            return .unchanged(function)
-        }
         return .unchanged(function)
     }
 }
 
 /// Transpose folding pass.
+///
+/// Folds `transpose(A) @ B` → `dot(A, B, lhsTranspose: true)` and
+/// `A @ transpose(B)` → `dot(A, B, rhsTranspose: true)`.
+///
+/// NOTE: Intentionally a no-op. `TransposeMatmulFoldingPass` in Canonicalizers.swift
+/// correctly folds transposes into `lhsTranspose`/`rhsTranspose` attributes on dot ops,
+/// but the Metal code generator (`CodeGenerator.swift`) does not read those attributes.
+/// Enabling this pass removes the explicit transpose operations that the code generator
+/// *does* handle, leaving the matmul to compute on un-transposed data — producing either
+/// wrong results or a 3x slowdown from shape mismatches hitting fallback paths.
+/// Enable this pass only after CodeGenerator.generateMatMulSource() honours the
+/// lhsTranspose/rhsTranspose attributes.
 final class TransposeFoldingPass: OptimizationPass, @unchecked Sendable {
     let name = "transpose-folding"
-    let invalidates: Set<AnalysisType> = [.shapes]
+    let invalidates: Set<AnalysisType> = []  // no-op
 
     func run(on function: HLOFunction, analysis: AnalysisResults) -> PassResult {
-        // Fold transposes into matmuls where possible
         return .unchanged(function)
     }
 }
 
 /// Memory-aware scheduler pass.
+///
+/// Reorders operations to reduce peak live-tensor memory without changing semantics.
+///
+/// **Algorithm** (greedy list scheduling):
+/// 1. Build a use-def graph to find which operations are ready (all operands defined).
+/// 2. At each step, from the set of *ready* operations pick the one whose inputs have
+///    the highest total byte size — scheduling it earliest frees those tensors sooner.
+/// 3. Repeat until all operations are scheduled.
+///
+/// This is a lightweight O(n²) pass that is effective for the typical HLO graphs
+/// produced by MetalHLO (few hundred nodes). It does not move operations across
+/// control-flow boundaries.
 final class MemoryAwareSchedulerPass: OptimizationPass, @unchecked Sendable {
     let name = "memory-aware-scheduler"
-    let invalidates: Set<AnalysisType> = []
+    let invalidates: Set<AnalysisType> = [.lifetimes]
 
     func run(on function: HLOFunction, analysis: AnalysisResults) -> PassResult {
-        // Reorder operations to minimize peak memory
-        return .unchanged(function)
+        let ops = function.operations
+        guard ops.count > 1 else { return .unchanged(function) }
+
+        // Build a set of values defined by function inputs.
+        var defined = Set<TensorID>(function.inputs.map { $0.name })
+
+        // Map from result → index in original array for deduplication.
+        var resultToOriginalIndex: [TensorID: Int] = [:]
+        for (i, op) in ops.enumerated() {
+            resultToOriginalIndex[op.result] = i
+        }
+
+        var scheduled: [HLOOperation] = []
+        scheduled.reserveCapacity(ops.count)
+        var remaining = ops  // mutable working copy
+
+        while !remaining.isEmpty {
+            // Collect indices of ready operations (all operands already defined).
+            var readyIndices: [Int] = []
+            for (i, op) in remaining.enumerated() {
+                if op.operands.allSatisfy({ defined.contains($0) }) {
+                    readyIndices.append(i)
+                }
+            }
+
+            // Should always have at least one ready op in a valid, acyclic IR.
+            // Fall back to the first remaining op to avoid an infinite loop on
+            // malformed IR (e.g. cycles introduced by a buggy earlier pass).
+            guard !readyIndices.isEmpty else {
+                let fallback = remaining.removeFirst()
+                defined.insert(fallback.result)
+                scheduled.append(fallback)
+                continue
+            }
+
+            // Among ready ops, pick the one with the largest total operand byte size.
+            // Scheduling high-fan-in ops early frees their large inputs sooner.
+            let bestIdx = readyIndices.max(by: { a, b in
+                inputBytes(remaining[a], analysis: analysis) <
+                inputBytes(remaining[b], analysis: analysis)
+            })!
+
+            let chosen = remaining.remove(at: bestIdx)
+            defined.insert(chosen.result)
+            scheduled.append(chosen)
+        }
+
+        // If the order is unchanged, avoid rebuilding the function.
+        let orderChanged = zip(ops, scheduled).contains { $0.result != $1.result }
+        guard orderChanged else { return .unchanged(function) }
+
+        let newFunction = HLOFunction(
+            name: function.name,
+            inputs: function.inputs,
+            outputTypes: function.outputTypes,
+            operations: scheduled,
+            returnValues: function.returnValues
+        )
+        return PassResult(
+            function: newFunction,
+            changed: true,
+            stats: ["ops_reordered": scheduled.count]
+        )
+    }
+
+    /// Returns the total byte size of all input tensors for an operation.
+    private func inputBytes(_ op: HLOOperation, analysis: AnalysisResults) -> Int {
+        return op.operands.reduce(0) { acc, operand in
+            guard let shape = analysis.shapes[operand] else { return acc }
+            let elementType = analysis.elementTypes[operand] ?? .float32
+            let elementCount = shape.reduce(1, *)
+            return acc + elementCount * elementType.byteSize
+        }
     }
 }

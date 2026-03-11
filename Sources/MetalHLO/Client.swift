@@ -135,7 +135,7 @@ public final class Client: @unchecked Sendable {
             case .O2:
                 effectiveEnabledPasses = OptimizationPass.standardPasses
             case .O3:
-                effectiveEnabledPasses = nil  // All passes (aggressive)
+                effectiveEnabledPasses = OptimizationPass.aggressivePasses
             }
         }
 
