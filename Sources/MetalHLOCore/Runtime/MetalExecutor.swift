@@ -239,12 +239,9 @@ public final class MetalExecutor: @unchecked Sendable {
             let dataType = storage.elementType.mpsDataType
 
             if let buffer = storage.metalBuffer {
-                // Fast path: write from MTLBuffer's unified memory directly into MPSNDArray.
-                // This avoids the toData() heap allocation + Data-based constructor double-copy.
-                let descriptor = MPSNDArrayDescriptor(dataType: dataType, shape: shape)
-                let ndarray = MPSNDArray(device: buffer.device, descriptor: descriptor)
-                ndarray.writeBytes(buffer.contents(), strideBytes: nil)
-                tensorData = MPSGraphTensorData(ndarray)
+                // Zero-copy: MPSGraphTensorData aliases the MTLBuffer directly.
+                // On Apple Silicon unified memory, no data movement occurs.
+                tensorData = MPSGraphTensorData(buffer, shape: shape, dataType: dataType)
             } else {
                 // Small tensor path: copy from Data (small enough that overhead is negligible)
                 tensorData = MPSGraphTensorData(
@@ -259,32 +256,68 @@ public final class MetalExecutor: @unchecked Sendable {
 
         let encodeEndTime = CFAbsoluteTimeGetCurrent()
 
-        // Execute using the executable's runAsync method for better GPU utilization
-        // runAsync allows better pipelining than graph.run() which is synchronous
         let inputDataArray = compiled.inputTensors.compactMap { inputDict[$0] }
+
+        // Pre-allocate output MTLBuffers for large outputs so MPSGraph writes into them
+        // directly (zero-copy on unified memory). Small outputs use readBytes (negligible).
+        let hasLargeOutput = compiled.outputTypes.contains {
+            $0.byteCount >= LargeTensorStorage.threshold
+        }
+
+        var preAllocatedResults: [MPSGraphTensorData]?
+        var outputBuffers: [MTLBuffer?] = []
+
+        if hasLargeOutput {
+            var results: [MPSGraphTensorData] = []
+            for outputType in compiled.outputTypes {
+                let shape = outputType.shape.map { NSNumber(value: $0) }
+                let dataType = outputType.elementType.mpsDataType
+                let byteCount = outputType.byteCount
+
+                if let buffer = device.makeBuffer(length: byteCount, options: .storageModeShared) {
+                    results.append(MPSGraphTensorData(buffer, shape: shape, dataType: dataType))
+                    outputBuffers.append(buffer)
+                } else {
+                    // Allocation failed — create an empty MPSNDArray placeholder
+                    let desc = MPSNDArrayDescriptor(dataType: dataType, shape: shape)
+                    let ndarray = MPSNDArray(device: device, descriptor: desc)
+                    results.append(MPSGraphTensorData(ndarray))
+                    outputBuffers.append(nil)
+                }
+            }
+            preAllocatedResults = results
+        }
 
         // Execute: synchronous run() ensures GPU work completes before reading results.
         let outputDataArray = compiled.executable.run(
             with: commandQueue,
             inputs: inputDataArray,
-            results: nil,
+            results: preAllocatedResults,
             executionDescriptor: nil
         )
 
         let gpuEndTime = CFAbsoluteTimeGetCurrent()
 
         // Convert results to buffer storages.
-        // For large outputs, read directly into a pre-allocated MTLBuffer (shared memory)
-        // so the next operation can use writeBytes from it without a heap round-trip.
         var outputStorages: [BufferStorage] = []
-        for (index, _) in compiled.outputTensors.enumerated() {
-            let outputType = compiled.outputTypes[index]
-            let storage = try BufferStorage(
-                tensorData: outputDataArray[index],
-                type: outputType,
-                device: device
-            )
-            outputStorages.append(storage)
+        for (index, outputType) in compiled.outputTypes.enumerated() {
+            if hasLargeOutput, let buffer = outputBuffers[index] {
+                // Zero-copy: MPSGraph wrote directly into our pre-allocated MTLBuffer.
+                let largeTensor = LargeTensorStorage(
+                    buffer: buffer,
+                    shape: outputType.shape,
+                    elementType: outputType.elementType
+                )
+                outputStorages.append(BufferStorage(largeTensor: largeTensor, device: device))
+            } else {
+                // Small output or allocation failed: extract via readBytes
+                let storage = try BufferStorage(
+                    tensorData: outputDataArray[index],
+                    type: outputType,
+                    device: device
+                )
+                outputStorages.append(storage)
+            }
         }
 
         let timing = ExecutionTiming(
