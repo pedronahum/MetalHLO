@@ -437,3 +437,247 @@ extension FlashAttentionParams {
         )
     }
 }
+
+// MARK: - Tiled Flash Attention Kernel
+
+/// High-performance Flash Attention with tiled K/V loading into threadgroup memory.
+///
+/// Key improvements over FlashAttentionKernel:
+/// - Br=32 query positions share each K/V tile read (one MTLBuffer load per tile instead of
+///   one per query position) — reduces K/V memory bandwidth by ~32x
+/// - Threadgroup memory holds the current K tile and V tile so all queries in the block
+///   can reuse them without re-reading from device memory
+/// - Online softmax accumulation per query position, fully independent across threads
+///
+/// Thread organization:
+///   grid:       (ceil(seqQ / Br), numHeads, batchSize)  threadgroups
+///   threadgroup: (Br, 1, 1) threads  — one thread per query position in the block
+///
+/// Threadgroup memory layout (passed via [[threadgroup(0)]]):
+///   [0 .. Bc*head_dim)       : K_tile  [Bc rows × head_dim cols]
+///   [Bc*head_dim .. 2*Bc*head_dim) : V_tile  [Bc rows × head_dim cols]
+///   Total: 2 * Bc * head_dim * sizeof(float) bytes
+///   For Bc=32, head_dim=64:  16 KB  (well within M1's 32 KB limit)
+///   For Bc=32, head_dim=128: 32 KB  (exactly M1's limit)
+public struct FlashAttentionTiledKernel: MetalKernel, Sendable {
+
+    public let name = "flash_attention_tiled"
+    public let metalFunctionName = "flash_attention_tiled_kernel"
+
+    public init() {}
+
+    public var shaderSource: String {
+        """
+        #include <metal_stdlib>
+        using namespace metal;
+
+        struct FlashAttentionTiledParams {
+            uint batch_size;
+            uint seq_len_q;
+            uint seq_len_kv;
+            uint num_heads;
+            uint head_dim;
+            float scale;
+            uint is_causal;
+            uint block_size;  // Br = Bc = number of threads per threadgroup
+        };
+
+        // Maximum supported head_dim for fixed-size register arrays.
+        // Metal requires compile-time array sizes; only the first head_dim elements are used.
+        constant uint FA_MAX_D = 128;
+
+        kernel void flash_attention_tiled_kernel(
+            device const float* Q  [[buffer(0)]],  // [B, H, Sq, D]
+            device const float* K  [[buffer(1)]],  // [B, H, Skv, D]
+            device const float* V  [[buffer(2)]],  // [B, H, Skv, D]
+            device       float* O  [[buffer(3)]],  // [B, H, Sq, D]
+            constant FlashAttentionTiledParams& p  [[buffer(4)]],
+            // Host sets length = 2 * Bc * head_dim * sizeof(float)
+            threadgroup float* shared [[threadgroup(0)]],
+            uint3 tgpig  [[threadgroup_position_in_grid]],  // (q_block, head, batch)
+            uint  tpitg  [[thread_position_in_threadgroup]] // thread index = local q offset
+        ) {
+            const uint q_block = tgpig.x;
+            const uint head    = tgpig.y;
+            const uint batch   = tgpig.z;
+            const uint tid     = tpitg;
+
+            const uint head_dim = p.head_dim;
+            const uint seq_q    = p.seq_len_q;
+            const uint seq_kv   = p.seq_len_kv;
+            const uint Bc       = p.block_size;
+
+            // My query position in the full sequence
+            const uint q_pos  = q_block * Bc + tid;
+            const bool valid  = (q_pos < seq_q);
+
+            // Row-major base offsets (last dim = head_dim)
+            const uint bh_q  = (batch * p.num_heads + head) * seq_q;
+            const uint bh_kv = (batch * p.num_heads + head) * seq_kv;
+
+            // Base byte offset of my query row
+            const uint q_base = (bh_q + q_pos) * head_dim;
+
+            // Threadgroup K and V tiles (each Bc rows × head_dim cols)
+            threadgroup float* K_tile = shared;
+            threadgroup float* V_tile = shared + Bc * head_dim;
+
+            // Load my Q vector into registers
+            float q_reg[FA_MAX_D];
+            for (uint d = 0; d < head_dim; d++) {
+                q_reg[d] = valid ? Q[q_base + d] : 0.0f;
+            }
+
+            // Online softmax state
+            float m_i = -INFINITY;
+            float l_i = 0.0f;
+
+            // Output accumulator (in registers)
+            float o_acc[FA_MAX_D];
+            for (uint d = 0; d < head_dim; d++) o_acc[d] = 0.0f;
+
+            const uint num_kv_blocks = (seq_kv + Bc - 1) / Bc;
+
+            for (uint kv_block = 0; kv_block < num_kv_blocks; kv_block++) {
+                const uint kv_start = kv_block * Bc;
+
+                // Causal optimisation: skip entire future tiles
+                if (p.is_causal != 0 && kv_start > q_pos) break;
+
+                // ---- Collaborative tile load ----
+                // Thread `tid` loads row `tid` of the current K/V tile from device memory.
+                // All Bc threads together load the entire Bc×head_dim tile.
+                {
+                    const uint kv_pos = kv_start + tid;
+                    threadgroup float* K_dst = K_tile + tid * head_dim;
+                    threadgroup float* V_dst = V_tile + tid * head_dim;
+                    if (kv_pos < seq_kv) {
+                        const uint k_base = (bh_kv + kv_pos) * head_dim;
+                        for (uint d = 0; d < head_dim; d++) {
+                            K_dst[d] = K[k_base + d];
+                            V_dst[d] = V[k_base + d];
+                        }
+                    } else {
+                        for (uint d = 0; d < head_dim; d++) {
+                            K_dst[d] = 0.0f;
+                            V_dst[d] = 0.0f;
+                        }
+                    }
+                }
+
+                // All threads must finish loading before any thread reads the tile
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                // ---- Compute attention scores and accumulate ----
+                if (valid) {
+                    const uint tile_size = min(Bc, seq_kv - kv_start);
+                    for (uint j = 0; j < tile_size; j++) {
+                        const uint kv_pos = kv_start + j;
+
+                        // Causal mask: skip future keys
+                        if (p.is_causal != 0 && kv_pos > q_pos) break;
+
+                        // score = dot(q_reg, K_tile[j]) * scale
+                        float score = 0.0f;
+                        const threadgroup float* K_row = K_tile + j * head_dim;
+                        for (uint d = 0; d < head_dim; d++) {
+                            score += q_reg[d] * K_row[d];
+                        }
+                        score *= p.scale;
+
+                        // Online softmax update (numerically stable)
+                        const float m_new = max(m_i, score);
+                        const float alpha  = exp(m_i - m_new);   // rescale old sum
+                        const float beta   = exp(score - m_new); // new weight
+
+                        const threadgroup float* V_row = V_tile + j * head_dim;
+                        for (uint d = 0; d < head_dim; d++) {
+                            o_acc[d] = o_acc[d] * alpha + beta * V_row[d];
+                        }
+                        l_i = l_i * alpha + beta;
+                        m_i = m_new;
+                    }
+                }
+
+                // All threads must finish reading before the next tile is loaded
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            // Write final normalised output
+            if (valid) {
+                const float l_inv = (l_i > 1e-10f) ? (1.0f / l_i) : 0.0f;
+                for (uint d = 0; d < head_dim; d++) {
+                    O[q_base + d] = o_acc[d] * l_inv;
+                }
+            }
+        }
+        """
+    }
+
+    public func encode(
+        into encoder: MTLComputeCommandEncoder,
+        inputs: [MTLBuffer],
+        outputs: [MTLBuffer],
+        params: KernelParams,
+        pipeline: MTLComputePipelineState
+    ) {
+        guard let p = params as? FlashAttentionParams else {
+            fatalError("FlashAttentionTiledKernel requires FlashAttentionParams")
+        }
+
+        var gpuParams = GPUFlashAttentionTiledParams(
+            batch_size: UInt32(p.batchSize),
+            seq_len_q:  UInt32(p.seqLenQ),
+            seq_len_kv: UInt32(p.seqLenKV),
+            num_heads:  UInt32(p.numHeads),
+            head_dim:   UInt32(p.headDim),
+            scale:      p.scale,
+            is_causal:  p.isCausal ? 1 : 0,
+            block_size: UInt32(p.blockSize)
+        )
+
+        let Bc = p.blockSize  // = 32
+        let sharedMemSize = 2 * Bc * p.headDim * MemoryLayout<Float>.size
+
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(inputs[0],  offset: 0, index: 0)  // Q
+        encoder.setBuffer(inputs[1],  offset: 0, index: 1)  // K
+        encoder.setBuffer(inputs[2],  offset: 0, index: 2)  // V
+        encoder.setBuffer(outputs[0], offset: 0, index: 3)  // O
+        encoder.setBytes(&gpuParams, length: MemoryLayout<GPUFlashAttentionTiledParams>.size, index: 4)
+        encoder.setThreadgroupMemoryLength(sharedMemSize, index: 0)
+
+        let (gridSize, threadgroupSize) = calculateThreadgroups(for: params, pipeline: pipeline)
+        encoder.dispatchThreadgroups(gridSize, threadsPerThreadgroup: threadgroupSize)
+    }
+
+    public func calculateThreadgroups(
+        for params: KernelParams,
+        pipeline: MTLComputePipelineState
+    ) -> (gridSize: MTLSize, threadgroupSize: MTLSize) {
+        guard let p = params as? FlashAttentionParams else {
+            fatalError("FlashAttentionTiledKernel requires FlashAttentionParams")
+        }
+
+        let Br = p.blockSize  // threads per threadgroup = query positions per block
+        let numQBlocks = (p.seqLenQ + Br - 1) / Br
+
+        // Grid:       (numQBlocks, numHeads, batchSize)
+        // Threadgroup: (Br, 1, 1)
+        let gridSize = MTLSize(width: numQBlocks, height: p.numHeads, depth: p.batchSize)
+        let threadgroupSize = MTLSize(width: Br, height: 1, depth: 1)
+        return (gridSize, threadgroupSize)
+    }
+}
+
+// GPU-side params for the tiled kernel (must match Metal shader struct layout)
+private struct GPUFlashAttentionTiledParams {
+    var batch_size: UInt32
+    var seq_len_q:  UInt32
+    var seq_len_kv: UInt32
+    var num_heads:  UInt32
+    var head_dim:   UInt32
+    var scale:      Float
+    var is_causal:  UInt32
+    var block_size: UInt32
+}

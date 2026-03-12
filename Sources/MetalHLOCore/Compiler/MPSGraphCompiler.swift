@@ -41,6 +41,11 @@ public final class MPSGraphCompiler {
     public func compile(module: HLOModule) throws -> CompiledGraph {
         let function = module.function
 
+        // Detect Flash Attention shortcut: if the function is a single SDPA op with
+        // direct function inputs, we can bypass MPSGraph at execution time and run
+        // FlashAttentionTiledKernel directly against the input MTLBuffers.
+        let flashShortcut = Self.detectFlashAttentionShortcut(function: function)
+
         // Create placeholders for inputs
         var inputTensors: [MPSGraphTensor] = []
         for input in function.inputs {
@@ -95,7 +100,74 @@ public final class MPSGraphCompiler {
             outputTensors: outputTensors,
             inputTypes: function.inputs.map { $0.type },
             outputTypes: function.outputTypes,
-            device: device
+            device: device,
+            flashAttentionShortcut: flashShortcut
+        )
+    }
+
+    /// Detects whether the function qualifies for direct Flash Attention Metal kernel execution.
+    ///
+    /// Conditions:
+    /// - Exactly one operation in the function body
+    /// - That operation is `custom_call @fused_scaled_dot_product_attention`
+    /// - All Q, K, V operands are direct function inputs (not computed intermediate values)
+    /// - The result feeds the function return
+    private static func detectFlashAttentionShortcut(function: HLOFunction) -> FlashAttentionShortcut? {
+        guard function.operations.count == 1,
+              let op = function.operations.first,
+              op.kind == .customCall,
+              op.attributes.callTargetName == "fused_scaled_dot_product_attention",
+              op.operands.count >= 3
+        else { return nil }
+
+        // Check that Q, K, V operands are all direct function inputs
+        let inputNames = function.inputs.map { $0.name }
+        let inputIndices = op.operands.prefix(3).compactMap { operand in
+            inputNames.firstIndex(of: operand)
+        }
+        guard inputIndices.count == 3 else { return nil }
+
+        // Check the result is returned
+        guard function.returnValues.contains(op.result) else { return nil }
+
+        // Extract shape from result type: [batch, heads, seqQ, headDim]
+        let shape = op.resultType.shape
+        guard shape.count == 4 else { return nil }
+        let batchSize = shape[0]
+        let numHeads  = shape[1]
+        let seqLenQ   = shape[2]
+        let headDim   = shape[3]
+
+        // Extract seqLenKV from K input type
+        let kInputIndex = inputIndices[1]
+        let kShape = function.inputs[kInputIndex].type.shape
+        guard kShape.count == 4 else { return nil }
+        let seqLenKV = kShape[2]
+
+        // Parse scale and isCausal from backend config JSON
+        var scale: Float = 1.0 / sqrt(Float(headDim))
+        var isCausal = false
+        if let configStr = op.attributes.backendConfig,
+           let data = configStr.data(using: .utf8),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            if let s = json["scale"] as? Double { scale = Float(s) }
+            if let c = json["is_causal"] as? Bool { isCausal = c }
+        }
+
+        let isFloat16 = (op.resultType.elementType == .float16)
+
+        return FlashAttentionShortcut(
+            qIndex:    inputIndices[0],
+            kIndex:    inputIndices[1],
+            vIndex:    inputIndices[2],
+            batchSize: batchSize,
+            numHeads:  numHeads,
+            seqLenQ:   seqLenQ,
+            seqLenKV:  seqLenKV,
+            headDim:   headDim,
+            scale:     scale,
+            isCausal:  isCausal,
+            isFloat16: isFloat16
         )
     }
 
@@ -3341,6 +3413,32 @@ public enum CompilationError: Error, Sendable, CustomStringConvertible {
     }
 }
 
+// MARK: - FlashAttentionShortcut
+
+/// Metadata for bypassing MPSGraph and executing Flash Attention directly as a Metal kernel.
+///
+/// Detected when the compiled function is a single `fused_scaled_dot_product_attention`
+/// custom_call whose Q, K, V operands are all direct function inputs. In this case
+/// `MetalExecutor` can skip MPSGraph entirely and dispatch `FlashAttentionTiledKernel`
+/// against the input MTLBuffers, eliminating MPSGraph dispatch overhead.
+public struct FlashAttentionShortcut: Sendable {
+    /// Index into the executor's input array for Q.
+    public let qIndex: Int
+    /// Index into the executor's input array for K.
+    public let kIndex: Int
+    /// Index into the executor's input array for V.
+    public let vIndex: Int
+    /// Attention shape parameters.
+    public let batchSize: Int
+    public let numHeads: Int
+    public let seqLenQ: Int
+    public let seqLenKV: Int
+    public let headDim: Int
+    public let scale: Float
+    public let isCausal: Bool
+    public let isFloat16: Bool
+}
+
 // MARK: - CompiledGraph
 
 /// A compiled MPSGraph ready for execution.
@@ -3365,4 +3463,8 @@ public struct CompiledGraph: @unchecked Sendable {
 
     /// The Metal device.
     public let device: MTLDevice
+
+    /// If non-nil, the function is a single attention op with direct function inputs.
+    /// MetalExecutor will bypass MPSGraph and run FlashAttentionTiledKernel directly.
+    public let flashAttentionShortcut: FlashAttentionShortcut?
 }

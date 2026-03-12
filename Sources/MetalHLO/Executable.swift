@@ -347,6 +347,8 @@ public final class Executable: @unchecked Sendable {
             return .executionFailed("Command queue creation failed")
         case .commandBufferCreationFailed:
             return .executionFailed("Command buffer creation failed")
+        case .generalError(let reason):
+            return .executionFailed(reason)
         }
     }
 

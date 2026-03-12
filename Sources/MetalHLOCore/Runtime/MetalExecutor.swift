@@ -204,6 +204,15 @@ public final class MetalExecutor: @unchecked Sendable {
         compiled: CompiledGraph,
         inputs: [BufferStorage]
     ) throws -> ([BufferStorage], ExecutionTiming) {
+        // Fast path: if the function is a single attention op with direct MTLBuffer inputs,
+        // bypass MPSGraph and execute FlashAttentionTiledKernel directly.
+        if let shortcut = compiled.flashAttentionShortcut {
+            if let result = try? executeFlashAttentionDirect(shortcut: shortcut, inputs: inputs) {
+                return result
+            }
+            // Fall through to MPSGraph path if direct execution fails (e.g. non-MTLBuffer inputs)
+        }
+
         // Validate input count
         guard inputs.count == compiled.inputTensors.count else {
             throw ExecutorError.inputMismatch(
@@ -292,6 +301,73 @@ public final class MetalExecutor: @unchecked Sendable {
 
         return (outputStorages, timing)
     }
+
+    /// Executes a Flash Attention function directly via FlashAttentionTiledKernel,
+    /// bypassing MPSGraph. Called when `compiled.flashAttentionShortcut` is non-nil
+    /// and all inputs have MTLBuffer backing.
+    private func executeFlashAttentionDirect(
+        shortcut: FlashAttentionShortcut,
+        inputs: [BufferStorage]
+    ) throws -> ([BufferStorage], ExecutionTiming) {
+        let start = CFAbsoluteTimeGetCurrent()
+
+        guard shortcut.qIndex < inputs.count,
+              shortcut.kIndex < inputs.count,
+              shortcut.vIndex < inputs.count
+        else { throw ExecutorError.inputMismatch(expected: 3, got: inputs.count) }
+
+        let qStorage = inputs[shortcut.qIndex]
+        let kStorage = inputs[shortcut.kIndex]
+        let vStorage = inputs[shortcut.vIndex]
+
+        guard let qBuffer = qStorage.metalBuffer,
+              let kBuffer = kStorage.metalBuffer,
+              let vBuffer = vStorage.metalBuffer
+        else { throw ExecutorError.generalError("Flash attention direct path requires MTLBuffer inputs") }
+
+        // Allocate output buffer
+        let outShape    = [shortcut.batchSize, shortcut.numHeads, shortcut.seqLenQ, shortcut.headDim]
+        let outElements = outShape.reduce(1, *)
+        let bytesPerElem = shortcut.isFloat16 ? 2 : 4
+        let outByteCount = outElements * bytesPerElem
+        guard let outBuffer = device.makeBuffer(length: outByteCount, options: .storageModeShared) else {
+            throw ExecutorError.generalError("Failed to allocate Flash Attention output buffer")
+        }
+
+        // Build kernel params (blockSize=32 is the tiled kernel's Br=Bc)
+        let flashParams = FlashAttentionParams(
+            batchSize:  shortcut.batchSize,
+            seqLenQ:    shortcut.seqLenQ,
+            seqLenKV:   shortcut.seqLenKV,
+            numHeads:   shortcut.numHeads,
+            headDim:    shortcut.headDim,
+            scale:      shortcut.scale,
+            isCausal:   shortcut.isCausal,
+            blockSize:  32
+        )
+
+        try MetalKernelRegistry.shared.execute(
+            kernelName: "flash_attention_tiled",
+            inputs:  [qBuffer, kBuffer, vBuffer],
+            outputs: [outBuffer],
+            params:  flashParams,
+            device:  device,
+            commandQueue: commandQueue
+        )
+
+        let end = CFAbsoluteTimeGetCurrent()
+
+        // Wrap output in BufferStorage
+        let elementType: ElementType = shortcut.isFloat16 ? .float16 : .float32
+        let largeTensor = LargeTensorStorage(buffer: outBuffer, shape: outShape, elementType: elementType)
+        let outputStorage = BufferStorage(largeTensor: largeTensor, device: device)
+        let timing = ExecutionTiming(
+            encodeTime: 0,
+            gpuTime:    end - start,
+            totalTime:  end - start
+        )
+        return ([outputStorage], timing)
+    }
 }
 
 // MARK: - Executor Errors
@@ -307,6 +383,7 @@ public enum ExecutorError: Error, Sendable, CustomStringConvertible {
     case executionFailed(String)
     case bufferCreationFailed(String)
     case transferFailed(String)
+    case generalError(String)
 
     public var description: String {
         switch self {
@@ -328,6 +405,8 @@ public enum ExecutorError: Error, Sendable, CustomStringConvertible {
             return "Buffer creation failed: \(reason)"
         case .transferFailed(let reason):
             return "Transfer failed: \(reason)"
+        case .generalError(let reason):
+            return "Error: \(reason)"
         }
     }
 }
