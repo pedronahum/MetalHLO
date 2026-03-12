@@ -70,6 +70,10 @@ public final class MetalKernelRegistry: @unchecked Sendable {
         // Register all built-in custom kernels
         registerKernel(SoftmaxKernel())
         registerKernel(GELUKernel())
+        registerKernel(ReLUKernel())
+        registerKernel(ExpKernel())
+        registerKernel(SigmoidKernel())
+        registerKernel(TanhKernel())
         registerKernel(LayerNormKernel())
         registerKernel(RMSNormKernel())
         registerKernel(FlashAttentionKernel())

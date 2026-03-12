@@ -204,6 +204,14 @@ public final class MetalExecutor: @unchecked Sendable {
         compiled: CompiledGraph,
         inputs: [BufferStorage]
     ) throws -> ([BufferStorage], ExecutionTiming) {
+        // Fast path: single elementwise op (softmax, gelu, tanh, sigmoid, exp) — bypass MPSGraph.
+        if let shortcut = compiled.elementwiseShortcut {
+            if let result = try? executeElementwiseDirect(shortcut: shortcut, inputs: inputs) {
+                return result
+            }
+            // Fall through to MPSGraph path if direct execution fails (e.g. non-MTLBuffer inputs)
+        }
+
         // Fast path: if the function is a single attention op with direct MTLBuffer inputs,
         // bypass MPSGraph and execute FlashAttentionTiledKernel directly.
         if let shortcut = compiled.flashAttentionShortcut {
@@ -300,6 +308,63 @@ public final class MetalExecutor: @unchecked Sendable {
         )
 
         return (outputStorages, timing)
+    }
+
+    /// Executes a single elementwise op directly via a Metal kernel, bypassing MPSGraph.
+    ///
+    /// Called when `compiled.elementwiseShortcut` is non-nil and the input has MTLBuffer backing.
+    /// Eliminates MPSGraph dispatch overhead for cheap single-op functions.
+    private func executeElementwiseDirect(
+        shortcut: ElementwiseShortcut,
+        inputs: [BufferStorage]
+    ) throws -> ([BufferStorage], ExecutionTiming) {
+        let start = CFAbsoluteTimeGetCurrent()
+
+        guard shortcut.inputIndex < inputs.count else {
+            throw ExecutorError.inputMismatch(expected: shortcut.inputIndex + 1, got: inputs.count)
+        }
+
+        // Float16 not currently supported in Metal kernel shortcut; fall back to MPSGraph.
+        guard !shortcut.isFloat16 else {
+            throw ExecutorError.generalError("Elementwise shortcut: float16 not supported")
+        }
+
+        let inputStorage = inputs[shortcut.inputIndex]
+
+        guard let inputBuffer = inputStorage.metalBuffer else {
+            throw ExecutorError.generalError("Elementwise shortcut requires MTLBuffer input")
+        }
+
+        let bytesPerElem = shortcut.isFloat16 ? 2 : 4
+        let outByteCount = shortcut.totalElements * bytesPerElem
+        guard let outBuffer = device.makeBuffer(length: outByteCount, options: .storageModeShared) else {
+            throw ExecutorError.generalError("Failed to allocate elementwise output buffer")
+        }
+
+        let params: any KernelParams
+        switch shortcut.op {
+        case .softmax(let batchSize, let seqLen):
+            params = SoftmaxParams(batchSize: batchSize, seqLen: seqLen)
+        default:
+            params = ElementwiseParams(totalElements: shortcut.totalElements, shape: shortcut.shape)
+        }
+
+        try MetalKernelRegistry.shared.execute(
+            kernelName: shortcut.op.kernelName,
+            inputs:  [inputBuffer],
+            outputs: [outBuffer],
+            params:  params,
+            device:  device,
+            commandQueue: commandQueue
+        )
+
+        let end = CFAbsoluteTimeGetCurrent()
+
+        let elementType: ElementType = shortcut.isFloat16 ? .float16 : .float32
+        let largeTensor = LargeTensorStorage(buffer: outBuffer, shape: shortcut.shape, elementType: elementType)
+        let outputStorage = BufferStorage(largeTensor: largeTensor, device: device)
+        let timing = ExecutionTiming(encodeTime: 0, gpuTime: end - start, totalTime: end - start)
+        return ([outputStorage], timing)
     }
 
     /// Executes a Flash Attention function directly via FlashAttentionTiledKernel,

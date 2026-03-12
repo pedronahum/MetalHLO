@@ -46,6 +46,10 @@ public final class MPSGraphCompiler {
         // FlashAttentionTiledKernel directly against the input MTLBuffers.
         let flashShortcut = Self.detectFlashAttentionShortcut(function: function)
 
+        // Detect elementwise shortcut: single-op functions (softmax, gelu, tanh, sigmoid, exp)
+        // that map a direct function input to the function output bypass MPSGraph entirely.
+        let elementwiseShortcut = Self.detectElementwiseShortcut(function: function)
+
         // Create placeholders for inputs
         var inputTensors: [MPSGraphTensor] = []
         for input in function.inputs {
@@ -101,7 +105,8 @@ public final class MPSGraphCompiler {
             inputTypes: function.inputs.map { $0.type },
             outputTypes: function.outputTypes,
             device: device,
-            flashAttentionShortcut: flashShortcut
+            flashAttentionShortcut: flashShortcut,
+            elementwiseShortcut: elementwiseShortcut
         )
     }
 
@@ -167,6 +172,64 @@ public final class MPSGraphCompiler {
             headDim:   headDim,
             scale:     scale,
             isCausal:  isCausal,
+            isFloat16: isFloat16
+        )
+    }
+
+    /// Detects whether the function qualifies for direct elementwise Metal kernel execution.
+    ///
+    /// Conditions:
+    /// - Exactly one operation in the function body
+    /// - Single input operand that is a direct function input
+    /// - Result feeds the function return
+    /// - Op kind is one of: tanh, logistic (sigmoid), exponential, or customCall
+    ///   with target "fused_gelu" or "fused_softmax"
+    private static func detectElementwiseShortcut(function: HLOFunction) -> ElementwiseShortcut? {
+        guard function.operations.count == 1,
+              let op = function.operations.first,
+              op.operands.count >= 1,
+              function.returnValues.contains(op.result)
+        else { return nil }
+
+        // Input must be a direct function input (not an intermediate value)
+        let inputNames = function.inputs.map { $0.name }
+        guard let inputIndex = inputNames.firstIndex(of: op.operands[0]) else { return nil }
+
+        let shape = op.resultType.shape
+        let totalElements = shape.reduce(1, *)
+        let isFloat16 = (op.resultType.elementType == .float16)
+
+        let kernelOp: ElementwiseKernelOp
+        switch op.kind {
+        case .tanh:
+            kernelOp = .tanh
+        case .logistic:
+            kernelOp = .sigmoid
+        case .exponential:
+            kernelOp = .exp
+        case .customCall:
+            guard let target = op.attributes.callTargetName else { return nil }
+            switch target {
+            case "fused_gelu":
+                kernelOp = .gelu
+            case "fused_softmax":
+                // Softmax operates on the last dimension; batchSize = product of all other dims
+                let rank = shape.count
+                let seqLen = rank > 0 ? shape[rank - 1] : 1
+                let batchSize = totalElements / max(seqLen, 1)
+                kernelOp = .softmax(batchSize: batchSize, seqLen: seqLen)
+            default:
+                return nil
+            }
+        default:
+            return nil
+        }
+
+        return ElementwiseShortcut(
+            op: kernelOp,
+            inputIndex: inputIndex,
+            totalElements: totalElements,
+            shape: shape,
             isFloat16: isFloat16
         )
     }
@@ -3413,6 +3476,49 @@ public enum CompilationError: Error, Sendable, CustomStringConvertible {
     }
 }
 
+// MARK: - ElementwiseShortcut
+
+/// Identifies which Metal kernel to dispatch for a single-op elementwise function.
+public enum ElementwiseKernelOp: Sendable {
+    case softmax(batchSize: Int, seqLen: Int)
+    case gelu
+    case relu
+    case exp
+    case sigmoid
+    case tanh
+
+    /// Name used to look up the kernel in `MetalKernelRegistry`.
+    public var kernelName: String {
+        switch self {
+        case .softmax:  return "softmax"
+        case .gelu:     return "gelu"
+        case .relu:     return "relu"
+        case .exp:      return "exp_activation"
+        case .sigmoid:  return "sigmoid"
+        case .tanh:     return "tanh_activation"
+        }
+    }
+}
+
+/// Metadata for bypassing MPSGraph and executing a single elementwise op directly.
+///
+/// Detected when the compiled function contains exactly one operation that maps a direct
+/// function input to the function output and has a corresponding Metal kernel. Eliminates
+/// MPSGraph graph dispatch overhead for cheap ops like GELU (6 MPSGraph nodes), softmax,
+/// sigmoid, exp, and tanh.
+public struct ElementwiseShortcut: Sendable {
+    /// Which elementwise kernel to dispatch.
+    public let op: ElementwiseKernelOp
+    /// Index into the executor's input array for the single input.
+    public let inputIndex: Int
+    /// Total element count of the input/output tensor.
+    public let totalElements: Int
+    /// Shape of the input/output tensor.
+    public let shape: [Int]
+    /// True if the data type is float16.
+    public let isFloat16: Bool
+}
+
 // MARK: - FlashAttentionShortcut
 
 /// Metadata for bypassing MPSGraph and executing Flash Attention directly as a Metal kernel.
@@ -3467,4 +3573,8 @@ public struct CompiledGraph: @unchecked Sendable {
     /// If non-nil, the function is a single attention op with direct function inputs.
     /// MetalExecutor will bypass MPSGraph and run FlashAttentionTiledKernel directly.
     public let flashAttentionShortcut: FlashAttentionShortcut?
+
+    /// If non-nil, the function is a single elementwise op with a direct function input.
+    /// MetalExecutor will bypass MPSGraph and dispatch the Metal kernel directly.
+    public let elementwiseShortcut: ElementwiseShortcut?
 }
