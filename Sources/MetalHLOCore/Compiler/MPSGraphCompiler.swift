@@ -50,6 +50,14 @@ public final class MPSGraphCompiler {
         // that map a direct function input to the function output bypass MPSGraph entirely.
         let elementwiseShortcut = Self.detectElementwiseShortcut(function: function)
 
+        // Detect embedded attention split: multi-op functions containing exactly one SDPA op
+        // are split into pre/post MPSGraph sub-graphs with the Metal Flash Attention kernel
+        // executing the attention stage.
+        let embeddedAttentionSplit = EmbeddedAttentionSplitter.detectSplit(
+            function: function,
+            device: device
+        )
+
         // Create placeholders for inputs
         var inputTensors: [MPSGraphTensor] = []
         for input in function.inputs {
@@ -106,7 +114,8 @@ public final class MPSGraphCompiler {
             outputTypes: function.outputTypes,
             device: device,
             flashAttentionShortcut: flashShortcut,
-            elementwiseShortcut: elementwiseShortcut
+            elementwiseShortcut: elementwiseShortcut,
+            embeddedAttentionSplit: embeddedAttentionSplit
         )
     }
 
@@ -3577,4 +3586,8 @@ public struct CompiledGraph: @unchecked Sendable {
     /// If non-nil, the function is a single elementwise op with a direct function input.
     /// MetalExecutor will bypass MPSGraph and dispatch the Metal kernel directly.
     public let elementwiseShortcut: ElementwiseShortcut?
+
+    /// If non-nil, the function contains an embedded SDPA op and execution is split into
+    /// pre-graph → Flash Attention kernel → post-graph stages.
+    public let embeddedAttentionSplit: EmbeddedAttentionSplit?
 }

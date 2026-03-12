@@ -204,6 +204,14 @@ public final class MetalExecutor: @unchecked Sendable {
         compiled: CompiledGraph,
         inputs: [BufferStorage]
     ) throws -> ([BufferStorage], ExecutionTiming) {
+        // Fast path: embedded attention split — pre MPSGraph → Flash Attention → post MPSGraph.
+        if let split = compiled.embeddedAttentionSplit {
+            if let result = try? executeEmbeddedAttentionSplit(split: split, inputs: inputs) {
+                return result
+            }
+            // Fall through to MPSGraph path on failure (e.g. non-MTLBuffer inputs)
+        }
+
         // Fast path: single elementwise op (softmax, gelu, tanh, sigmoid, exp) — bypass MPSGraph.
         if let shortcut = compiled.elementwiseShortcut {
             if let result = try? executeElementwiseDirect(shortcut: shortcut, inputs: inputs) {
@@ -308,6 +316,97 @@ public final class MetalExecutor: @unchecked Sendable {
         )
 
         return (outputStorages, timing)
+    }
+
+    /// Executes a function that contains an embedded SDPA op by splitting into three stages:
+    /// pre-graph (MPSGraph) → Flash Attention (Metal) → post-graph (MPSGraph).
+    private func executeEmbeddedAttentionSplit(
+        split: EmbeddedAttentionSplit,
+        inputs: [BufferStorage]
+    ) throws -> ([BufferStorage], ExecutionTiming) {
+        let start = CFAbsoluteTimeGetCurrent()
+
+        // ---- Stage 1: pre-graph → Q, K, V -------------------------------------------
+
+        var preOutputs: [BufferStorage] = []
+        if let preGraph = split.preGraph {
+            var preInputs = [BufferStorage](repeating: inputs[0], count: preGraph.inputTensors.count)
+            for (origIdx, preIdx) in split.originalToPreInputMap {
+                guard origIdx < inputs.count else {
+                    throw ExecutorError.inputMismatch(expected: origIdx + 1, got: inputs.count)
+                }
+                preInputs[preIdx] = inputs[origIdx]
+            }
+            preOutputs = try execute(compiled: preGraph, inputs: preInputs)
+        }
+
+        // Resolve Q, K, V buffers
+        func resolve(_ source: QKVSource) throws -> MTLBuffer {
+            let storage = source.isOriginalInput ? inputs[source.index] : preOutputs[source.index]
+            guard let buf = storage.metalBuffer else {
+                throw ExecutorError.generalError("Embedded attention split requires MTLBuffer QKV")
+            }
+            return buf
+        }
+
+        guard !split.isFloat16 else {
+            throw ExecutorError.generalError("Embedded attention split: float16 not yet supported")
+        }
+
+        let qBuffer = try resolve(split.qSource)
+        let kBuffer = try resolve(split.kSource)
+        let vBuffer = try resolve(split.vSource)
+
+        // ---- Stage 2: Flash Attention kernel ----------------------------------------
+
+        let outShape = [split.batchSize, split.numHeads, split.seqLenQ, split.headDim]
+        let outByteCount = outShape.reduce(1, *) * 4  // float32
+        guard let attnBuffer = device.makeBuffer(length: outByteCount, options: .storageModeShared) else {
+            throw ExecutorError.generalError("Failed to allocate attention output buffer")
+        }
+
+        let flashParams = FlashAttentionParams(
+            batchSize: split.batchSize,
+            seqLenQ:   split.seqLenQ,
+            seqLenKV:  split.seqLenKV,
+            numHeads:  split.numHeads,
+            headDim:   split.headDim,
+            scale:     split.scale,
+            isCausal:  split.isCausal,
+            blockSize: 32
+        )
+        try MetalKernelRegistry.shared.execute(
+            kernelName: "flash_attention_tiled",
+            inputs:  [qBuffer, kBuffer, vBuffer],
+            outputs: [attnBuffer],
+            params:  flashParams,
+            device:  device,
+            commandQueue: commandQueue
+        )
+
+        let attnStorage = BufferStorage(
+            largeTensor: LargeTensorStorage(buffer: attnBuffer, shape: outShape, elementType: .float32),
+            device: device
+        )
+
+        // ---- Stage 3: post-graph -------------------------------------------------------
+
+        let finalOutputs: [BufferStorage]
+        if let postGraph = split.postGraph {
+            var postInputs = [BufferStorage](repeating: inputs[0], count: postGraph.inputTensors.count)
+            postInputs[split.postAttentionInputIndex] = attnStorage
+            for (origIdx, postIdx) in split.originalToPostInputMap {
+                guard origIdx < inputs.count else { continue }
+                postInputs[postIdx] = inputs[origIdx]
+            }
+            finalOutputs = try execute(compiled: postGraph, inputs: postInputs)
+        } else {
+            finalOutputs = [attnStorage]
+        }
+
+        let end = CFAbsoluteTimeGetCurrent()
+        let timing = ExecutionTiming(encodeTime: 0, gpuTime: end - start, totalTime: end - start)
+        return (finalOutputs, timing)
     }
 
     /// Executes a single elementwise op directly via a Metal kernel, bypassing MPSGraph.
