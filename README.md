@@ -11,7 +11,7 @@ MetalHLO draws inspiration from both [OpenXLA](https://github.com/openxla/xla) a
 **From OpenXLA:**
 - **StableHLO as the IR** — A stable, portable intermediate representation for ML workloads
 - **Multi-phase optimization pipeline** — Simplification → Canonicalization → Fusion → Layout → Scheduling
-- **Pattern-based fusion** — Recognizing and fusing common patterns like attention, layer norm, GELU
+- **Pattern-based fusion** — Recognizing and fusing common patterns like attention, depth attention ([Attention Residuals](https://github.com/MoonshotAI/Attention-Residuals)), layer norm, GELU
 - **Cost-model driven decisions** — Using analytical cost models to guide fusion decisions
 
 **From MLX:**
@@ -361,6 +361,7 @@ MetalHLO's optimization pipeline runs in phases, inspired by XLA's approach:
                     │  • GELU/SiLU activation fusion          │
                     │  • Layer norm / RMS norm fusion         │
                     │  • Attention pattern fusion             │
+                    │  • Depth attention (Attention Residuals)│
                     │  • MatMul + Bias + Activation fusion    │
                     └─────────────────┬───────────────────────┘
                                       │
@@ -393,7 +394,7 @@ MetalHLO's optimization pipeline runs in phases, inspired by XLA's approach:
 | **Reshape Canonicalizer** | Fuses consecutive reshapes, eliminates no-op reshapes |
 | **Transpose Canonicalizer** | Composes consecutive transposes, eliminates identity transposes |
 | **Broadcast Canonicalizer** | Fuses broadcasts, moves broadcasts through elementwise ops |
-| **Pattern Fusion** | Recognizes ML patterns (softmax, GELU, attention) and replaces with optimized kernels |
+| **Pattern Fusion** | Recognizes ML patterns (softmax, GELU, attention, depth attention) and replaces with optimized kernels |
 | **Producer-Consumer Fusion** | Fuses elementwise operations with their consumers to reduce memory traffic |
 | **Sibling Fusion** | Fuses operations that share inputs (multi-output fusion) |
 | **Horizontal Fusion** | Batches multiple small independent operations |
@@ -423,7 +424,7 @@ MetalHLO's optimization pipeline runs in phases, inspired by XLA's approach:
 | **Quantization** | uniform_quantize, uniform_dequantize |
 | **Complex Numbers** | complex, real, imag |
 | **Select/Scatter** | select_and_scatter |
-| **Custom Calls** | fused_scaled_dot_product_attention, fused_layer_norm, fused_rms_norm, fused_matmul_bias_activation, fused_softmax, fused_gelu, fused_rope |
+| **Custom Calls** | fused_scaled_dot_product_attention, fused_depth_attention, fused_layer_norm, fused_rms_norm, fused_matmul_bias_activation, fused_softmax, fused_gelu, fused_rope |
 
 ### Operations Requiring MPS Kernel Bridging (3 ops)
 
