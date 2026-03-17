@@ -133,6 +133,7 @@ public final class HLOPatternRegistry: @unchecked Sendable {
 
     private func registerDefaultPatterns() {
         // Register built-in patterns in priority order (higher priority first)
+        register(DepthAttentionPattern())  // Priority 120 - check before standard attention
         register(AttentionPattern())  // Priority 110 - check before softmax
         register(SoftmaxPattern())    // Priority 100
         register(GELUPattern())       // Priority 90

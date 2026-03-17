@@ -83,6 +83,7 @@ public final class CustomCallRegistry: @unchecked Sendable {
         register(FusedRoPEHandler())
         register(FusedFFNHandler())
         register(FusedElementwiseHandler())
+        register(FusedDepthAttentionHandler())
     }
 
     /// List of supported targets
@@ -932,6 +933,73 @@ public final class FusedElementwiseHandler: CustomCallHandler {
         }
 
         return [finalResult]
+    }
+}
+
+// MARK: - Fused Depth Attention Handler (Attention Residuals)
+
+/// Handles fused depth-wise attention for Attention Residuals (Block AttnRes).
+///
+/// Implements: output = softmax(query @ keys^T * scale) @ values
+/// where the depth dimension (keys/values sequence length) is very small (≤ 32).
+///
+/// This is structurally similar to SDPA but optimized for the tiny KV dimension
+/// characteristic of cross-layer aggregation in AttnRes.
+public final class FusedDepthAttentionHandler: CustomCallHandler {
+
+    public static let targetName = "fused_depth_attention"
+
+    public init() {}
+
+    public func emit(
+        operation: HLOOperation,
+        graph: MPSGraph,
+        inputs: [MPSGraphTensor],
+        config: [String: Any]
+    ) throws -> [MPSGraphTensor] {
+        guard inputs.count >= 3 else {
+            throw CustomCallError.invalidInputCount(expected: 3, got: inputs.count)
+        }
+
+        let query = inputs[0]   // [batch, 1, hidden] or [batch, hidden]
+        let keys = inputs[1]    // [batch, depth, hidden]
+        let values = inputs[2]  // [batch, depth, hidden]
+
+        let scale = BackendConfigParser.getFloat(config, key: "scale", default: 1.0)
+
+        // Transpose keys for matmul: [batch, hidden, depth]
+        let keysRank = keys.shape?.count ?? 3
+        let keysT = graph.transposeTensor(
+            keys,
+            dimension: keysRank - 2,
+            withDimension: keysRank - 1,
+            name: "depth_attn_keys_t"
+        )
+
+        // Scores: query @ keys^T -> [batch, 1, depth] or [batch, depth]
+        var scores = graph.matrixMultiplication(
+            primary: query,
+            secondary: keysT,
+            name: "depth_attn_scores"
+        )
+
+        // Scale
+        if scale != 1.0 {
+            let scaleConst = graph.constant(Double(scale), dataType: scores.dataType)
+            scores = graph.multiplication(scores, scaleConst, name: "depth_attn_scaled")
+        }
+
+        // Softmax over depth dimension (last dim)
+        let weights = graph.softMax(with: scores, axis: -1, name: "depth_attn_weights")
+
+        // Weighted sum: weights @ values -> [batch, 1, hidden] or [batch, hidden]
+        let output = graph.matrixMultiplication(
+            primary: weights,
+            secondary: values,
+            name: "depth_attn_output"
+        )
+
+        return [output]
     }
 }
 

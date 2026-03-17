@@ -720,6 +720,264 @@ public struct AttentionPattern: HLOPattern {
     }
 }
 
+// MARK: - Depth Attention Pattern (Attention Residuals)
+
+/// Detects the depth-wise attention pattern used in Attention Residuals (AttnRes).
+///
+/// Block AttnRes aggregates layer representations via learned attention:
+///   h_l = Σ α(i→l) · v_i
+/// where α = softmax(w_l · stacked_layers) is computed from a single learned
+/// pseudo-query vector attending over all prior block outputs.
+///
+/// In HLO this decomposes to the same structure as standard SDPA but with:
+/// - seqLenQ = 1 (single query vector per block boundary)
+/// - seqLenKV ≤ 32 (number of preceding blocks, typically 4-16)
+/// - numHeads = 1 (depth attention has no multi-head structure)
+///
+/// We match this with higher priority than AttentionPattern (120 > 110) so the
+/// tiny depth case routes to our specialized kernel instead of FlashAttention.
+///
+/// The pattern is: dot_general(softmax(dot_general(query, keys) * scale), values)
+/// where the Q·K^T output has a very small last dimension (≤ maxDepthDim).
+public struct DepthAttentionPattern: HLOPattern {
+    public let name = "depth_attention"
+    public let priority = 120  // Higher than AttentionPattern (110)
+
+    /// Maximum KV sequence length to classify as depth attention.
+    /// Block AttnRes typically uses 4-16 blocks; 32 is a generous ceiling.
+    public let maxDepthDim: Int
+
+    public init(maxDepthDim: Int = 32) {
+        self.maxDepthDim = maxDepthDim
+    }
+
+    public func match(
+        at op: HLOOperation,
+        index: Int,
+        in function: HLOFunction,
+        definingOps: [String: (op: HLOOperation, index: Int)]
+    ) -> PatternMatch? {
+        // Depth attention ends with dot_general (weights @ values)
+        guard op.kind == .dotGeneral else { return nil }
+
+        let weightsSource = op.operands[0]
+        let vSource = op.operands[1]
+
+        // The weights must come from softmax (divide in decomposed form)
+        guard let softmaxEndOp = definingOps[weightsSource]?.op,
+              softmaxEndOp.kind == .divide else { return nil }
+
+        // Walk back through softmax: divide ← exp, sum ← exp ← subtract ← max, input
+        guard let expOp = definingOps[softmaxEndOp.operands[0]]?.op,
+              expOp.kind == .exponential else { return nil }
+
+        guard let sumOp = definingOps[softmaxEndOp.operands[1]]?.op,
+              sumOp.kind == .reduce,
+              sumOp.operands.first == expOp.result else { return nil }
+
+        guard let subOp = definingOps[expOp.operands[0]]?.op,
+              subOp.kind == .subtract else { return nil }
+
+        // Find max op (possibly via broadcast)
+        let maxSource = subOp.operands[1]
+        var maxOp: HLOOperation?
+        var broadcastOp: HLOOperation?
+
+        if let directMax = definingOps[maxSource]?.op {
+            if directMax.kind == .reduce {
+                maxOp = directMax
+            } else if directMax.kind == .broadcastInDim {
+                broadcastOp = directMax
+                if let innerMax = definingOps[directMax.operands[0]]?.op,
+                   innerMax.kind == .reduce {
+                    maxOp = innerMax
+                }
+            }
+        }
+        guard maxOp != nil else { return nil }
+
+        // The softmax input is the first operand of subtract
+        let softmaxInputSource = subOp.operands[0]
+
+        // Walk pre-softmax: optional scale multiply, then Q·K^T dot
+        var scaleValue: Float = 1.0
+        var qkDotSource = softmaxInputSource
+        var preOps: [HLOOperation] = []
+        var preIndices: [Int] = []
+
+        if let scoresOp = definingOps[softmaxInputSource]?.op {
+            if scoresOp.kind == .multiply {
+                if let scaleConst = extractScaleConstant(scoresOp, definingOps: definingOps) {
+                    scaleValue = scaleConst
+                }
+                qkDotSource = findDotInput(scoresOp, definingOps: definingOps)
+                if let idx = definingOps[scoresOp.result]?.index {
+                    preOps.append(scoresOp)
+                    preIndices.append(idx)
+                }
+            } else if scoresOp.kind == .dotGeneral {
+                qkDotSource = softmaxInputSource
+            }
+        }
+
+        // Find the Q·K^T dot_general
+        guard let qkDotOp = definingOps[qkDotSource]?.op,
+              qkDotOp.kind == .dotGeneral else { return nil }
+
+        // --- Depth attention discriminator ---
+        // Check that the scores (Q·K^T output) have a small last dimension.
+        // This is the depth dimension (number of blocks). Standard sequence
+        // attention has seqLen in the hundreds/thousands; depth attention ≤ 32.
+        let scoresShape = qkDotOp.resultType.shape
+        guard let lastDim = scoresShape.last,
+              lastDim > 0 && lastDim <= maxDepthDim else {
+            return nil  // Not depth attention — let AttentionPattern handle it
+        }
+
+        // Also verify the query dimension is small (single-vector or very few queries).
+        // In depth attention, Q is a learned weight [1, hidden] or [hidden].
+        // After the dot, scores shape is [..., 1, numBlocks] or [..., numBlocks].
+        // We check that the second-to-last dim (if it exists) is ≤ maxDepthDim too.
+        if scoresShape.count >= 2 {
+            let queryDim = scoresShape[scoresShape.count - 2]
+            if queryDim > maxDepthDim {
+                return nil  // Query dimension too large — this is regular attention
+            }
+        }
+
+        let qOperand = qkDotOp.operands[0]
+        var kOperand = qkDotOp.operands[1]
+        let vOperand = vSource
+
+        // Absorb explicit K transpose if present
+        var kTransposeOp: HLOOperation? = nil
+        if let kDef = definingOps[kOperand]?.op, kDef.kind == .transpose {
+            kTransposeOp = kDef
+            kOperand = kDef.operands[0]
+        }
+
+        // Build matched operations list
+        var matchedOps: [HLOOperation] = []
+        var matchedIndices: [Int] = []
+
+        // Q·K^T dot
+        if let idx = definingOps[qkDotOp.result]?.index {
+            matchedOps.append(qkDotOp)
+            matchedIndices.append(idx)
+        }
+
+        // K transpose
+        if let kt = kTransposeOp, let idx = definingOps[kt.result]?.index {
+            matchedOps.append(kt)
+            matchedIndices.append(idx)
+        }
+
+        // Pre-softmax ops (scale)
+        matchedOps.append(contentsOf: preOps)
+        matchedIndices.append(contentsOf: preIndices)
+
+        // Softmax chain
+        if let m = maxOp, let idx = definingOps[m.result]?.index {
+            matchedOps.append(m)
+            matchedIndices.append(idx)
+        }
+        if let b = broadcastOp, let idx = definingOps[b.result]?.index {
+            matchedOps.append(b)
+            matchedIndices.append(idx)
+        }
+        if let idx = definingOps[subOp.result]?.index {
+            matchedOps.append(subOp)
+            matchedIndices.append(idx)
+        }
+        if let idx = definingOps[expOp.result]?.index {
+            matchedOps.append(expOp)
+            matchedIndices.append(idx)
+        }
+        if let idx = definingOps[sumOp.result]?.index {
+            matchedOps.append(sumOp)
+            matchedIndices.append(idx)
+        }
+        if let idx = definingOps[softmaxEndOp.result]?.index {
+            matchedOps.append(softmaxEndOp)
+            matchedIndices.append(idx)
+        }
+
+        // Final weights @ V dot
+        matchedOps.append(op)
+        matchedIndices.append(index)
+
+        let inputs = [qOperand, kOperand, vOperand]
+
+        return PatternMatch(
+            operations: matchedOps,
+            indices: matchedIndices.sorted(),
+            rootOperation: op,
+            metadata: [
+                "scale": .float(scaleValue),
+                "depth_dim": .int(lastDim),
+                "pattern": .string("depth_attention")
+            ],
+            inputs: inputs
+        )
+    }
+
+    public func replacement(for match: PatternMatch, in function: HLOFunction) -> [HLOOperation] {
+        var scale: Float = 1.0
+        var depthDim: Int = 8
+
+        if case .float(let s) = match.metadata["scale"] {
+            scale = s
+        }
+        if case .int(let d) = match.metadata["depth_dim"] {
+            depthDim = d
+        }
+
+        var attributes = HLOAttributes()
+        attributes.callTargetName = "fused_depth_attention"
+        attributes.backendConfig = "{\"scale\": \(scale), \"depth_dim\": \(depthDim)}"
+
+        return [HLOOperation(
+            result: match.rootOperation.result,
+            kind: .customCall,
+            operands: match.inputs,
+            resultType: match.rootOperation.resultType,
+            attributes: attributes
+        )]
+    }
+
+    // MARK: - Helpers
+
+    private func extractScaleConstant(
+        _ mulOp: HLOOperation,
+        definingOps: [String: (op: HLOOperation, index: Int)]
+    ) -> Float? {
+        for operand in mulOp.operands {
+            if let constOp = definingOps[operand]?.op,
+               constOp.kind == .constant,
+               let constVal = constOp.attributes.constantValue {
+                switch constVal {
+                case .scalar(let v): return Float(v)
+                case .splat(let v, _): return Float(v)
+                default: break
+                }
+            }
+        }
+        return nil
+    }
+
+    private func findDotInput(
+        _ mulOp: HLOOperation,
+        definingOps: [String: (op: HLOOperation, index: Int)]
+    ) -> String {
+        for operand in mulOp.operands {
+            if let def = definingOps[operand]?.op, def.kind != .constant {
+                return operand
+            }
+        }
+        return mulOp.operands[0]
+    }
+}
+
 // MARK: - RMSNorm Pattern
 
 /// Detects RMSNorm pattern: x / sqrt(mean(x^2) + eps) * gamma

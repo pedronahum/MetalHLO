@@ -111,6 +111,39 @@ let package = Package(
             ]
         ),
 
+        // MARK: - Heterogeneous Fusion (cross-unit GPU+ANE+CPU execution)
+        .target(
+            name: "HeterogeneousFusion",
+            dependencies: [],
+            path: "Sources/HeterogeneousFusion",
+            linkerSettings: [
+                .linkedFramework("Metal"),
+                .linkedFramework("MetalPerformanceShaders"),
+                .linkedFramework("Accelerate"),
+            ]
+        ),
+        .executableTarget(
+            name: "HeterogeneousFusionBenchmark",
+            dependencies: ["HeterogeneousFusion"],
+            path: "Sources/HeterogeneousFusionBenchmark"
+        ),
+        .executableTarget(
+            name: "GPT2EndToEnd",
+            dependencies: ["HeterogeneousFusion"],
+            path: "Sources/GPT2EndToEnd"
+        ),
+        .executableTarget(
+            name: "CalibrateTest",
+            dependencies: ["HeterogeneousFusion"],
+            path: "Sources/CalibrateTest"
+        ),
+        .executableTarget(
+            name: "DepthAttentionBenchmark",
+            dependencies: ["MetalHLOCore"],
+            path: "Sources/DepthAttentionBenchmark",
+            swiftSettings: [.unsafeFlags(["-enable-testing"])]
+        ),
+
         // MARK: - Benchmarks
         .target(
             name: "MetalHLOBenchmarks",

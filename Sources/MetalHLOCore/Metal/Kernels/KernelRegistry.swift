@@ -78,6 +78,7 @@ public final class MetalKernelRegistry: @unchecked Sendable {
         registerKernel(RMSNormKernel())
         registerKernel(FlashAttentionKernel())
         registerKernel(FlashAttentionTiledKernel())
+        registerKernel(DepthAttentionKernel())
     }
 
     // MARK: - Registration
