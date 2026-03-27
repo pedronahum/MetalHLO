@@ -21,44 +21,88 @@ MetalHLO draws inspiration from both [OpenXLA](https://github.com/openxla/xla) a
 - **Single-device focus** — Optimized for one GPU rather than distributed execution
 
 **MetalHLO's unique contribution:**
-- **Three execution backends** — MPSGraph for broad compatibility, custom Metal kernels for peak performance, and heterogeneous GPU+ANE for parallel execution
-- **Heterogeneous GPU+ANE execution** — Automatically partitions workloads across the GPU and Apple Neural Engine, the first StableHLO runtime to leverage the ANE (see [how it works](#how-gpuane-heterogeneous-execution-works) below)
+- **Three execution backends** — MPSGraph for broad compatibility, custom Metal kernels for peak performance, and heterogeneous GPU+ANE+CPU for parallel execution
+- **Heterogeneous GPU+ANE+CPU execution** — Automatically partitions profitable workloads across GPU, MPS/ANE, and CPU using a profitability-gated 4-pass pipeline (see [how it works](#how-heterogeneous-execution-works) below)
 - **Progressive optimization levels** — O0 to O3 matching compiler conventions
 - **PJRT plugin for JAX** — Standard OpenXLA plugin interface enables `import jax; jax.numpy` on Apple GPUs
 - **C API for portability** — Integrate with any language that can call C functions
 
-### How GPU+ANE Heterogeneous Execution Works
+### How Heterogeneous Execution Works
 
-Every Apple Silicon chip contains both a GPU and a Neural Engine (ANE) — two independent accelerators that share unified memory. Most ML frameworks only use the GPU. MetalHLO is the first StableHLO runtime to use both simultaneously.
+Every Apple Silicon chip contains a GPU, a Neural Engine (ANE, accessible via MPS), and high-performance CPU cores — three independent compute units that share unified memory. Most ML frameworks only use the GPU. MetalHLO is the first StableHLO runtime to use all three simultaneously.
 
 ```
                   StableHLO Program
                         │
-                   ┌────▼────┐
-                   │  Cost   │  Estimates GPU vs ANE execution time
-                   │  Model  │  per operation based on op type, shape,
-                   │         │  and data movement cost
-                   └────┬────┘
+               ┌────────▼────────┐
+               │  4-Pass Graph   │
+               │  Pipeline       │
+               └────────┬────────┘
                         │
-              ┌─────────┴─────────┐
-              ▼                   ▼
-     ┌────────────────┐  ┌────────────────┐
-     │   GPU Queue    │  │   ANE Queue    │
-     │                │  │                │
-     │  • Large GEMM  │  │  • Elementwise │
-     │  • Convolution │  │  • Batch norm  │
-     │  • Complex     │  │  • Simple      │
-     │    reductions  │  │    reductions  │
-     └────────┬───────┘  └────────┬───────┘
-              │                   │
-              │   Unified Memory  │  ← Zero-copy: both accelerators
-              │   (shared)        │    read/write the same buffers
-              └─────────┬─────────┘
+         Pass 1: Eligibility Annotation
+              (ProfitabilityGuard)
+                        │
+         Pass 2: Op Fusion
+              (chain + attention absorption)
+                        │
+         Pass 3: Heterogeneous Partitioning
+              (optimal split per cluster)
+                        │
+         Pass 4: Sequential Scheduling
+              (serial between clusters,
+               parallel within)
+                        │
+         ┌──────────────┼──────────────┐
+         ▼              ▼              ▼
+  ┌────────────┐ ┌────────────┐ ┌────────────┐
+  │  GPU       │ │  MPS/ANE   │ │  CPU       │
+  │  (Metal)   │ │            │ │ (Accelerate│
+  │            │ │  • matmul  │ │  /vDSP)    │
+  │  • matmul  │ │  • conv    │ │            │
+  │  • elem.   │ │  (routes   │ │  • matmul  │
+  │  • softmax │ │   to ANE)  │ │  • elem.   │
+  │  • layerN. │ │            │ │  • layerN. │
+  └──────┬─────┘ └──────┬─────┘ └──────┬─────┘
+         │              │              │
+         │       Unified Memory        │  ← Zero-copy: all three units
+         │       (shared)              │    read/write the same buffers
+         └──────────────┴──────────────┘
                         ▼
                      Results
 ```
 
-The key insight is that because Apple Silicon uses unified memory, there is no data transfer cost between GPU and ANE — both read and write the same physical memory. The cost model assigns each operation to whichever accelerator will complete it faster, and both execute their queues concurrently. This gives up to **3-4x speedup** on element-wise heavy workloads compared to MPSGraph, with the ANE handling simple operations while the GPU focuses on compute-intensive ones.
+The key insight is that Apple Silicon's unified memory eliminates data transfer cost between compute units — GPU, MPS/ANE, and CPU all read and write the same physical memory. The system uses a **profitability-gated** cost model: rather than partitioning every operation, a compound gate filters out shapes where the overhead of multi-unit dispatch exceeds the benefit, ensuring zero regressions on unprofitable workloads.
+
+#### Profitability Guard (Compound Gate)
+
+Not every operation benefits from partitioning. Empirical validation on GPT-2 and ViT-B/16 established two hardware-derived thresholds:
+
+- **Minimum elements**: ≥ 10M output elements (below this, dispatch overhead dominates)
+- **Minimum output columns**: N ≥ 32,768 (narrow shapes can't amortize per-unit slice overhead)
+
+Both conditions must be met. In practice, this means only vocabulary-scale projections (GPT-2 N=50,257, LLaMA N=32,000, CLIP N=49,408) are partitioned, while all other operations pass through to single-unit execution with zero overhead.
+
+#### Op-Class Taxonomy
+
+| Class | Examples | Strategy | Speedup |
+|-------|----------|----------|---------|
+| Compute-bound | matmul, attention | 3-unit GPU+MPS+CPU | 1.14-1.91x |
+| MPS-dominant | convolution | MPS/ANE alone (2-5x faster than partitioned) | — |
+| Bandwidth-bound | elementwise, layerNorm | 2-unit GPU+CPU, value is cluster absorption | — |
+| Gather | embedding | 2-unit GPU+CPU, CPU dominates | — |
+
+#### GPT-2 End-to-End Validation
+
+The heterogeneous pipeline was validated on GPT-2 (124M parameters):
+
+| Metric | Result |
+|--------|--------|
+| **Logit projection speedup** | 1.91x (fused GPU+MPS+CPU vs single-unit) |
+| **Regressions** | Zero — compound gate rejects all unprofitable ops |
+| **Ops partitioned (seq=512)** | 1 of 147 (logit projection only) |
+| **Cross-architecture** | ViT-B/16: 0 partitioned at all batch sizes (correct) |
+
+The compound gate is **batch-invariant**: the same ops are selected regardless of batch size (1 through 8). At batch ≥ 16 on 8GB devices, memory pressure causes regressions — the gate should be extended with an upper memory bound for large-batch safety.
 
 ## Features
 
@@ -67,7 +111,7 @@ The key insight is that because Apple Silicon uses unified memory, there is no d
 - **~99% Practical ML Coverage** — All operations needed for production ML workloads
 - **Triple API** — Native Swift API + C API + PJRT plugin for JAX/XLA integration
 - **Configurable Optimization** — O0 to O3 levels with algebraic simplification and operator fusion
-- **Heterogeneous Execution** — GPU+ANE auto mode partitions operations across GPU and Neural Engine with a cost model
+- **Heterogeneous Execution** — GPU+MPS/ANE+CPU auto mode partitions profitable operations across all compute units with a compound profitability gate
 - **Full Training Support** — Forward and backward pass operations
 - **Apple Silicon Optimized** — Leverages MPSGraph, custom Metal kernels, and the Apple Neural Engine
 
@@ -170,27 +214,27 @@ let releaseExe = try client.compile(mlir, config: .release) // O3, caching enabl
 let fastExe = try client.compile(mlir, config: .fast)       // O1, quick compilation
 ```
 
-### Swift — Heterogeneous GPU+ANE Execution
+### Swift — Heterogeneous GPU+ANE+CPU Execution
 
 ```swift
 import MetalHLO
 
 let client = try Client.create()
 
-// Enable heterogeneous execution across GPU and Apple Neural Engine
+// Enable heterogeneous execution across GPU, MPS/ANE, and CPU
 let config = CompilationConfig(
     optimizationLevel: .O3,
-    devicePolicy: .auto  // Cost model decides GPU vs ANE per operation
+    devicePolicy: .auto  // Profitability guard decides which ops to partition
 )
 let executable = try client.compile(mlir, config: config)
 
-// Execute — operations are automatically partitioned across GPU and ANE
+// Execute — profitable operations are partitioned across GPU + MPS/ANE + CPU
 let outputs = try executable.execute(inputs)
 ```
 
-The cost model routes operations to the most efficient accelerator:
-- **GPU:** Large matmuls, convolutions, reductions with complex access patterns
-- **ANE:** Element-wise operations on large tensors, batch normalization, simple reductions
+The profitability guard gates partitioning to operations where it provably helps:
+- **Partitioned (3-unit):** Large vocabulary projections (N ≥ 32K, ≥ 10M elements) — e.g., GPT-2 logit projection
+- **Single-unit fallback:** Everything else — the guard ensures zero overhead on unprofitable shapes
 
 ### C — Basic Usage
 
@@ -278,7 +322,7 @@ mhlo_compile_config_init(&config);
 
 // Use aggressive optimization
 config.optimization_level = MHLO_OPT_O3;
-config.device_policy = MHLO_DEVICE_AUTO;  // Enable GPU+ANE heterogeneous execution
+config.device_policy = MHLO_DEVICE_AUTO;  // Enable GPU+ANE+CPU heterogeneous execution
 config.enable_caching = true;
 config.enable_debug_info = false;
 
@@ -645,15 +689,15 @@ export METALHLO_PLUGIN_PATH=/path/to/libPJRTMetalHLO.dylib
 │               │       ┌────────────┴────────────────┐   │              │
 │               │       ▼              ▼              ▼   │              │
 │               │  ┌──────────┐  ┌──────────┐  ┌────────────┐           │
-│               │  │ MPSGraph │  │ Metal    │  │ GPU+ANE    │           │
-│               │  │ Backend  │  │ Kernel   │  │ Heterogen. │           │
+│               │  │ MPSGraph │  │ Metal    │  │ Heterogen. │           │
+│               │  │ Backend  │  │ Kernel   │  │ GPU+ANE+CPU│           │
 │               │  │ (default)│  │ (O0-O3)  │  │ (auto)     │           │
 │               │  └──────────┘  └──────────┘  └────────────┘           │
 │               └─────────────────────────────────────────┘              │
 │                          │            │            │                    │
 │                          ▼            ▼            ▼                    │
 │               ┌──────────────────────────────────────────┐             │
-│               │  Apple Metal / MPSGraph / Neural Engine  │             │
+│               │  Apple Metal / MPSGraph / ANE / CPU      │             │
 │               └──────────────────────────────────────────┘             │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
@@ -1112,6 +1156,18 @@ swift build -c release --product benchmark-runner
 swift build -c release --product mlx-comparison
 .build/release/mlx-comparison --quick
 .build/release/mlx-comparison --category matrix
+
+# Heterogeneous fusion benchmarks (GPU+MPS+CPU partitioning)
+swift build -c release --product HeterogeneousFusionBenchmark
+.build/release/HeterogeneousFusionBenchmark
+
+# GPT-2 end-to-end validation (profitability guard + crossover analysis)
+swift build -c release --product GPT2EndToEnd
+.build/release/GPT2EndToEnd
+
+# Hardware calibration test
+swift build -c release --product CalibrateTest
+.build/release/CalibrateTest
 ```
 
 ### Benchmark Framework Features
