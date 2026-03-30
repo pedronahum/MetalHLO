@@ -46,15 +46,17 @@ final class PJRTDeviceDescriptionImpl: @unchecked Sendable {
         var stringValues: [UnsafeMutablePointer<CChar>] = []
         var namedValues: [PJRT_NamedValue] = []
 
-        // Attribute: ane_available (bool)
+        // Attribute: ane_available (int64, 0 or 1)
+        // Using kInt64 instead of kBool for compatibility with JAX 0.9+
+        // where kBool is no longer handled by DeviceAttributesFromPjRtValues.
         let aneAvailName = strdup("ane_available")!
         names.append(aneAvailName)
         var aneAvailAttr = PJRT_NamedValue()
         aneAvailAttr.struct_size = MemoryLayout<PJRT_NamedValue>.size
         aneAvailAttr.name = UnsafePointer(aneAvailName)
         aneAvailAttr.name_size = strlen(aneAvailName)
-        aneAvailAttr.type = PJRT_NamedValue_kBool
-        aneAvailAttr.bool_value = aneInfo.isAvailable
+        aneAvailAttr.type = PJRT_NamedValue_kInt64
+        aneAvailAttr.int64_value = aneInfo.isAvailable ? 1 : 0
         aneAvailAttr.value_size = 1
         namedValues.append(aneAvailAttr)
 

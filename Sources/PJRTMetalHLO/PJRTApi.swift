@@ -108,6 +108,7 @@ private func buildPjrtApi() -> PJRT_Api {
     api.PJRT_LoadedExecutable_Delete = pjrt_loaded_executable_delete
     api.PJRT_LoadedExecutable_IsDeleted = pjrt_loaded_executable_is_deleted
     api.PJRT_LoadedExecutable_Execute = pjrt_loaded_executable_execute
+    api.PJRT_LoadedExecutable_GetDeviceAssignment = pjrt_loaded_executable_get_device_assignment
     api.PJRT_Executable_DeserializeAndLoad = pjrt_executable_deserialize_and_load
     api.PJRT_LoadedExecutable_Fingerprint = pjrt_loaded_executable_fingerprint
 

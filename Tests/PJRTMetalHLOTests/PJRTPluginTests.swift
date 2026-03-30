@@ -355,7 +355,7 @@ struct PJRTPluginTests {
                 let name = String(cString: attr.name!)
                 if name == "ane_available" {
                     foundANE = true
-                    #expect(attr.type == PJRT_NamedValue_kBool)
+                    #expect(attr.type == PJRT_NamedValue_kInt64)
                 }
                 if name == "device_policy" {
                     foundPolicy = true

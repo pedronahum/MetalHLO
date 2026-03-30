@@ -658,6 +658,39 @@ func pjrt_loaded_executable_execute(
     }
 }
 
+func pjrt_loaded_executable_get_device_assignment(
+    _ args: UnsafeMutablePointer<PJRT_LoadedExecutable_GetDeviceAssignment_Args>?
+) -> UnsafeMutablePointer<PJRT_Error>? {
+    guard let args = args else {
+        return makeError(PJRT_Error_Code_INVALID_ARGUMENT, "NULL args")
+    }
+
+    // Serialize a DeviceAssignmentProto for single-device:
+    //   replica_count = 1, computation_count = 1,
+    //   computation_devices = [{replica_device_ids: [0]}]
+    // Protobuf encoding:
+    //   field 1 varint 1, field 2 varint 1, field 3 length-delimited {field 1 varint 0}
+    let proto: [UInt8] = [0x08, 0x01, 0x10, 0x01, 0x1A, 0x02, 0x08, 0x00]
+
+    // Allocate a copy of the proto bytes that outlives this call.
+    // We use malloc so the deleter can simply call free().
+    let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: proto.count)
+    proto.withUnsafeBufferPointer { src in
+        buf.initialize(from: src.baseAddress!, count: src.count)
+    }
+
+    args.pointee.serialized_bytes = UnsafePointer<CChar>(OpaquePointer(buf))
+    args.pointee.serialized_bytes_size = proto.count
+    // Use the buffer pointer itself as the opaque "serialized_device_assignment" handle.
+    args.pointee.serialized_device_assignment = OpaquePointer(buf)
+    args.pointee.serialized_device_assignment_deleter = { daPtr in
+        guard let daPtr = daPtr else { return }
+        UnsafeMutableRawPointer(daPtr).deallocate()
+    }
+
+    return nil
+}
+
 func pjrt_loaded_executable_fingerprint(
     _ args: UnsafeMutablePointer<PJRT_LoadedExecutable_Fingerprint_Args>?
 ) -> UnsafeMutablePointer<PJRT_Error>? {
