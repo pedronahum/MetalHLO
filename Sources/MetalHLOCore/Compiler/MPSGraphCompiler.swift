@@ -1860,24 +1860,68 @@ public final class MPSGraphCompiler {
         let updateWindowDims = dimNumbers.updateWindowDims
         let insertedWindowDims = dimNumbers.insertedWindowDims
 
-        // FAST PATH: Window scatter (update_window_dims covers all update dims).
-        // This is effectively a dynamic_update_slice: place the full update tensor
-        // at the position specified by indices. Common for at[i].set() operations.
-        // Strategy: expand updates to include size-1 dims for inserted_window_dims,
-        // then use scatterAlongAxis with matching indices shape.
-        // Debug: fputs("[scatter-mps] uwDims=\(updateWindowDims) iwDims=\(insertedWindowDims) uRank=\(updatesRank) oRank=\(operandRank)\n", stderr)
+        // FAST PATH: Window scatter — covers all patterns where update_window_dims
+        // covers all update dimensions (dynamic_update_slice semantics).
+        //
+        // Pattern A: insertedWindowDims has 1 dim (single-axis scatter)
+        //   e.g., at[i].set(val), at[:, i].set(val)
+        // Pattern B: insertedWindowDims is empty (pure dynamic_update_slice)
+        //   e.g., at[i:i+k].set(val) where updates shape is a sub-window
+        // Pattern C: insertedWindowDims has 2+ dims (multi-axis scatter)
+        //   e.g., at[i, :, j].set(val)
+        //
+        // For single-index single-axis: coordinate mask + select
+        // For multi-index single-axis: scatterAlongAxis
+        // For dynamic_update_slice: use compileDynamicUpdateSlice path
         if updateWindowDims.count == updatesRank &&
-           insertedWindowDims.count + updateWindowDims.count == operandRank &&
-           insertedWindowDims.count == 1 {
+           insertedWindowDims.isEmpty &&
+           scatterMode == .set {
+            // Pattern B: pure dynamic_update_slice — updates has same rank as operand,
+            // placed at the index position along scatter axis. Use scatterAlongAxis directly.
+            let scatterAxis = dimNumbers.scatterDimsToOperandDims.first ?? 0
+            let scatterCount = updatesShape[scatterAxis].intValue
 
+            let castIndices = graph.cast(scatterIndices, to: .int32, name: "\(op.result)_idx_i32")
+            // Reshape indices to operand rank with scatterCount at scatter axis
+            var idxReshape = [NSNumber](repeating: 1, count: operandRank)
+            idxReshape[scatterAxis] = NSNumber(value: scatterCount)
+
+            // Build range indices: if index is i and updates has K slices,
+            // indices should be [i, i+1, i+2, ..., i+K-1]
+            let baseIdx = graph.reshape(castIndices, shape: [1], name: "\(op.result)_base")
+            let offsets = graph.coordinate(alongAxis: 0, withShape: [NSNumber(value: scatterCount)], name: "\(op.result)_offsets")
+            let offsetsInt = graph.cast(offsets, to: .int32, name: "\(op.result)_offsets_i32")
+            let rangeIdx = graph.addition(graph.broadcast(baseIdx, shape: [NSNumber(value: scatterCount)], name: "\(op.result)_base_bcast"),
+                                          offsetsInt, name: "\(op.result)_range")
+
+            let reshapedIdx = graph.reshape(rangeIdx, shape: idxReshape, name: "\(op.result)_idx_reshape")
+            var idxShape = updates.shape!.map { $0 }
+            idxShape[scatterAxis] = NSNumber(value: scatterCount)
+            let broadcastIdx = graph.broadcast(reshapedIdx, shape: idxShape, name: "\(op.result)_idx_bcast")
+
+            return graph.scatterAlongAxis(
+                scatterAxis,
+                data: operand,
+                updates: updates,
+                indices: broadcastIdx,
+                mode: scatterMode,
+                name: op.result
+            )
+        }
+
+        if updateWindowDims.count == updatesRank &&
+           insertedWindowDims.count == 1 &&
+           scatterMode == .set {
+            // Pattern A: single-axis window scatter
             let scatterAxis = insertedWindowDims[0]
+            let numIndices = indicesShape.isEmpty ? 1 : indicesShape[0]
 
-            // Reshape updates: insert size-1 dim at the scatter axis position
+            // Expand updates: insert scatter axis dim
             var expandedShape = [NSNumber]()
             var windowIdx = 0
             for dim in 0..<operandRank {
                 if dim == scatterAxis {
-                    expandedShape.append(1)
+                    expandedShape.append(NSNumber(value: numIndices))
                 } else {
                     expandedShape.append(updatesShape[windowIdx])
                     windowIdx += 1
@@ -1885,30 +1929,93 @@ public final class MPSGraphCompiler {
             }
             let expandedUpdates = graph.reshape(updates, shape: expandedShape, name: "\(op.result)_expand")
 
-            // Reshape indices to match expanded updates rank (broadcast to same shape)
-            var indicesExpandedShape = expandedShape.map { _ in NSNumber(value: 1) }
-            indicesExpandedShape[scatterAxis] = 1
-            let reshapedIndices = graph.reshape(
-                scatterIndices,
-                shape: indicesExpandedShape,
-                name: "\(op.result)_idx_reshape"
-            )
-            let broadcastIndices = graph.broadcast(
-                reshapedIndices,
-                shape: expandedShape,
-                name: "\(op.result)_idx_broadcast"
-            )
+            if numIndices == 1 {
+                // Single index: coordinate mask + select
+                let coords = graph.coordinate(alongAxis: scatterAxis, withShape: operand.shape!, name: "\(op.result)_coords")
+                let coordsInt = graph.cast(coords, to: .int32, name: "\(op.result)_coords_i32")
+                let indexBroadcast = graph.broadcast(
+                    graph.cast(scatterIndices, to: .int32, name: "\(op.result)_idx_i32"),
+                    shape: operand.shape!,
+                    name: "\(op.result)_idx_bcast"
+                )
+                let mask = graph.equal(coordsInt, indexBroadcast, name: "\(op.result)_mask")
+                let updatesBroadcast = graph.broadcast(expandedUpdates, shape: operand.shape!, name: "\(op.result)_upd_bcast")
+                return graph.select(predicate: mask, trueTensor: updatesBroadcast, falseTensor: operand, name: op.result)
+            } else {
+                // Multiple indices: scatterAlongAxis
+                var idxShape = operandShape.map { NSNumber(value: $0) }
+                idxShape[scatterAxis] = NSNumber(value: numIndices)
 
-            return graph.scatterAlongAxis(
-                scatterAxis,
-                data: operand,
-                updates: expandedUpdates,
-                indices: broadcastIndices,
-                mode: scatterMode,
-                name: op.result
-            )
+                // Handle index_vector_dim for multi-index: indices may be (N, 1) shaped
+                let flatIndices: MPSGraphTensor
+                if indicesShape.count > 1 {
+                    flatIndices = graph.reshape(
+                        graph.cast(scatterIndices, to: .int32, name: "\(op.result)_idx_i32"),
+                        shape: [NSNumber(value: numIndices)],
+                        name: "\(op.result)_idx_flat"
+                    )
+                } else {
+                    flatIndices = graph.cast(scatterIndices, to: .int32, name: "\(op.result)_idx_i32")
+                }
+
+                var idxReshape = [NSNumber](repeating: 1, count: operandRank)
+                idxReshape[scatterAxis] = NSNumber(value: numIndices)
+                let reshapedIdx = graph.reshape(flatIndices, shape: idxReshape, name: "\(op.result)_idx_reshape")
+                let broadcastIdx = graph.broadcast(reshapedIdx, shape: idxShape, name: "\(op.result)_idx_bcast")
+
+                return graph.scatterAlongAxis(
+                    scatterAxis,
+                    data: operand,
+                    updates: expandedUpdates,
+                    indices: broadcastIdx,
+                    mode: scatterMode,
+                    name: op.result
+                )
+            }
         }
 
+        // Pattern C: multi-axis window scatter (2+ inserted dims)
+        if updateWindowDims.count == updatesRank &&
+           insertedWindowDims.count >= 2 &&
+           insertedWindowDims.count == dimNumbers.scatterDimsToOperandDims.count &&
+           scatterMode == .set {
+
+            let castIndices = graph.cast(scatterIndices, to: .int32, name: "\(op.result)_idx_i32")
+
+            // Build mask: AND of (coord_dim_k == index_k) for each inserted dim
+            var combinedMask: MPSGraphTensor? = nil
+            for (k, scatterDim) in insertedWindowDims.enumerated() {
+                let coords = graph.coordinate(alongAxis: scatterDim, withShape: operand.shape!, name: "\(op.result)_coord_\(scatterDim)")
+                let coordsInt = graph.cast(coords, to: .int32, name: "\(op.result)_coord_i32_\(scatterDim)")
+
+                let idxVal = graph.sliceTensor(castIndices, dimension: 0, start: k, length: 1, name: "\(op.result)_ival_\(k)")
+                let idxBroadcast = graph.broadcast(idxVal, shape: operand.shape!, name: "\(op.result)_ibcast_\(k)")
+                let dimMask = graph.equal(coordsInt, idxBroadcast, name: "\(op.result)_mask_\(scatterDim)")
+
+                if let existing = combinedMask {
+                    combinedMask = graph.logicalAND(existing, dimMask, name: "\(op.result)_mask_and_\(k)")
+                } else {
+                    combinedMask = dimMask
+                }
+            }
+
+            var expandedShape = [NSNumber]()
+            var windowIdx = 0
+            for dim in 0..<operandRank {
+                if insertedWindowDims.contains(dim) {
+                    expandedShape.append(1)
+                } else {
+                    expandedShape.append(updatesShape[windowIdx])
+                    windowIdx += 1
+                }
+            }
+            let expandedUpdates = graph.reshape(updates, shape: expandedShape, name: "\(op.result)_expand")
+            let broadcastUpdates = graph.broadcast(expandedUpdates, shape: operand.shape!, name: "\(op.result)_upd_bcast")
+
+            return graph.select(predicate: combinedMask!, trueTensor: broadcastUpdates, falseTensor: operand, name: op.result)
+        }
+
+        // GENERAL FALLBACK: for other scatter patterns, use scatterAlongAxis
         let indicesRank = indicesShape.count
         let indexVectorDim = dimNumbers.indexVectorDim
 
@@ -1918,51 +2025,44 @@ public final class MPSGraphCompiler {
             var perm = Array(0..<indicesRank)
             perm.remove(at: indexVectorDim)
             perm.append(indexVectorDim)
-
-            processedIndices = graph.transpose(
-                scatterIndices,
-                permutation: perm.map { NSNumber(value: $0) },
-                name: "\(op.result)_move_ivd"
-            )
+            processedIndices = graph.transpose(scatterIndices, permutation: perm.map { NSNumber(value: $0) }, name: "\(op.result)_move_ivd")
         } else {
             processedIndices = scatterIndices
         }
 
-        // Determine the scatter axis from dimension numbers
-        let scatterAxis = dimNumbers.scatterDimsToOperandDims.first ?? 0
+        let scatterAxis2 = dimNumbers.scatterDimsToOperandDims.first ?? 0
+        let processedIndicesShape = processedIndices.shape?.map { $0.intValue } ?? indicesShape
 
-        // For scatterAlongAxis, ALL tensors (data, updates, indices) must have the SAME rank
-        // and the same shape EXCEPT at the scatter axis.
-        // Build the target shape for updates: match operand shape except scatter axis gets updates count.
-        var updatesTargetShape: [NSNumber] = operandShape.map { NSNumber(value: $0) }
-        // The scatter axis in updates should reflect the number of scatter points
-        let scatterCount = indicesShape.isEmpty ? 1 : indicesShape[0]
-        updatesTargetShape[scatterAxis] = NSNumber(value: scatterCount)
+        // For scatterAlongAxis: updates and indices must match operand rank.
+        // The scatter dim of updates has scatterCount elements; other dims match operand.
+        let scatterCount = processedIndicesShape.isEmpty ? 1 : processedIndicesShape[0]
+        var updatesTargetShape = operandShape.map { NSNumber(value: $0) }
+        updatesTargetShape[scatterAxis2] = NSNumber(value: scatterCount)
 
-        let reshapedUpdates = graph.reshape(
-            updates,
-            shape: updatesTargetShape,
-            name: "\(op.result)_updates_reshape"
-        )
+        // Only reshape if total element count matches
+        let updatesTotal = updatesShape.map { $0.intValue }.reduce(1, *)
+        let targetTotal = updatesTargetShape.map { $0.intValue }.reduce(1, *)
+        let reshapedUpdates: MPSGraphTensor
+        if updatesTotal == targetTotal {
+            reshapedUpdates = graph.reshape(updates, shape: updatesTargetShape, name: "\(op.result)_updates_reshape")
+        } else {
+            reshapedUpdates = updates
+        }
 
-        // Reshape indices to match: same shape as updatesTargetShape
-        var indicesTargetShape: [NSNumber] = updatesTargetShape.map { _ in NSNumber(value: 1) }
-        indicesTargetShape[scatterAxis] = NSNumber(value: scatterCount)
-        let reshapedIndices = graph.reshape(
-            processedIndices,
-            shape: indicesTargetShape,
-            name: "\(op.result)_indices_reshape"
-        )
-
-        // Broadcast indices to match updates shape
-        let broadcastIndices = graph.broadcast(
-            reshapedIndices,
-            shape: updatesTargetShape,
-            name: "\(op.result)_indices_broadcast"
-        )
+        var idxReshape = [NSNumber](repeating: 1, count: operandRank)
+        idxReshape[scatterAxis2] = NSNumber(value: scatterCount)
+        let flatIndices: MPSGraphTensor
+        if processedIndicesShape.count > 1 {
+            flatIndices = graph.reshape(graph.cast(processedIndices, to: .int32, name: "\(op.result)_idx_i32"),
+                                        shape: [NSNumber(value: scatterCount)], name: "\(op.result)_idx_flat")
+        } else {
+            flatIndices = graph.cast(processedIndices, to: .int32, name: "\(op.result)_idx_i32")
+        }
+        let reshapedIndices = graph.reshape(flatIndices, shape: idxReshape, name: "\(op.result)_indices_reshape")
+        let broadcastIndices = graph.broadcast(reshapedIndices, shape: reshapedUpdates.shape ?? updatesTargetShape, name: "\(op.result)_indices_broadcast")
 
         return graph.scatterAlongAxis(
-            scatterAxis,
+            scatterAxis2,
             data: operand,
             updates: reshapedUpdates,
             indices: broadcastIndices,

@@ -1184,6 +1184,17 @@ public final class CodeGenerator: @unchecked Sendable {
         // scatter phase dispatches totalUpdateElements threads.
         // Since we can't do global sync, we'll use a single dispatch with max(operand, updates) threads.
 
+        // Determine scatter axis and compute strides for proper addressing
+        let scatterAxis = dimNumbers.scatterDimsToOperandDims.first ?? 0
+        let scatterDimSize = operandShape[scatterAxis]
+
+        // Stride of the scatter axis in the flat layout
+        let scatterAxisStride = operandShape.suffix(from: scatterAxis + 1).reduce(1, *)
+        // Number of elements in dimensions before the scatter axis
+        let outerSize = operandShape.prefix(scatterAxis).reduce(1, *)
+        // Number of elements in dimensions after the scatter axis
+        let innerSize = scatterAxisStride
+
         return """
         kernel void \(entryPoint)(
             device const \(operandType)* operand [[buffer(0)]],
@@ -1201,14 +1212,19 @@ public final class CodeGenerator: @unchecked Sendable {
             threadgroup_barrier(mem_flags::mem_device);
 
             // Phase 2: Scatter updates at indexed positions
+            // Scatter axis: \(scatterAxis), dim size: \(scatterDimSize)
             if (tid < \(totalUpdateElements)) {
                 uint indexIdx = tid / \(sliceSize);
                 uint sliceOffset = tid % \(sliceSize);
 
                 if (indexIdx < \(numIndices)) {
                     uint idx = uint(indices[indexIdx]);
-                    if (idx < \(operandShape.first ?? 1)) {
-                        uint dstPos = idx * \(operandInnerStride) + sliceOffset;
+                    if (idx < \(scatterDimSize)) {
+                        // Compute destination in flat operand layout:
+                        // outer_pos * (scatterDimSize * innerSize) + idx * innerSize + inner_pos
+                        uint outerPos = sliceOffset / \(innerSize);
+                        uint innerPos = sliceOffset % \(innerSize);
+                        uint dstPos = outerPos * \(scatterDimSize * innerSize) + idx * \(innerSize) + innerPos;
                         \(updateExpr)
                     }
                 }
