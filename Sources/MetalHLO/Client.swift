@@ -99,7 +99,10 @@ public final class Client: @unchecked Sendable {
         )
         let optimizer = HLOOptimizer(config: optimizerConfig)
         let optimizedFunction = optimizer.optimize(module.function)
-        let optimizedModule = HLOModule(name: module.name, function: optimizedFunction)
+        // Preserve all functions (main + private helpers needed by call ops)
+        var allFunctions = module.functions.filter { $0.isPrivate }
+        allFunctions.insert(optimizedFunction, at: 0)
+        let optimizedModule = HLOModule(name: module.name, functions: allFunctions)
 
         // Compile HLOModule to MPSGraph executable
         let compiled = try executor.compile(module: optimizedModule)

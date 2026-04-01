@@ -357,6 +357,47 @@ public final class Parser {
         try expect(.colon)
         let resultType = try parseTypeSignature(for: kind)
 
+        // For reduce operations, skip the optional reducer block that follows the type.
+        // Format: ... : (types) -> type\n  reducer(%args) (%args) { body }
+        if kind == .reduce {
+            skipNewlines()
+            if checkIdentifier("reducer") {
+                try expectIdentifier("reducer")
+                // Skip argument groups: (%arg1: type, ...) (%arg2: type, ...)
+                while check(.leftParen) {
+                    try expect(.leftParen)
+                    var depth = 1
+                    while depth > 0 && !check(.eof) {
+                        if check(.leftParen) { depth += 1 }
+                        if check(.rightParen) { depth -= 1 }
+                        advance()
+                    }
+                }
+                skipNewlines()
+                // Skip the reducer body block { ... }
+                if check(.leftBrace) {
+                    try expect(.leftBrace)
+                    var braceDepth = 1
+                    // Detect reduction kind from body
+                    while braceDepth > 0 && !check(.eof) {
+                        if check(.leftBrace) { braceDepth += 1 }
+                        if check(.rightBrace) {
+                            braceDepth -= 1
+                            if braceDepth == 0 { break }
+                        }
+                        // Detect comparison-based reduce (argmax/argmin)
+                        if checkIdentifier("GT") || checkIdentifier("GE") {
+                            if attributes.reductionKind == nil { attributes.reductionKind = .max }
+                        } else if checkIdentifier("LT") || checkIdentifier("LE") {
+                            if attributes.reductionKind == nil { attributes.reductionKind = .min }
+                        }
+                        advance()
+                    }
+                    try expect(.rightBrace)
+                }
+            }
+        }
+
         return (operands, attributes, resultType)
     }
 
@@ -556,20 +597,23 @@ public final class Parser {
 
         // Check which format we're parsing
         if check(.leftParen) {
-            // Format 1: (%input init: %init)
-            try expect(.leftParen)
+            // Format 1: (%input init: %init) [, (%input2 init: %init2)]
+            // Supports multi-input reduce used by argmax/argmin
+            repeat {
+                try expect(.leftParen)
 
-            // Parse input operand
-            let inputOperand = try parsePercentIdentifier()
-            operands.append(inputOperand)
+                // Parse input operand
+                let inputOperand = try parsePercentIdentifier()
+                operands.append(inputOperand)
 
-            // Parse "init:" and init operand
-            try expectIdentifier("init")
-            try expect(.colon)
-            let initOperand = try parsePercentIdentifier()
-            operands.append(initOperand)
+                // Parse "init:" and init operand
+                try expectIdentifier("init")
+                try expect(.colon)
+                let initOperand = try parsePercentIdentifier()
+                operands.append(initOperand)
 
-            try expect(.rightParen)
+                try expect(.rightParen)
+            } while match(.comma) && check(.leftParen)
         } else {
             // Format 2: %input, %init
             // Parse input operand
@@ -609,6 +653,14 @@ public final class Parser {
                 try expect(.equal)
                 attributes.dimensions = try parseDimensionList()
             }
+        }
+
+        // Parse: across dimensions = [0]
+        if checkIdentifier("across") {
+            try expectIdentifier("across")
+            try expectIdentifier("dimensions")
+            try expect(.equal)
+            attributes.dimensions = try parseDimensionList()
         }
 
         return (operands, attributes)

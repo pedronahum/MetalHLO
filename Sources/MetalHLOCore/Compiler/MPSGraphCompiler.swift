@@ -884,6 +884,46 @@ public final class MPSGraphCompiler {
     }
 
     private func compileReduce(_ op: HLOOperation) throws -> MPSGraphTensor {
+        // Multi-input reduce: argmax/argmin pattern with 4 operands
+        // (input_values, input_indices, init_value, init_index)
+        // Returns 2 results: (max/min value, argmax/argmin index)
+        if op.operands.count >= 4 && op.resultCount >= 2 {
+            let values = try getOperand(op.operands[0])
+            let axes = op.attributes.dimensions ?? []
+            let axesNS = axes.map { NSNumber(value: $0) }
+
+            let kind = op.attributes.reductionKind ?? .max
+
+            // Compute max/min value
+            let reducedValue: MPSGraphTensor
+            let argReducedIndex: MPSGraphTensor
+            switch kind {
+            case .max:
+                reducedValue = graph.reductionMaximum(with: values, axes: axesNS, name: nil)
+                argReducedIndex = graph.reductionArgMaximum(with: values, axis: axes.first ?? 0, name: nil)
+            case .min:
+                reducedValue = graph.reductionMinimum(with: values, axes: axesNS, name: nil)
+                argReducedIndex = graph.reductionArgMinimum(with: values, axis: axes.first ?? 0, name: nil)
+            default:
+                throw CompilationError.unsupportedOperation("multi-input reduce with kind \(kind)")
+            }
+
+            // Reshape both outputs
+            let reshapedValue = graph.reshape(reducedValue, shape: op.resultType.mpsShape, name: "\(op.result)_val")
+            let reshapedIndex = graph.reshape(
+                graph.cast(argReducedIndex, to: .int32, name: "\(op.result)_idx_cast"),
+                shape: op.resultType.mpsShape,
+                name: "\(op.result)_idx"
+            )
+
+            // Store both results with indexed names
+            valueMap["\(op.result).0"] = reshapedValue
+            valueMap["\(op.result).1"] = reshapedIndex
+            tupleOutputCounts[op.result] = 2
+
+            return reshapedValue
+        }
+
         let input = try getOperand(op.operands[0])
         let axes = op.attributes.dimensions ?? []
         let axesNS = axes.map { NSNumber(value: $0) }
@@ -1825,7 +1865,7 @@ public final class MPSGraphCompiler {
         // at the position specified by indices. Common for at[i].set() operations.
         // Strategy: expand updates to include size-1 dims for inserted_window_dims,
         // then use scatterAlongAxis with matching indices shape.
-        // Debug: print("[scatter] updateWindowDims=\(updateWindowDims) insertedWindowDims=\(insertedWindowDims) updatesRank=\(updatesRank) operandRank=\(operandRank)")
+        // Debug: fputs("[scatter-mps] uwDims=\(updateWindowDims) iwDims=\(insertedWindowDims) uRank=\(updatesRank) oRank=\(operandRank)\n", stderr)
         if updateWindowDims.count == updatesRank &&
            insertedWindowDims.count + updateWindowDims.count == operandRank &&
            insertedWindowDims.count == 1 {
@@ -1888,30 +1928,43 @@ public final class MPSGraphCompiler {
             processedIndices = scatterIndices
         }
 
-        // For simple scatter without batching, use scatterND
-        // For scatterAlongAxis, indices must have same shape as updates
-        // Reshape and broadcast indices to match updates shape
-        var reshapeForBroadcast: [NSNumber] = processedIndices.shape?.map { $0 } ?? []
-        while reshapeForBroadcast.count < updatesShape.count {
-            reshapeForBroadcast.append(1)
-        }
+        // Determine the scatter axis from dimension numbers
+        let scatterAxis = dimNumbers.scatterDimsToOperandDims.first ?? 0
 
+        // For scatterAlongAxis, ALL tensors (data, updates, indices) must have the SAME rank
+        // and the same shape EXCEPT at the scatter axis.
+        // Build the target shape for updates: match operand shape except scatter axis gets updates count.
+        var updatesTargetShape: [NSNumber] = operandShape.map { NSNumber(value: $0) }
+        // The scatter axis in updates should reflect the number of scatter points
+        let scatterCount = indicesShape.isEmpty ? 1 : indicesShape[0]
+        updatesTargetShape[scatterAxis] = NSNumber(value: scatterCount)
+
+        let reshapedUpdates = graph.reshape(
+            updates,
+            shape: updatesTargetShape,
+            name: "\(op.result)_updates_reshape"
+        )
+
+        // Reshape indices to match: same shape as updatesTargetShape
+        var indicesTargetShape: [NSNumber] = updatesTargetShape.map { _ in NSNumber(value: 1) }
+        indicesTargetShape[scatterAxis] = NSNumber(value: scatterCount)
         let reshapedIndices = graph.reshape(
             processedIndices,
-            shape: reshapeForBroadcast,
+            shape: indicesTargetShape,
             name: "\(op.result)_indices_reshape"
         )
 
+        // Broadcast indices to match updates shape
         let broadcastIndices = graph.broadcast(
             reshapedIndices,
-            shape: updatesShape,
+            shape: updatesTargetShape,
             name: "\(op.result)_indices_broadcast"
         )
 
         return graph.scatterAlongAxis(
-            0,
+            scatterAxis,
             data: operand,
-            updates: updates,
+            updates: reshapedUpdates,
             indices: broadcastIndices,
             mode: scatterMode,
             name: op.result
@@ -3342,6 +3395,14 @@ public final class MPSGraphCompiler {
                     if let result = result {
                         localValueMap[operation.result] = result
                         lastResult = result
+                        if operation.resultCount > 1 {
+                            for idx in 0..<operation.resultCount {
+                                let indexedName = "\(operation.result).\(idx)"
+                                if let indexedTensor = self.valueMap[indexedName] {
+                                    localValueMap[indexedName] = indexedTensor
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -3368,12 +3429,27 @@ public final class MPSGraphCompiler {
 
                 // Compile operations in body region
                 for operation in bodyRegion.operations {
-                    let result = try? self.compileRegionOperation(
-                        operation,
-                        localValueMap: &localValueMap
-                    )
+                    let result: MPSGraphTensor?
+                    do {
+                        result = try self.compileRegionOperation(
+                            operation,
+                            localValueMap: &localValueMap
+                        )
+                    } catch {
+                        fputs("[while body] Failed to compile \(operation.kind.rawValue) \(operation.result): \(error)\n", stderr)
+                        result = nil
+                    }
                     if let result = result {
                         localValueMap[operation.result] = result
+                        // Handle multi-result operations (call, while) within body
+                        if operation.resultCount > 1 {
+                            for idx in 0..<operation.resultCount {
+                                let indexedName = "\(operation.result).\(idx)"
+                                if let indexedTensor = self.valueMap[indexedName] {
+                                    localValueMap[indexedName] = indexedTensor
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -3381,6 +3457,8 @@ public final class MPSGraphCompiler {
                 var outputs: [MPSGraphTensor] = []
                 for returnVal in bodyRegion.returnValues {
                     if let tensor = localValueMap[returnVal] {
+                        outputs.append(tensor)
+                    } else if let tensor = self.valueMap[returnVal] {
                         outputs.append(tensor)
                     }
                 }
@@ -3576,6 +3654,18 @@ public final class MPSGraphCompiler {
             let trueVal = try getLocalOperand(op.operands[1])
             let falseVal = try getLocalOperand(op.operands[2])
             return graph.select(predicate: condition, trueTensor: trueVal, falseTensor: falseVal, name: op.result)
+
+        case .convert:
+            let input = try getLocalOperand(op.operands[0])
+            return graph.cast(input, to: op.resultType.elementType.mpsDataType, name: op.result)
+
+        case .broadcastInDim:
+            let input = try getLocalOperand(op.operands[0])
+            return graph.broadcast(input, shape: op.resultType.mpsShape, name: op.result)
+
+        case .reshape:
+            let input = try getLocalOperand(op.operands[0])
+            return graph.reshape(input, shape: op.resultType.mpsShape, name: op.result)
 
         case .constant:
             guard let constantValue = op.attributes.constantValue else {

@@ -355,11 +355,23 @@ func pjrt_client_compile(
     }
 
     do {
-        let config = CompilationConfig(
-            optimizationLevel: .O2,
-            devicePolicy: resolveDevicePolicy()
-        )
-        let executable = try impl.client.compile(mlirSource, config: config)
+        // Detect control flow (while, call, private functions) that the integrated
+        // Metal kernel compiler can't handle. Fall back to the MPSGraph path which
+        // supports while loops natively and can inline function calls.
+        let needsMPSGraph = mlirSource.contains("stablehlo.while")
+            || mlirSource.contains("call @")
+            || mlirSource.contains("func.func private")
+
+        let executable: Executable
+        if needsMPSGraph {
+            executable = try impl.client.compile(mlirSource)
+        } else {
+            let config = CompilationConfig(
+                optimizationLevel: .O2,
+                devicePolicy: resolveDevicePolicy()
+            )
+            executable = try impl.client.compile(mlirSource, config: config)
+        }
 
         let meta = PJRTExecutableImpl(
             name: "metalhlo_program",
