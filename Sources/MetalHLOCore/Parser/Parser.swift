@@ -44,21 +44,35 @@ public final class Parser {
         try expect(.leftBrace)
         skipNewlines()
 
-        // Parse function
-        let function = try parseFunction()
-        skipNewlines()
+        // Parse all functions in the module
+        var functions: [HLOFunction] = []
+        while !check(.rightBrace) && !check(.eof) {
+            if checkIdentifier("func.func") || checkIdentifier("func") {
+                let function = try parseFunction()
+                functions.append(function)
+            } else {
+                // Skip unknown top-level declarations (e.g., sdy.mesh)
+                advance()
+            }
+            skipNewlines()
+        }
 
         // Expect: }
         try expect(.rightBrace)
 
-        return HLOModule(name: moduleName, function: function)
+        return HLOModule(name: moduleName, functions: functions)
     }
 
     // MARK: - Function Parsing
 
     private func parseFunction() throws -> HLOFunction {
-        // Expect: func.func @main(args) -> (return_types) {
+        // Expect: func.func [private] @name(args) -> (return_types) {
         try expectIdentifier("func.func")
+
+        // Check for 'private' visibility
+        let isPrivate = checkIdentifier("private")
+        if isPrivate { advance() }
+
         let funcName = try parseAtIdentifier()
         let inputs = try parseFunctionArguments()
         try expect(.arrow)
@@ -117,6 +131,7 @@ public final class Parser {
 
         return HLOFunction(
             name: funcName,
+            isPrivate: isPrivate,
             inputs: inputs,
             outputTypes: outputTypes,
             operations: operations,
@@ -142,18 +157,25 @@ public final class Parser {
     }
 
     private func parseReturnTypes() throws -> [TensorType] {
-        try expect(.leftParen)
-        var types: [TensorType] = []
+        // Handle both parenthesized: -> (type1, type2)
+        // and bare: -> type
+        if match(.leftParen) {
+            var types: [TensorType] = []
 
-        if !check(.rightParen) {
-            repeat {
-                let type = try parseTensorType()
-                types.append(type)
-            } while match(.comma)
+            if !check(.rightParen) {
+                repeat {
+                    let type = try parseTensorType()
+                    types.append(type)
+                } while match(.comma)
+            }
+
+            try expect(.rightParen)
+            return types
+        } else {
+            // Bare return type (e.g., -> tensor<3x3xf32>)
+            let type = try parseTensorType()
+            return [type]
         }
-
-        try expect(.rightParen)
-        return types
     }
 
     private func parseReturn() throws -> [String] {
@@ -189,7 +211,18 @@ public final class Parser {
 
     private func parseOperation() throws -> HLOOperation {
         // Format: %result = stablehlo.op operands attributes : type
+        //     or: %result:N = stablehlo.op ... (multi-result, e.g., while, call)
         let result = try parsePercentIdentifier()
+
+        // Check for multi-result syntax: %name:N
+        var resultCount = 1
+        if match(.colon) {
+            if case .integer(let count) = currentToken.kind {
+                resultCount = Int(count)
+                advance()
+            }
+        }
+
         try expect(.equal)
 
         // Parse operation name (e.g., stablehlo.add)
@@ -204,7 +237,8 @@ public final class Parser {
             kind: kind,
             operands: operands,
             resultType: resultType,
-            attributes: attributes
+            attributes: attributes,
+            resultCount: resultCount
         )
     }
 
@@ -249,6 +283,11 @@ public final class Parser {
     }
 
     private func parseOpKind(from name: String) throws -> HLOOpKind {
+        // Handle function calls: "call" or "func.call"
+        if name == "call" || name == "func.call" {
+            return .call
+        }
+
         // Extract the operation name after "stablehlo."
         let opName: String
         if name.hasPrefix("stablehlo.") {
@@ -292,6 +331,16 @@ public final class Parser {
         } else if kind == .getTupleElement {
             // Special handling for get_tuple_element: %tuple[index]
             (operands, attributes) = try parseGetTupleElementOperandsAndAttributes()
+        } else if kind == .call {
+            // func.call @name(%arg0, %arg1) : (input_types) -> (output_types)
+            (operands, attributes) = try parseCallOperandsAndAttributes()
+        } else if kind == .whileOp && check(.leftParen) {
+            // JAX-emitted while format:
+            //   stablehlo.while(%iterArg = %c_0, %iterArg_1 = %arg0) : tensor<i32>, tensor<i32>
+            //   cond { ... } do { ... }
+            // This format includes type annotation and regions inline, so return directly.
+            let (whileOperands, whileAttrs, whileType) = try parseWhileBindingsAndRegions()
+            return (whileOperands, whileAttrs, whileType)
         } else {
             // Parse operands (% identifiers before attributes/type)
             while check(.percentIdentifier) {
@@ -309,6 +358,28 @@ public final class Parser {
         let resultType = try parseTypeSignature(for: kind)
 
         return (operands, attributes, resultType)
+    }
+
+    /// Parse func.call operands: @name(%arg0, %arg1) : (in_types) -> (out_types)
+    private func parseCallOperandsAndAttributes() throws -> ([String], HLOAttributes) {
+        var operands: [String] = []
+        var attributes = HLOAttributes()
+
+        // Parse target function name: @name
+        let targetName = try parseAtIdentifier()
+        attributes.functionCallTarget = targetName
+
+        // Parse operands: (%arg0, %arg1, ...)
+        try expect(.leftParen)
+        if !check(.rightParen) {
+            repeat {
+                let operand = try parsePercentIdentifier()
+                operands.append(operand)
+            } while match(.comma)
+        }
+        try expect(.rightParen)
+
+        return (operands, attributes)
     }
 
     /// Parse custom_call operands and attributes in the format: @target(operands) { backend_config = "..." }
@@ -458,6 +529,18 @@ public final class Parser {
                 }
             }
             try expect(.rightBrace)
+        }
+
+        // Parse region if present AFTER attribute block (e.g., scatter in JAX-emitted MLIR).
+        // JAX emits: operands, attributes, region — unlike the MLIR spec order (operands, region, attributes).
+        if check(.leftParen) {
+            let computationKind = try parseOperationRegion()
+            if kind == .scatter {
+                // Only set if not already determined by the attribute block
+                if attributes.scatterComputationKind == nil {
+                    attributes.scatterComputationKind = computationKind
+                }
+            }
         }
 
         return (operands, attributes)
@@ -1483,6 +1566,114 @@ public final class Parser {
         return WhileRegions(condition: condRegion, body: bodyRegion)
     }
 
+    /// Parses JAX-emitted while format with inline bindings.
+    /// Format: (%iterArg = %val0, %iterArg_1 = %val1) : T0, T1
+    ///         cond { ops using %iterArg... } do { ops using %iterArg... }
+    /// Returns (operands, attributes, resultType) — the type of the first result.
+    private func parseWhileBindingsAndRegions() throws -> ([String], HLOAttributes, TensorType) {
+        var operands: [String] = []
+        var bindingNames: [String] = []
+        var attributes = HLOAttributes()
+
+        // Parse bindings: (%iterArg = %val, ...)
+        try expect(.leftParen)
+        if !check(.rightParen) {
+            repeat {
+                let bindingName = try parsePercentIdentifier()
+                bindingNames.append(bindingName)
+                try expect(.equal)
+                let value = try parsePercentIdentifier()
+                operands.append(value)
+            } while match(.comma)
+        }
+        try expect(.rightParen)
+
+        // Parse type annotations: : T0, T1, ...
+        try expect(.colon)
+        var types: [TensorType] = []
+        repeat {
+            let type = try parseTensorType()
+            types.append(type)
+        } while match(.comma)
+
+        // Build region arguments from bindings + types
+        var regionArgs: [RegionArgument] = []
+        for (i, name) in bindingNames.enumerated() {
+            let type = i < types.count ? types[i] : types.last ?? TensorType(shape: [], elementType: .float32)
+            regionArgs.append(RegionArgument(name: name, type: type))
+        }
+
+        skipNewlines()
+
+        // Parse cond region (no ^bb header — uses binding names directly)
+        try expectIdentifier("cond")
+        let condRegion = try parseRegion(implicitArguments: regionArgs)
+
+        // Parse body region
+        skipNewlines()
+        try expectIdentifier("do")
+        let bodyRegion = try parseRegion(implicitArguments: regionArgs)
+
+        attributes.whileRegions = WhileRegions(condition: condRegion, body: bodyRegion)
+
+        let resultType = types.first ?? TensorType(shape: [], elementType: .float32)
+        return (operands, attributes, resultType)
+    }
+
+    /// Parses a region block, optionally injecting implicit arguments when no ^bb header is present.
+    private func parseRegion(implicitArguments: [RegionArgument]? = nil) throws -> Region {
+        try expect(.leftBrace)
+        skipNewlines()
+
+        var arguments: [RegionArgument] = []
+        var operations: [HLOOperation] = []
+        var returnValues: [String] = []
+
+        // Check for block label with arguments: ^bb(%arg0: type, ...)
+        if currentToken.text == "^" {
+            advance()
+            if check(.identifier) { advance() }
+            if check(.leftParen) {
+                try expect(.leftParen)
+                if !check(.rightParen) {
+                    repeat {
+                        let name = try parsePercentIdentifier()
+                        try expect(.colon)
+                        let type = try parseTensorType()
+                        arguments.append(RegionArgument(name: name, type: type))
+                    } while match(.comma)
+                }
+                try expect(.rightParen)
+                _ = match(.colon)
+            }
+        } else if let implicit = implicitArguments {
+            // No ^bb header — use implicit arguments from while bindings
+            arguments = implicit
+        }
+
+        skipNewlines()
+
+        // Parse operations until stablehlo.return or }
+        while !check(.rightBrace) && !check(.eof) {
+            if checkIdentifier("stablehlo.return") {
+                returnValues = try parseStablehloReturn()
+                break
+            }
+            let op = try parseOperation()
+            operations.append(op)
+            skipNewlines()
+        }
+
+        skipNewlines()
+        try expect(.rightBrace)
+
+        return Region(
+            arguments: arguments,
+            operations: operations,
+            returnValues: returnValues
+        )
+    }
+
     /// Parses if conditional regions.
     /// Format: then { ... } else { ... }
     private func parseIfRegions() throws -> IfRegions {
@@ -1566,65 +1757,6 @@ public final class Parser {
         }
 
         return computationKind
-    }
-
-    /// Parses a region block.
-    /// Format: { ^bb(%arg0: type, ...): ops... stablehlo.return %vals }
-    private func parseRegion() throws -> Region {
-        try expect(.leftBrace)
-        skipNewlines()
-
-        var arguments: [RegionArgument] = []
-        var operations: [HLOOperation] = []
-        var returnValues: [String] = []
-
-        // Check for block label with arguments: ^bb(%arg0: type, ...)
-        // The lexer tokenizes this as: ^ (unknown), bb (identifier), ( , args..., ), :
-        if currentToken.text == "^" {
-            // Skip the ^ token
-            advance()
-            // Skip the block label identifier (e.g., "bb")
-            if check(.identifier) {
-                advance()
-            }
-            // Parse block arguments if present
-            if check(.leftParen) {
-                try expect(.leftParen)
-                if !check(.rightParen) {
-                    repeat {
-                        let name = try parsePercentIdentifier()
-                        try expect(.colon)
-                        let type = try parseTensorType()
-                        arguments.append(RegionArgument(name: name, type: type))
-                    } while match(.comma)
-                }
-                try expect(.rightParen)
-                _ = match(.colon)  // Optional colon after block args
-            }
-        }
-
-        skipNewlines()
-
-        // Parse operations until stablehlo.return or }
-        while !check(.rightBrace) && !check(.eof) {
-            // Check for stablehlo.return
-            if checkIdentifier("stablehlo.return") {
-                returnValues = try parseStablehloReturn()
-                break
-            }
-            let op = try parseOperation()
-            operations.append(op)
-            skipNewlines()
-        }
-
-        skipNewlines()
-        try expect(.rightBrace)
-
-        return Region(
-            arguments: arguments,
-            operations: operations,
-            returnValues: returnValues
-        )
     }
 
     /// Parses stablehlo.return statement.
@@ -1729,6 +1861,7 @@ public final class Parser {
     private func parseTypeSignature(for kind: HLOOpKind = .add) throws -> TensorType {
         // Handle both simple types: tensor<2x3xf32>
         // and function-like types: (tensor<2x3xf32>, tensor<2x3xf32>) -> tensor<2x3xf32>
+        //                      or: (tensor<i32>) -> (tensor<i32>, tensor<i32>)
 
         if check(.leftParen) {
             // Function-like signature, skip to return type
@@ -1740,6 +1873,19 @@ public final class Parser {
                 advance()
             }
             try expect(.arrow)
+
+            // Handle multi-result return: (type1, type2, ...)
+            if check(.leftParen) {
+                try expect(.leftParen)
+                let firstType = try parseTensorType()
+                // Skip remaining types
+                while match(.comma) {
+                    _ = try parseTensorType()
+                }
+                try expect(.rightParen)
+                return firstType
+            }
+
             return try parseTensorType()
         }
 
@@ -1795,7 +1941,20 @@ public final class Parser {
         // Parse the constant data
         let value: ConstantValue
 
-        if check(.leftBracket) {
+        if check(.rightAngle) {
+            // Empty tensor: dense<> for zero-element tensors
+            value = .dense([], TensorType(shape: [0], elementType: .int32))
+        } else if case .string(let hexStr) = currentToken.kind {
+            // Hex-encoded byte buffer: dense<"0x6F12833A..."> for raw float data
+            advance()
+            value = .hexBytes(hexStr)
+        } else if checkKeyword(.true_) {
+            advance()
+            value = .scalar(1.0)
+        } else if checkKeyword(.false_) {
+            advance()
+            value = .scalar(0.0)
+        } else if check(.leftBracket) {
             // Dense array
             let values = try parseDenseArray()
             // We'll get the type from the type signature later
@@ -2433,8 +2592,18 @@ public final class Parser {
         guard case .percentIdentifier = currentToken.kind else {
             throw ParseError.unexpectedToken(expected: "%identifier", got: currentToken)
         }
-        let name = currentToken.text
+        var name = currentToken.text
         advance()
+
+        // Handle element access syntax: %name#N → %name.N
+        // Used by multi-result operations (while, call) to reference individual outputs.
+        // The compiler stores multi-result outputs as "%name.0", "%name.1", etc.
+        if case .hashIdentifier = currentToken.kind {
+            let indexStr = String(currentToken.text.dropFirst())  // Remove '#'
+            name = "\(name).\(indexStr)"
+            advance()
+        }
+
         return name
     }
 }

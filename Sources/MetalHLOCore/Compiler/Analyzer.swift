@@ -928,6 +928,8 @@ public final class Analyzer: @unchecked Sendable {
         case .dense(let values, _):
             // For dense, return first value if it's a single-element tensor
             return values.first
+        case .hexBytes:
+            return nil
         }
     }
 

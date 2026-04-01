@@ -37,7 +37,7 @@ def main():
     # Convert generic form inherent attributes <{...}> to {...} for parser compatibility
     # Matches ") <{" at end of generic form operand list and "}>" at end of attribute block
     text = text.replace("<{", "{")
-    text = re.sub(r"\}>\s*:", "} :", text)
+    text = text.replace("}>", "}")
 
     # Convert dynamic_slice 'sizes' attribute to 'slice_sizes' for parser compatibility
     text = re.sub(r",\s*sizes\s*=\s*\[", ", slice_sizes = [", text)

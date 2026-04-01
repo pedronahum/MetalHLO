@@ -43,7 +43,7 @@ private func convertBytecodeToText(_ bytecode: Data) -> Result<String, BytecodeE
         text = re.sub(r',\s*precision\s*=\s*\[[^\]]*\]', '', text)
         # Convert generic form inherent attributes <{...}> to {...}
         text = text.replace('<{', '{')
-        text = re.sub(r'\}>\s*:', '} :', text)
+        text = text.replace('}>', '}')
         # Convert dynamic_slice 'sizes' to 'slice_sizes'
         text = re.sub(r',\s*sizes\s*=\s*\[', ', slice_sizes = [', text)
         # Convert convolution parenthesized operands to standard form

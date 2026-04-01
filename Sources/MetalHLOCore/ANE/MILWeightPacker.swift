@@ -90,6 +90,26 @@ internal final class MILWeightPacker {
                     size: data.count
                 )
             }
+
+        case .hexBytes(let hexStr):
+            // Decode hex string to raw bytes and pack as blob
+            var bytes = [UInt8]()
+            var index = hexStr.startIndex
+            while index < hexStr.endIndex {
+                let nextIndex = hexStr.index(index, offsetBy: 2, limitedBy: hexStr.endIndex) ?? hexStr.endIndex
+                if let byte = UInt8(hexStr[index..<nextIndex], radix: 16) {
+                    bytes.append(byte)
+                }
+                index = nextIndex
+            }
+            let data = Data(bytes)
+            let offset = appendBlob(data, name: name)
+            builder.emitBlobConst(
+                name: name,
+                shape: shape,
+                offset: offset,
+                size: data.count
+            )
         }
     }
 

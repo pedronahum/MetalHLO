@@ -1108,15 +1108,28 @@ public final class CodeGenerator: @unchecked Sendable {
         operandType: String,
         indicesType: String
     ) -> String {
-        let numIndices = indicesShape.isEmpty ? 0 : indicesShape[0]
         let totalOperandElements = operandShape.reduce(1, *)
 
-        // Calculate the size of each update slice (elements per scatter row)
+        // Calculate the number of scatter indices and slice size.
+        // For window scatter (update_window_dims covers all update dims),
+        // the slice includes all update elements per index.
+        // For per-element scatter, the slice is the trailing update dimensions.
+        let numIndices: Int
         let sliceSize: Int
-        if updatesShape.count > 1 {
-            sliceSize = updatesShape.dropFirst().reduce(1, *)
-        } else {
+        if dimNumbers.updateWindowDims.count == updatesShape.count {
+            // Window scatter: entire update is placed at each index position
+            numIndices = 1  // Only one scatter position per update tensor
+            sliceSize = updatesShape.reduce(1, *)
+        } else if indicesShape.isEmpty {
+            numIndices = 0
             sliceSize = 1
+        } else {
+            numIndices = indicesShape[0]
+            if updatesShape.count > 1 {
+                sliceSize = updatesShape.dropFirst().reduce(1, *)
+            } else {
+                sliceSize = 1
+            }
         }
 
         let totalUpdateElements = updatesShape.reduce(1, *)

@@ -20,6 +20,7 @@ public final class MPSGraphCompiler {
     private var typeMap: [String: TensorType] = [:]
     private var scalarConstantMap: [String: Double] = [:]  // Track scalar constants for ops like pad
     private var tupleOutputCounts: [String: Int] = [:]  // Track multi-output operations (while, if)
+    private var currentModule: HLOModule?  // Module reference for function call resolution
 
     // MARK: - Initialization
 
@@ -39,6 +40,7 @@ public final class MPSGraphCompiler {
     /// - Throws: `CompilationError` if compilation fails.
     /// - Returns: A compiled graph ready for execution.
     public func compile(module: HLOModule) throws -> CompiledGraph {
+        currentModule = module
         let function = module.function
 
         // Detect Flash Attention shortcut: if the function is a single SDPA op with
@@ -467,6 +469,10 @@ public final class MPSGraphCompiler {
         // Custom calls (fused operations from Magma)
         case .customCall:
             return try compileCustomCall(op)
+
+        // Function calls — inline the called function
+        case .call:
+            return try compileCall(op)
         }
     }
 
@@ -504,6 +510,66 @@ public final class MPSGraphCompiler {
         } catch let error as CustomCallError {
             throw CompilationError.invalidAttribute(error.description, operation: "custom_call:\(target)")
         }
+    }
+
+    // MARK: - Function Call Compilation
+
+    /// Compiles a func.call by inlining the target function.
+    /// Maps call operands to the target function's arguments, compiles the body,
+    /// and maps the results back. Supports multi-result calls.
+    private func compileCall(_ op: HLOOperation) throws -> MPSGraphTensor {
+        guard let targetName = op.attributes.functionCallTarget else {
+            throw CompilationError.missingAttribute("functionCallTarget", operation: "call")
+        }
+        guard let module = currentModule else {
+            throw CompilationError.unsupportedOperation("call without module context")
+        }
+        guard let function = module.getFunction(named: targetName) else {
+            throw CompilationError.unsupportedOperation("call to unknown function '\(targetName)'")
+        }
+
+        // Map call operands to function arguments
+        for (i, arg) in function.inputs.enumerated() {
+            if i < op.operands.count {
+                let callerTensor = try getOperand(op.operands[i])
+                valueMap[arg.name] = callerTensor
+                typeMap[arg.name] = arg.type
+            }
+        }
+
+        // Compile the function body (inline)
+        for bodyOp in function.operations {
+            let result = try compileOperation(bodyOp)
+            valueMap[bodyOp.result] = result
+            typeMap[bodyOp.result] = bodyOp.resultType
+
+            // Handle multi-result operations within the inlined function
+            if bodyOp.resultCount > 1 {
+                tupleOutputCounts[bodyOp.result] = bodyOp.resultCount
+            }
+        }
+
+        // Map function return values to call results
+        var results: [MPSGraphTensor] = []
+        for returnVal in function.returnValues {
+            if let tensor = valueMap[returnVal] {
+                results.append(tensor)
+            }
+        }
+
+        // Store multi-result outputs with indexed names
+        if op.resultCount > 1 {
+            for (index, tensor) in results.enumerated() {
+                let indexedName = "\(op.result).\(index)"
+                valueMap[indexedName] = tensor
+            }
+            tupleOutputCounts[op.result] = results.count
+        }
+
+        return results.first ?? {
+            // Shouldn't happen, but create a zero tensor as fallback
+            graph.constant(0.0, shape: [1], dataType: .float32)
+        }()
     }
 
     // MARK: - Helper Methods
@@ -1745,6 +1811,64 @@ public final class MPSGraphCompiler {
             throw CompilationError.undefinedValue("\(op.result)_updates")
         }
 
+        guard let operandShape = operand.shape?.map({ $0.intValue }) else {
+            throw CompilationError.undefinedValue("\(op.result)_operand")
+        }
+
+        let operandRank = operandShape.count
+        let updatesRank = updatesShape.count
+        let updateWindowDims = dimNumbers.updateWindowDims
+        let insertedWindowDims = dimNumbers.insertedWindowDims
+
+        // FAST PATH: Window scatter (update_window_dims covers all update dims).
+        // This is effectively a dynamic_update_slice: place the full update tensor
+        // at the position specified by indices. Common for at[i].set() operations.
+        // Strategy: expand updates to include size-1 dims for inserted_window_dims,
+        // then use scatterAlongAxis with matching indices shape.
+        // Debug: print("[scatter] updateWindowDims=\(updateWindowDims) insertedWindowDims=\(insertedWindowDims) updatesRank=\(updatesRank) operandRank=\(operandRank)")
+        if updateWindowDims.count == updatesRank &&
+           insertedWindowDims.count + updateWindowDims.count == operandRank &&
+           insertedWindowDims.count == 1 {
+
+            let scatterAxis = insertedWindowDims[0]
+
+            // Reshape updates: insert size-1 dim at the scatter axis position
+            var expandedShape = [NSNumber]()
+            var windowIdx = 0
+            for dim in 0..<operandRank {
+                if dim == scatterAxis {
+                    expandedShape.append(1)
+                } else {
+                    expandedShape.append(updatesShape[windowIdx])
+                    windowIdx += 1
+                }
+            }
+            let expandedUpdates = graph.reshape(updates, shape: expandedShape, name: "\(op.result)_expand")
+
+            // Reshape indices to match expanded updates rank (broadcast to same shape)
+            var indicesExpandedShape = expandedShape.map { _ in NSNumber(value: 1) }
+            indicesExpandedShape[scatterAxis] = 1
+            let reshapedIndices = graph.reshape(
+                scatterIndices,
+                shape: indicesExpandedShape,
+                name: "\(op.result)_idx_reshape"
+            )
+            let broadcastIndices = graph.broadcast(
+                reshapedIndices,
+                shape: expandedShape,
+                name: "\(op.result)_idx_broadcast"
+            )
+
+            return graph.scatterAlongAxis(
+                scatterAxis,
+                data: operand,
+                updates: expandedUpdates,
+                indices: broadcastIndices,
+                mode: scatterMode,
+                name: op.result
+            )
+        }
+
         let indicesRank = indicesShape.count
         let indexVectorDim = dimNumbers.indexVectorDim
 
@@ -1865,6 +1989,26 @@ public final class MPSGraphCompiler {
                 data = Data(bytes: &bools, count: bools.count * MemoryLayout<UInt8>.stride)
             }
 
+            return graph.constant(
+                data,
+                shape: op.resultType.mpsShape,
+                dataType: op.resultType.elementType.mpsDataType
+            )
+
+        case .hexBytes(let hexStr):
+            // Decode hex string to raw bytes: "0x6F12833A..." → [0x6F, 0x12, 0x83, 0x3A, ...]
+            let hex = hexStr.hasPrefix("0x") ? String(hexStr.dropFirst(2)) : hexStr
+            var bytes = [UInt8]()
+            bytes.reserveCapacity(hex.count / 2)
+            var index = hex.startIndex
+            while index < hex.endIndex {
+                let nextIndex = hex.index(index, offsetBy: 2, limitedBy: hex.endIndex) ?? hex.endIndex
+                if let byte = UInt8(hex[index..<nextIndex], radix: 16) {
+                    bytes.append(byte)
+                }
+                index = nextIndex
+            }
+            let data = Data(bytes)
             return graph.constant(
                 data,
                 shape: op.resultType.mpsShape,
@@ -3444,6 +3588,16 @@ public final class MPSGraphCompiler {
                 var floats = values.map { Float($0) }
                 let data = Data(bytes: &floats, count: floats.count * MemoryLayout<Float>.stride)
                 return graph.constant(data, shape: op.resultType.mpsShape, dataType: op.resultType.elementType.mpsDataType)
+            case .hexBytes(let hexStr):
+                let hex = hexStr.hasPrefix("0x") ? String(hexStr.dropFirst(2)) : hexStr
+                var bytes = [UInt8]()
+                var index = hex.startIndex
+                while index < hex.endIndex {
+                    let nextIndex = hex.index(index, offsetBy: 2, limitedBy: hex.endIndex) ?? hex.endIndex
+                    if let byte = UInt8(hex[index..<nextIndex], radix: 16) { bytes.append(byte) }
+                    index = nextIndex
+                }
+                return graph.constant(Data(bytes), shape: op.resultType.mpsShape, dataType: op.resultType.elementType.mpsDataType)
             }
 
         default:

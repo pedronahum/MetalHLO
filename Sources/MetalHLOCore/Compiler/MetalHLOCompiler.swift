@@ -470,6 +470,24 @@ public final class MetalHLOCompiler: @unchecked Sendable {
                 result.append(0)
             }
             return result
+
+        case .hexBytes(let hexStr):
+            // Hex-encoded raw bytes - decode directly
+            var result = [UInt8]()
+            result.reserveCapacity(elementCount * elementSize)
+            var index = hexStr.startIndex
+            while index < hexStr.endIndex {
+                let nextIndex = hexStr.index(index, offsetBy: 2, limitedBy: hexStr.endIndex) ?? hexStr.endIndex
+                if let byte = UInt8(hexStr[index..<nextIndex], radix: 16) {
+                    result.append(byte)
+                }
+                index = nextIndex
+            }
+            // Pad with zeros if needed
+            while result.count < elementCount * elementSize {
+                result.append(0)
+            }
+            return result
         }
     }
 

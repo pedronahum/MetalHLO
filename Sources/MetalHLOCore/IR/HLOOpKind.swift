@@ -319,6 +319,12 @@ public enum HLOOpKind: String, CaseIterable, Sendable {
     /// - fused_gelu
     /// - fused_rope
     case customCall = "custom_call"
+
+    // MARK: - Function Calls
+
+    /// Call to a named function within the module.
+    /// Format: func.call @name(%arg0, %arg1) : (input_types) -> (output_types)
+    case call
 }
 
 // MARK: - Operation Categories
@@ -488,6 +494,9 @@ extension HLOOpKind {
 
         case .customCall:
             return .atLeast(1)  // variable inputs depending on target
+
+        case .call:
+            return .atLeast(0)  // variable inputs — may have zero args
         }
     }
 }

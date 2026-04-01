@@ -24,6 +24,10 @@ public struct HLOOperation: Sendable {
     /// Operation-specific attributes.
     public let attributes: HLOAttributes
 
+    /// Number of results produced by this operation (1 for most ops, >1 for while/call).
+    /// Multi-result ops store outputs as "%result.0", "%result.1", etc.
+    public let resultCount: Int
+
     /// Creates a new HLO operation.
     ///
     /// - Parameters:
@@ -32,18 +36,21 @@ public struct HLOOperation: Sendable {
     ///   - operands: The operand value names.
     ///   - resultType: The result type.
     ///   - attributes: The operation attributes.
+    ///   - resultCount: Number of results (default 1).
     public init(
         result: String,
         kind: HLOOpKind,
         operands: [String],
         resultType: TensorType,
-        attributes: HLOAttributes = HLOAttributes()
+        attributes: HLOAttributes = HLOAttributes(),
+        resultCount: Int = 1
     ) {
         self.result = result
         self.kind = kind
         self.operands = operands
         self.resultType = resultType
         self.attributes = attributes
+        self.resultCount = resultCount
     }
 }
 

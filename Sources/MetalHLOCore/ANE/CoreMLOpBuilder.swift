@@ -608,6 +608,8 @@ public struct CoreMLOpBuilder {
         case .dense(let values, _):
             return [CoreMLOp(result: resultName, op: "const", shape: shape,
                              params: [("val", .floatArray(values))])]
+        case .hexBytes:
+            throw MILEmitterError.invalidAttributes("hexBytes constants not supported in CoreML translation")
         }
     }
 

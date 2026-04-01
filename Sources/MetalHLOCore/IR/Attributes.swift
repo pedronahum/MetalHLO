@@ -218,6 +218,11 @@ public struct HLOAttributes: Sendable {
     /// Backend configuration JSON string for custom_call.
     public var backendConfig: String?
 
+    // MARK: - Function Call Attributes
+
+    /// Target function name for func.call operation (e.g., "closed_call").
+    public var functionCallTarget: String?
+
     // MARK: - Initialization
 
     public init() {}
@@ -454,6 +459,10 @@ public enum ConstantValue: Sendable {
 
     /// A dense constant with explicit values.
     case dense([Double], TensorType)
+
+    /// A hex-encoded byte buffer constant (e.g., dense<"0x6F12833A...">).
+    /// The string contains the hex-encoded raw bytes of the tensor data.
+    case hexBytes(String)
 }
 
 // MARK: - Control Flow Regions

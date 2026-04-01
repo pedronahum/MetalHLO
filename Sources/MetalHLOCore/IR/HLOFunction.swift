@@ -12,6 +12,9 @@ public struct HLOFunction: Sendable {
     /// The function name (typically "main").
     public let name: String
 
+    /// Whether this is a private helper function (not the entry point).
+    public let isPrivate: Bool
+
     /// The input arguments.
     public let inputs: [HLOArgument]
 
@@ -28,18 +31,21 @@ public struct HLOFunction: Sendable {
     ///
     /// - Parameters:
     ///   - name: The function name.
+    ///   - isPrivate: Whether this is a private function.
     ///   - inputs: The input arguments.
     ///   - outputTypes: The output types.
     ///   - operations: The operations.
     ///   - returnValues: The return value names.
     public init(
         name: String,
+        isPrivate: Bool = false,
         inputs: [HLOArgument],
         outputTypes: [TensorType],
         operations: [HLOOperation],
         returnValues: [String]
     ) {
         self.name = name
+        self.isPrivate = isPrivate
         self.inputs = inputs
         self.outputTypes = outputTypes
         self.operations = operations

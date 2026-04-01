@@ -221,6 +221,8 @@ private func isZero(_ value: ConstantValue) -> Bool {
         return v == 0.0
     case .dense(let values, _):
         return values.allSatisfy { $0 == 0.0 }
+    case .hexBytes:
+        return false
     }
 }
 
@@ -233,6 +235,8 @@ private func isOne(_ value: ConstantValue) -> Bool {
         return v == 1.0
     case .dense(let values, _):
         return values.allSatisfy { $0 == 1.0 }
+    case .hexBytes:
+        return false
     }
 }
 
@@ -244,6 +248,8 @@ private func getScalarValue(_ value: ConstantValue) -> Double? {
     case .splat(let v, _):
         return v
     case .dense:
+        return nil
+    case .hexBytes:
         return nil
     }
 }
