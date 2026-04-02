@@ -514,9 +514,14 @@ public final class MPSGraphCompiler {
 
     // MARK: - Function Call Compilation
 
+    /// Counter for unique call inlining prefixes to avoid name collisions.
+    private var callInlineCounter = 0
+
     /// Compiles a func.call by inlining the target function.
     /// Maps call operands to the target function's arguments, compiles the body,
     /// and maps the results back. Supports multi-result calls.
+    /// Uses unique prefixed names to prevent collisions when the same function
+    /// is inlined multiple times.
     private func compileCall(_ op: HLOOperation) throws -> MPSGraphTensor {
         guard let targetName = op.attributes.functionCallTarget else {
             throw CompilationError.missingAttribute("functionCallTarget", operation: "call")
@@ -528,31 +533,53 @@ public final class MPSGraphCompiler {
             throw CompilationError.unsupportedOperation("call to unknown function '\(targetName)'")
         }
 
-        // Map call operands to function arguments
+        // Create a unique prefix for this call site to avoid name collisions
+        // when the same function is inlined multiple times.
+        let prefix = "_call\(callInlineCounter)_"
+        callInlineCounter += 1
+
+        // Map call operands to function arguments (prefixed)
         for (i, arg) in function.inputs.enumerated() {
             if i < op.operands.count {
                 let callerTensor = try getOperand(op.operands[i])
-                valueMap[arg.name] = callerTensor
-                typeMap[arg.name] = arg.type
+                valueMap[prefix + arg.name] = callerTensor
+                typeMap[prefix + arg.name] = arg.type
             }
         }
 
-        // Compile the function body (inline)
+        // Compile the function body with prefixed names
         for bodyOp in function.operations {
-            let result = try compileOperation(bodyOp)
-            valueMap[bodyOp.result] = result
-            typeMap[bodyOp.result] = bodyOp.resultType
+            // Remap operands to use prefixed names
+            let remappedOperands = bodyOp.operands.map { operand -> String in
+                // Check if this operand refers to a value defined in this inlined function
+                if valueMap[prefix + operand] != nil {
+                    return prefix + operand
+                }
+                // Otherwise it's a reference to the caller's scope
+                return operand
+            }
+            let remappedOp = HLOOperation(
+                result: prefix + bodyOp.result,
+                kind: bodyOp.kind,
+                operands: remappedOperands,
+                resultType: bodyOp.resultType,
+                attributes: bodyOp.attributes,
+                resultCount: bodyOp.resultCount
+            )
 
-            // Handle multi-result operations within the inlined function
+            let result = try compileOperation(remappedOp)
+            valueMap[prefix + bodyOp.result] = result
+            typeMap[prefix + bodyOp.result] = bodyOp.resultType
+
             if bodyOp.resultCount > 1 {
-                tupleOutputCounts[bodyOp.result] = bodyOp.resultCount
+                tupleOutputCounts[prefix + bodyOp.result] = bodyOp.resultCount
             }
         }
 
         // Map function return values to call results
         var results: [MPSGraphTensor] = []
         for returnVal in function.returnValues {
-            if let tensor = valueMap[returnVal] {
+            if let tensor = valueMap[prefix + returnVal] {
                 results.append(tensor)
             }
         }
@@ -567,7 +594,6 @@ public final class MPSGraphCompiler {
         }
 
         return results.first ?? {
-            // Shouldn't happen, but create a zero tensor as fallback
             graph.constant(0.0, shape: [1], dataType: .float32)
         }()
     }
@@ -1930,9 +1956,20 @@ public final class MPSGraphCompiler {
             let expandedUpdates = graph.reshape(updates, shape: expandedShape, name: "\(op.result)_expand")
 
             if numIndices == 1 {
-                // Single index: coordinate mask + select
-                let coords = graph.coordinate(alongAxis: scatterAxis, withShape: operand.shape!, name: "\(op.result)_coords")
-                let coordsInt = graph.cast(coords, to: .int32, name: "\(op.result)_coords_i32")
+                // Single index: iota mask + select
+                let dimSize = operandShape[scatterAxis]
+                var iotaData = (0..<dimSize).map { Int32($0) }
+                let iotaShape: [NSNumber] = {
+                    var s = [NSNumber](repeating: 1, count: operandRank)
+                    s[scatterAxis] = NSNumber(value: dimSize)
+                    return s
+                }()
+                let iotaConst = graph.constant(
+                    Data(bytes: &iotaData, count: dimSize * MemoryLayout<Int32>.stride),
+                    shape: iotaShape,
+                    dataType: .int32
+                )
+                let coordsInt = graph.broadcast(iotaConst, shape: operand.shape!.map { $0 }, name: "\(op.result)_iota")
                 let indexBroadcast = graph.broadcast(
                     graph.cast(scatterIndices, to: .int32, name: "\(op.result)_idx_i32"),
                     shape: operand.shape!,
@@ -1975,6 +2012,8 @@ public final class MPSGraphCompiler {
         }
 
         // Pattern C: multi-axis window scatter (2+ inserted dims)
+        // e.g., at[i, :, j].set(val) → iwd=[0,2], sdtod=[0,2], uwd=[0]
+        // Build coordinate masks for each inserted dim, AND them, then select.
         if updateWindowDims.count == updatesRank &&
            insertedWindowDims.count >= 2 &&
            insertedWindowDims.count == dimNumbers.scatterDimsToOperandDims.count &&
@@ -1982,11 +2021,23 @@ public final class MPSGraphCompiler {
 
             let castIndices = graph.cast(scatterIndices, to: .int32, name: "\(op.result)_idx_i32")
 
-            // Build mask: AND of (coord_dim_k == index_k) for each inserted dim
+            // Build mask: AND of (iota_along_dim_k == index_k) for each inserted dim
+            // Use iota (built from constant data) instead of graph.coordinate for reliability
             var combinedMask: MPSGraphTensor? = nil
             for (k, scatterDim) in insertedWindowDims.enumerated() {
-                let coords = graph.coordinate(alongAxis: scatterDim, withShape: operand.shape!, name: "\(op.result)_coord_\(scatterDim)")
-                let coordsInt = graph.cast(coords, to: .int32, name: "\(op.result)_coord_i32_\(scatterDim)")
+                let dimSize = operandShape[scatterDim]
+                // Build iota data along this axis: [0, 1, 2, ..., dimSize-1]
+                var iotaData = (0..<dimSize).map { Int32($0) }
+                let iotaConstant = graph.constant(
+                    Data(bytes: &iotaData, count: dimSize * MemoryLayout<Int32>.stride),
+                    shape: { () -> [NSNumber] in
+                        var s = [NSNumber](repeating: 1, count: operandRank)
+                        s[scatterDim] = NSNumber(value: dimSize)
+                        return s
+                    }(),
+                    dataType: .int32
+                )
+                let coordsInt = graph.broadcast(iotaConstant, shape: operand.shape!.map { $0 }, name: "\(op.result)_iota_\(scatterDim)")
 
                 let idxVal = graph.sliceTensor(castIndices, dimension: 0, start: k, length: 1, name: "\(op.result)_ival_\(k)")
                 let idxBroadcast = graph.broadcast(idxVal, shape: operand.shape!, name: "\(op.result)_ibcast_\(k)")
@@ -3243,27 +3294,89 @@ public final class MPSGraphCompiler {
     }
 
     private func compileDynamicUpdateSlice(_ op: HLOOperation) throws -> MPSGraphTensor {
-        // Dynamic update slice
         let operand = try getOperand(op.operands[0])
         let update = try getOperand(op.operands[1])
 
-        // Start indices come from remaining operands
-        // This is a simplified implementation using scatter
-        guard let updateShape = update.shape else {
-            throw CompilationError.unsupportedOperation("dynamic_update_slice requires known update shape")
+        guard let operandShape = operand.shape, let updateShape = update.shape else {
+            throw CompilationError.unsupportedOperation("dynamic_update_slice requires known shapes")
         }
 
-        // Create indices for scatter
-        let zeros = graph.constant(0.0, shape: updateShape, dataType: .int32)
+        let rank = operandShape.count
 
-        return graph.scatterAlongAxis(
+        // Collect start index tensors from operands[2:]
+        var startIndices: [MPSGraphTensor] = []
+        for i in 2..<op.operands.count {
+            startIndices.append(try getOperand(op.operands[i]))
+        }
+
+        // If shapes are identical, the update replaces the entire operand
+        if operandShape == updateShape {
+            return graph.identity(with: update, name: op.result)
+        }
+
+        let totalElements = operandShape.reduce(1) { $0 * $1.intValue }
+        let updateElements = updateShape.reduce(1) { $0 * $1.intValue }
+
+        // Compute operand strides (row-major)
+        var operandStrides = [Int](repeating: 1, count: rank)
+        for i in stride(from: rank - 2, through: 0, by: -1) {
+            operandStrides[i] = operandStrides[i + 1] * operandShape[i + 1].intValue
+        }
+
+        // Static offsets: for each flat update element, compute its offset relative to
+        // the start position in the flattened operand
+        var staticOffsets = [Int32](repeating: 0, count: updateElements)
+        for flatIdx in 0..<updateElements {
+            var remaining = flatIdx
+            var offset: Int32 = 0
+            for d in 0..<rank {
+                var updateStride = 1
+                for dd in (d + 1)..<rank { updateStride *= updateShape[dd].intValue }
+                let coord = remaining / updateStride
+                remaining %= updateStride
+                offset += Int32(coord * operandStrides[d])
+            }
+            staticOffsets[flatIdx] = offset
+        }
+
+        let staticData = staticOffsets.withUnsafeBufferPointer { Data(buffer: $0) }
+        let staticTensor = graph.constant(staticData, shape: [NSNumber(value: updateElements)], dataType: .int32)
+
+        // Dynamic base offset: sum of clamped_start[i] * operand_stride[i]
+        let zeroScalar = graph.constant(0, dataType: .int32)
+        var dynamicBase = zeroScalar
+        for i in 0..<rank {
+            let maxStart = operandShape[i].intValue - updateShape[i].intValue
+            if maxStart <= 0 { continue }  // no offset needed on this axis
+            let castIdx = graph.cast(startIndices[i], to: .int32, name: nil)
+            let clampedIdx = graph.clamp(
+                castIdx,
+                min: zeroScalar,
+                max: graph.constant(Double(maxStart), dataType: .int32),
+                name: nil
+            )
+            let strideTensor = graph.constant(Double(operandStrides[i]), dataType: .int32)
+            let term = graph.multiplication(clampedIdx, strideTensor, name: nil)
+            dynamicBase = graph.addition(dynamicBase, term, name: nil)
+        }
+
+        // Final flat indices = staticOffsets + dynamicBase (broadcast scalar)
+        let flatIndices = graph.addition(staticTensor, dynamicBase, name: nil)
+
+        // Flatten, scatter, reshape back
+        let flatOperand = graph.reshape(operand, shape: [NSNumber(value: totalElements)], name: nil)
+        let flatUpdate = graph.reshape(update, shape: [NSNumber(value: updateElements)], name: nil)
+
+        let flatResult = graph.scatterAlongAxis(
             0,
-            data: operand,
-            updates: update,
-            indices: zeros,
+            data: flatOperand,
+            updates: flatUpdate,
+            indices: flatIndices,
             mode: .set,
-            name: op.result
+            name: nil
         )
+
+        return graph.reshape(flatResult, shape: operandShape, name: op.result)
     }
 
     private func compileDynamicPad(_ op: HLOOperation) throws -> MPSGraphTensor {
