@@ -4051,14 +4051,29 @@ public final class MPSGraphCompiler {
             }
 
         default:
-            // For unsupported operations in regions, try to use the regular compilation
-            // by temporarily updating the global value map
+            // For unsupported operations in regions (call, scatter, gather, etc.),
+            // temporarily promote local values to the global valueMap so that
+            // compileOperation (and compileCall) can find them via getOperand().
+            // We must unconditionally overwrite — stale outer-scope entries from
+            // prior while-loop aliasing would otherwise shadow the current
+            // iteration's tensors, causing wrong results (e.g. LU decomposition).
+            var savedValues: [String: MPSGraphTensor?] = [:]
             for operand in op.operands {
-                if let tensor = localValueMap[operand], valueMap[operand] == nil {
+                if let tensor = localValueMap[operand] {
+                    savedValues[operand] = valueMap[operand] // save previous (may be nil)
                     valueMap[operand] = tensor
                 }
             }
-            return try compileOperation(op)
+            let result = try compileOperation(op)
+            // Restore original valueMap entries to avoid polluting outer scope
+            for (key, original) in savedValues {
+                if let orig = original {
+                    valueMap[key] = orig
+                } else {
+                    valueMap.removeValue(forKey: key)
+                }
+            }
+            return result
         }
     }
 }
