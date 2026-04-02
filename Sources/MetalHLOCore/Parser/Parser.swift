@@ -519,6 +519,11 @@ public final class Parser {
                 while !check(.rightBrace) && !check(.eof) {
                     advance()
                 }
+            } else if kind == .triangularSolve {
+                attributes = try parseTriangularSolveAttributes()
+                while !check(.rightBrace) && !check(.eof) {
+                    advance()
+                }
             } else {
                 // Generic attribute parsing
                 while !check(.rightBrace) && !check(.eof) {
@@ -1370,10 +1375,10 @@ public final class Parser {
             } else if checkIdentifier("is_stable") {
                 try expectIdentifier("is_stable")
                 try expect(.equal)
-                if checkIdentifier("true") {
+                if checkBool(true) {
                     attributes.isStable = true
                     advance()
-                } else if checkIdentifier("false") {
+                } else if checkBool(false) {
                     attributes.isStable = false
                     advance()
                 }
@@ -1414,37 +1419,55 @@ public final class Parser {
             if checkIdentifier("left_side") {
                 try expectIdentifier("left_side")
                 try expect(.equal)
-                if checkIdentifier("true") {
+                if checkBool(true) {
                     attributes.leftSide = true
                     advance()
-                } else if checkIdentifier("false") {
+                } else if checkBool(false) {
                     attributes.leftSide = false
                     advance()
                 }
             } else if checkIdentifier("lower") {
                 try expectIdentifier("lower")
                 try expect(.equal)
-                if checkIdentifier("true") {
+                if checkBool(true) {
                     attributes.lower = true
                     advance()
-                } else if checkIdentifier("false") {
+                } else if checkBool(false) {
                     attributes.lower = false
                     advance()
                 }
             } else if checkIdentifier("unit_diagonal") {
                 try expectIdentifier("unit_diagonal")
                 try expect(.equal)
-                if checkIdentifier("true") {
+                if checkBool(true) {
                     attributes.unitDiagonal = true
                     advance()
-                } else if checkIdentifier("false") {
+                } else if checkBool(false) {
                     attributes.unitDiagonal = false
                     advance()
                 }
             } else if checkIdentifier("transpose_a") {
                 try expectIdentifier("transpose_a")
                 try expect(.equal)
-                if checkIdentifier("NO_TRANSPOSE") {
+                // Handle both plain identifier and #stablehlo<transpose ...> format
+                if check(.hashIdentifier) {
+                    advance() // skip #stablehlo
+                    if match(.leftAngle) {
+                        // Skip "transpose" keyword if present
+                        if checkIdentifier("transpose") { advance() }
+                        if checkIdentifier("NO_TRANSPOSE") {
+                            attributes.transposeA = .noTranspose
+                            advance()
+                        } else if checkIdentifier("TRANSPOSE") {
+                            attributes.transposeA = .transpose
+                            advance()
+                        } else if checkIdentifier("ADJOINT") {
+                            attributes.transposeA = .adjoint
+                            advance()
+                        }
+                        _ = match(.rightAngle)
+                    }
+                } else if checkIdentifier("NO_TRANSPOSE") {
                     attributes.transposeA = .noTranspose
                     advance()
                 } else if checkIdentifier("TRANSPOSE") {
@@ -1472,10 +1495,10 @@ public final class Parser {
             if checkIdentifier("lower") {
                 try expectIdentifier("lower")
                 try expect(.equal)
-                if checkIdentifier("true") {
+                if checkBool(true) {
                     attributes.lower = true
                     advance()
-                } else if checkIdentifier("false") {
+                } else if checkBool(false) {
                     attributes.lower = false
                     advance()
                 }
@@ -2350,8 +2373,8 @@ public final class Parser {
                 // Skip this attribute
                 try expectIdentifier("indices_are_sorted")
                 try expect(.equal)
-                // Skip true/false
-                if checkIdentifier("true") || checkIdentifier("false") {
+                // Skip true/false (tokenized as keywords, not identifiers)
+                if checkKeyword(.true_) || checkKeyword(.false_) {
                     advance()
                 }
             } else {
@@ -2601,6 +2624,15 @@ public final class Parser {
 
     private func checkIdentifier(_ name: String) -> Bool {
         currentToken.kind == .identifier && currentToken.text == name
+    }
+
+    /// Check for true/false which are tokenized as keywords, not identifiers.
+    private func checkBool(_ value: Bool) -> Bool {
+        if value {
+            return checkKeyword(.true_) || (currentToken.kind == .identifier && currentToken.text == "true")
+        } else {
+            return checkKeyword(.false_) || (currentToken.kind == .identifier && currentToken.text == "false")
+        }
     }
 
     private func match(_ kind: TokenKind) -> Bool {

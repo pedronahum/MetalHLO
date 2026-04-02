@@ -1184,16 +1184,47 @@ public final class CodeGenerator: @unchecked Sendable {
         // scatter phase dispatches totalUpdateElements threads.
         // Since we can't do global sync, we'll use a single dispatch with max(operand, updates) threads.
 
-        // Determine scatter axis and compute strides for proper addressing
-        let scatterAxis = dimNumbers.scatterDimsToOperandDims.first ?? 0
-        let scatterDimSize = operandShape[scatterAxis]
+        // Compute strides for each operand dimension
+        var operandStrides = [Int](repeating: 1, count: operandShape.count)
+        for d in stride(from: operandShape.count - 2, through: 0, by: -1) {
+            operandStrides[d] = operandStrides[d + 1] * operandShape[d + 1]
+        }
 
-        // Stride of the scatter axis in the flat layout
-        let scatterAxisStride = operandShape.suffix(from: scatterAxis + 1).reduce(1, *)
-        // Number of elements in dimensions before the scatter axis
-        let outerSize = operandShape.prefix(scatterAxis).reduce(1, *)
-        // Number of elements in dimensions after the scatter axis
-        let innerSize = scatterAxisStride
+        let scatterDims = dimNumbers.scatterDimsToOperandDims
+        let numScatterDims = scatterDims.count
+
+        // Build destination address calculation code.
+        // For each update element (tid), we decompose it into:
+        //   - index into the scatter indices (which scatter dims get values from indices[])
+        //   - position within the window (remaining dims use sequential addressing)
+        //
+        // The window dims are the operand dims NOT in insertedWindowDims.
+        let windowDims = (0..<operandShape.count).filter { !dimNumbers.insertedWindowDims.contains($0) }
+
+        // Compute window strides (product of window dim sizes after current dim)
+        let windowShape = windowDims.map { operandShape[$0] }
+        var windowStrides = [Int](repeating: 1, count: windowShape.count)
+        for d in stride(from: windowShape.count - 2, through: 0, by: -1) {
+            windowStrides[d] = windowStrides[d + 1] * windowShape[d + 1]
+        }
+
+        // Build the address computation as a Metal expression
+        var dstPosCode = "uint dstPos = 0;\n"
+        // Add scatter index contributions (from indices buffer)
+        for (i, scatterDim) in scatterDims.enumerated() {
+            let stride = operandStrides[scatterDim]
+            let dimSize = operandShape[scatterDim]
+            dstPosCode += "                        uint scatter_idx_\(i) = uint(indices[\(numIndices > 1 ? "indexIdx * \(numScatterDims) + " : "")\(i)]);\n"
+            dstPosCode += "                        if (scatter_idx_\(i) >= \(dimSize)) return;\n"
+            dstPosCode += "                        dstPos += scatter_idx_\(i) * \(stride);\n"
+        }
+        // Add window position contributions (from sliceOffset)
+        for (i, windowDim) in windowDims.enumerated() {
+            let stride = operandStrides[windowDim]
+            let windowStride = windowStrides[i]
+            let windowSize = windowShape[i]
+            dstPosCode += "                        dstPos += ((sliceOffset / \(windowStride)) % \(windowSize)) * \(stride);\n"
+        }
 
         return """
         kernel void \(entryPoint)(
@@ -1212,21 +1243,13 @@ public final class CodeGenerator: @unchecked Sendable {
             threadgroup_barrier(mem_flags::mem_device);
 
             // Phase 2: Scatter updates at indexed positions
-            // Scatter axis: \(scatterAxis), dim size: \(scatterDimSize)
             if (tid < \(totalUpdateElements)) {
                 uint indexIdx = tid / \(sliceSize);
                 uint sliceOffset = tid % \(sliceSize);
 
                 if (indexIdx < \(numIndices)) {
-                    uint idx = uint(indices[indexIdx]);
-                    if (idx < \(scatterDimSize)) {
-                        // Compute destination in flat operand layout:
-                        // outer_pos * (scatterDimSize * innerSize) + idx * innerSize + inner_pos
-                        uint outerPos = sliceOffset / \(innerSize);
-                        uint innerPos = sliceOffset % \(innerSize);
-                        uint dstPos = outerPos * \(scatterDimSize * innerSize) + idx * \(innerSize) + innerPos;
+                        \(dstPosCode)
                         \(updateExpr)
-                    }
                 }
             }
         }

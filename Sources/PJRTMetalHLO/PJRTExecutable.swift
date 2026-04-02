@@ -361,6 +361,8 @@ func pjrt_client_compile(
         let needsMPSGraph = mlirSource.contains("stablehlo.while")
             || mlirSource.contains("call @")
             || mlirSource.contains("func.func private")
+            || mlirSource.contains("triangular_solve")
+            || mlirSource.contains("cholesky")
 
         let executable: Executable
         if needsMPSGraph {

@@ -567,7 +567,42 @@ public final class MPSGraphCompiler {
                 resultCount: bodyOp.resultCount
             )
 
+            // For while/if ops, their region operations reference outer scope values
+            // by unprefixed names. Temporarily alias prefixed values so regions can find them.
+            var savedValues: [String: MPSGraphTensor?] = [:]
+            var savedTypes: [String: TensorType?] = [:]
+            if bodyOp.kind == .whileOp || bodyOp.kind == .ifOp {
+                for (key, tensor) in valueMap where key.hasPrefix(prefix) {
+                    let unprefixed = String(key.dropFirst(prefix.count))
+                    savedValues[unprefixed] = valueMap[unprefixed]
+                    valueMap[unprefixed] = tensor
+                }
+                for (key, type) in typeMap where key.hasPrefix(prefix) {
+                    let unprefixed = String(key.dropFirst(prefix.count))
+                    savedTypes[unprefixed] = typeMap[unprefixed]
+                    typeMap[unprefixed] = type
+                }
+            }
+
             let result = try compileOperation(remappedOp)
+
+            // Restore original values after while/if compilation
+            if !savedValues.isEmpty {
+                for (key, original) in savedValues {
+                    if let orig = original {
+                        valueMap[key] = orig
+                    } else {
+                        valueMap.removeValue(forKey: key)
+                    }
+                }
+                for (key, original) in savedTypes {
+                    if let orig = original {
+                        typeMap[key] = orig
+                    } else {
+                        typeMap.removeValue(forKey: key)
+                    }
+                }
+            }
             valueMap[prefix + bodyOp.result] = result
             typeMap[prefix + bodyOp.result] = bodyOp.resultType
 
@@ -1886,6 +1921,12 @@ public final class MPSGraphCompiler {
         let updateWindowDims = dimNumbers.updateWindowDims
         let insertedWindowDims = dimNumbers.insertedWindowDims
 
+        // Full replacement: 0-element indices with update covering all dims → just return updates
+        let indexElements = indicesShape.reduce(1, *)
+        if indexElements == 0 && updateWindowDims.count == updatesRank && insertedWindowDims.isEmpty {
+            return updates
+        }
+
         // FAST PATH: Window scatter — covers all patterns where update_window_dims
         // covers all update dimensions (dynamic_update_slice semantics).
         //
@@ -2013,57 +2054,105 @@ public final class MPSGraphCompiler {
 
         // Pattern C: multi-axis window scatter (2+ inserted dims)
         // e.g., at[i, :, j].set(val) → iwd=[0,2], sdtod=[0,2], uwd=[0]
-        // Build coordinate masks for each inserted dim, AND them, then select.
+        //
+        // Reduces to dynamic_update_slice semantics: the update window has size 1
+        // at each inserted dim, and the scatter indices provide the start position.
+        // Uses flatten + scatterAlongAxis (same approach as compileDynamicUpdateSlice)
+        // to avoid iota/mask/select which produces wrong results in large graphs.
         if updateWindowDims.count == updatesRank &&
            insertedWindowDims.count >= 2 &&
            insertedWindowDims.count == dimNumbers.scatterDimsToOperandDims.count &&
            scatterMode == .set {
 
-            let castIndices = graph.cast(scatterIndices, to: .int32, name: "\(op.result)_idx_i32")
+            let sdtod = dimNumbers.scatterDimsToOperandDims
 
-            // Build mask: AND of (iota_along_dim_k == index_k) for each inserted dim
-            // Use iota (built from constant data) instead of graph.coordinate for reliability
-            var combinedMask: MPSGraphTensor? = nil
-            for (k, scatterDim) in insertedWindowDims.enumerated() {
-                let dimSize = operandShape[scatterDim]
-                // Build iota data along this axis: [0, 1, 2, ..., dimSize-1]
-                var iotaData = (0..<dimSize).map { Int32($0) }
-                let iotaConstant = graph.constant(
-                    Data(bytes: &iotaData, count: dimSize * MemoryLayout<Int32>.stride),
-                    shape: { () -> [NSNumber] in
-                        var s = [NSNumber](repeating: 1, count: operandRank)
-                        s[scatterDim] = NSNumber(value: dimSize)
-                        return s
-                    }(),
-                    dataType: .int32
-                )
-                let coordsInt = graph.broadcast(iotaConstant, shape: operand.shape!.map { $0 }, name: "\(op.result)_iota_\(scatterDim)")
-
-                let idxVal = graph.sliceTensor(castIndices, dimension: 0, start: k, length: 1, name: "\(op.result)_ival_\(k)")
-                let idxBroadcast = graph.broadcast(idxVal, shape: operand.shape!, name: "\(op.result)_ibcast_\(k)")
-                let dimMask = graph.equal(coordsInt, idxBroadcast, name: "\(op.result)_mask_\(scatterDim)")
-
-                if let existing = combinedMask {
-                    combinedMask = graph.logicalAND(existing, dimMask, name: "\(op.result)_mask_and_\(k)")
-                } else {
-                    combinedMask = dimMask
-                }
-            }
-
-            var expandedShape = [NSNumber]()
+            // Build expanded update shape: size 1 at inserted dims, original at window dims
+            var expandedShape = [Int]()
             var windowIdx = 0
             for dim in 0..<operandRank {
                 if insertedWindowDims.contains(dim) {
                     expandedShape.append(1)
                 } else {
-                    expandedShape.append(updatesShape[windowIdx])
+                    expandedShape.append(updatesShape[windowIdx].intValue)
                     windowIdx += 1
                 }
             }
-            let expandedUpdates = graph.reshape(updates, shape: expandedShape, name: "\(op.result)_expand")
-            let broadcastUpdates = graph.broadcast(expandedUpdates, shape: operand.shape!, name: "\(op.result)_upd_bcast")
+            let updateElements = expandedShape.reduce(1, *)
 
-            return graph.select(predicate: combinedMask!, trueTensor: broadcastUpdates, falseTensor: operand, name: op.result)
+            // Compute operand strides (row-major)
+            var operandStrides = [Int](repeating: 1, count: operandRank)
+            for i in stride(from: operandRank - 2, through: 0, by: -1) {
+                operandStrides[i] = operandStrides[i + 1] * operandShape[i + 1]
+            }
+
+            // Static offsets: for each update element, its flat offset assuming start=[0,...,0]
+            // Only window dims contribute (inserted dims have size 1, always coord 0).
+            var staticOffsets = [Int32](repeating: 0, count: updateElements)
+            for flatIdx in 0..<updateElements {
+                var remaining = flatIdx
+                var offset: Int32 = 0
+                for d in 0..<operandRank {
+                    var expandedStride = 1
+                    for dd in (d + 1)..<operandRank { expandedStride *= expandedShape[dd] }
+                    let coord = remaining / expandedStride
+                    remaining %= expandedStride
+                    offset += Int32(coord * operandStrides[d])
+                }
+                staticOffsets[flatIdx] = offset
+            }
+
+            let staticData = staticOffsets.withUnsafeBufferPointer { Data(buffer: $0) }
+            let staticTensor = graph.constant(staticData, shape: [NSNumber(value: updateElements)], dataType: .int32)
+
+            // Dynamic base offset: sum of index_k * operandStride[sdtod[k]]
+            // Each scatter index component tells the start position along its operand dim.
+            let castIndices = graph.cast(scatterIndices, to: .int32, name: "\(op.result)_idx_i32")
+
+            // Handle index_vector_dim: ensure indices are 1D [numComponents]
+            let indexVectorDim = dimNumbers.indexVectorDim
+            let flatIndicesVec: MPSGraphTensor
+            if indicesShape.count > 1 {
+                if indexVectorDim != 0 {
+                    var perm = Array(0..<indicesShape.count)
+                    perm.remove(at: indexVectorDim)
+                    perm.insert(indexVectorDim, at: 0)
+                    let transposed = graph.transpose(castIndices, permutation: perm.map { NSNumber(value: $0) }, name: "\(op.result)_idx_perm")
+                    flatIndicesVec = graph.reshape(transposed, shape: [NSNumber(value: sdtod.count)], name: "\(op.result)_idx_flat")
+                } else {
+                    flatIndicesVec = graph.reshape(castIndices, shape: [NSNumber(value: sdtod.count)], name: "\(op.result)_idx_flat")
+                }
+            } else {
+                flatIndicesVec = castIndices
+            }
+
+            let zeroScalar = graph.constant(0, dataType: .int32)
+            var dynamicBase = zeroScalar
+            for k in 0..<sdtod.count {
+                let operandDim = sdtod[k]
+                let idxVal = graph.sliceTensor(flatIndicesVec, dimension: 0, start: k, length: 1, name: "\(op.result)_ival_\(k)")
+                let strideTensor = graph.constant(Double(operandStrides[operandDim]), dataType: .int32)
+                let term = graph.multiplication(idxVal, strideTensor, name: "\(op.result)_term_\(k)")
+                dynamicBase = graph.addition(dynamicBase, term, name: "\(op.result)_base_\(k)")
+            }
+
+            // Final flat indices = staticOffsets + dynamicBase (broadcast scalar)
+            let finalIndices = graph.addition(staticTensor, dynamicBase, name: "\(op.result)_indices")
+
+            // Flatten operand, scatter updates, reshape back
+            let totalElements = operandShape.reduce(1, *)
+            let flatOperand = graph.reshape(operand, shape: [NSNumber(value: totalElements)], name: "\(op.result)_flat_op")
+            let flatUpdates = graph.reshape(updates, shape: [NSNumber(value: updateElements)], name: "\(op.result)_flat_upd")
+
+            let flatResult = graph.scatterAlongAxis(
+                0,
+                data: flatOperand,
+                updates: flatUpdates,
+                indices: finalIndices,
+                mode: .set,
+                name: "\(op.result)_scatter"
+            )
+
+            return graph.reshape(flatResult, shape: operand.shape!, name: op.result)
         }
 
         // GENERAL FALLBACK: for other scatter patterns, use scatterAlongAxis
@@ -3440,23 +3529,81 @@ public final class MPSGraphCompiler {
     // MARK: - Linear Algebra Operations
 
     private func compileTriangularSolve(_ op: HLOOperation) throws -> MPSGraphTensor {
-        // Solve Ax = b where A is triangular
-        // MPSGraph doesn't have direct triangular solve - requires MPSMatrixSolveTriangular
-        //
-        // To implement properly, you would need to:
-        // 1. Extract MTLBuffer from MPSGraphTensorData
-        // 2. Create MPSMatrix objects
-        // 3. Use MPSMatrixSolveTriangular to solve
-        // 4. Wrap result back into MPSGraphTensor
-        //
-        // This requires breaking out of the pure MPSGraph compilation model.
-        _ = try getOperand(op.operands[0])  // a - triangular matrix
-        _ = try getOperand(op.operands[1])  // b - right-hand side
+        let a = try getOperand(op.operands[0])  // triangular matrix [N, N]
+        let b = try getOperand(op.operands[1])  // right-hand side [N, M]
 
-        throw CompilationError.unsupportedOperation(
-            "triangular_solve requires MPSMatrixSolveTriangular kernel bridging - " +
-            "not available in pure MPSGraph compilation"
-        )
+        let leftSide = op.attributes.leftSide ?? true
+        let lower = op.attributes.lower ?? true
+        let unitDiag = op.attributes.unitDiagonal ?? false
+
+        guard leftSide else {
+            throw CompilationError.unsupportedOperation(
+                "triangular_solve with left_side=false not yet implemented"
+            )
+        }
+
+        guard let aShape = a.shape, aShape.count == 2 else {
+            throw CompilationError.unsupportedOperation("triangular_solve requires 2D matrix A")
+        }
+        let n = aShape[0].intValue
+
+        // Build X row-by-row via forward (lower) or backward (upper) substitution.
+        // For lower triangular: X[i,:] = (B[i,:] - A[i,0:i] @ X[0:i,:]) / A[i,i]
+        // For upper triangular: X[i,:] = (B[i,:] - A[i,i+1:N] @ X[i+1:N,:]) / A[i,i]
+        var xRows: [MPSGraphTensor] = Array(repeating: graph.constant(0.0, shape: [1, 1], dataType: .float32), count: n)
+        let indices = lower ? Array(0..<n) : Array((0..<n).reversed())
+
+        for i in indices {
+            // B[i, :] — shape [1, M]
+            let bi = graph.sliceTensor(b, dimension: 0, start: i, length: 1, name: nil)
+
+            // Compute correction = A[i, prev_range] @ X[prev_range, :]
+            var corrected = bi
+            let prevIndices = lower ? Array(0..<i) : Array((i+1)..<n)
+
+            if !prevIndices.isEmpty {
+                // Stack previously solved rows into a submatrix
+                var prevRows: [MPSGraphTensor] = []
+                for j in prevIndices {
+                    prevRows.append(xRows[j])
+                }
+                let xPrev = graph.concatTensors(prevRows, dimension: 0, name: nil)  // [K, M]
+
+                // A[i, prev_range] — shape [1, K]
+                let aRow: MPSGraphTensor
+                if lower {
+                    aRow = graph.sliceTensor(
+                        graph.sliceTensor(a, dimension: 0, start: i, length: 1, name: nil),
+                        dimension: 1, start: 0, length: i, name: nil
+                    )
+                } else {
+                    aRow = graph.sliceTensor(
+                        graph.sliceTensor(a, dimension: 0, start: i, length: 1, name: nil),
+                        dimension: 1, start: i + 1, length: n - i - 1, name: nil
+                    )
+                }
+
+                // correction = A[i, prev_range] @ X[prev_range, :] — [1, M]
+                let correction = graph.matrixMultiplication(
+                    primary: aRow, secondary: xPrev, name: nil
+                )
+                corrected = graph.subtraction(bi, correction, name: nil)
+            }
+
+            if !unitDiag {
+                // Divide by diagonal element A[i, i]
+                let aii = graph.sliceTensor(
+                    graph.sliceTensor(a, dimension: 0, start: i, length: 1, name: nil),
+                    dimension: 1, start: i, length: 1, name: nil
+                )
+                corrected = graph.division(corrected, aii, name: nil)
+            }
+
+            xRows[i] = corrected  // [1, M]
+        }
+
+        // Concatenate all rows → [N, M]
+        return graph.concatTensors(xRows, dimension: 0, name: op.result)
     }
 
     private func compileCholesky(_ op: HLOOperation) throws -> MPSGraphTensor {

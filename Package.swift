@@ -180,7 +180,7 @@ let package = Package(
         ),
         .testTarget(
             name: "MetalHLOCoreTests",
-            dependencies: ["MetalHLOCore"],
+            dependencies: ["MetalHLOCore", "MetalHLO"],
             path: "Tests/MetalHLOCoreTests"
         ),
         .testTarget(
