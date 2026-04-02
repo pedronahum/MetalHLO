@@ -3356,9 +3356,8 @@ public final class MPSGraphCompiler {
     }
 
     private func compileDynamicSlice(_ op: HLOOperation) throws -> MPSGraphTensor {
-        // Dynamic slice with runtime start indices
-        // Note: True dynamic indices would require CPU readback from tensor operands.
-        // For now, we assume start indices are 0 (common case for static graphs).
+        // Dynamic slice: %result = dynamic_slice %input, %start0, %start1, ..., sizes = [s0, s1, ...]
+        // Start indices are tensor operands op.operands[1], [2], ...
         let input = try getOperand(op.operands[0])
         let sliceSizes = op.attributes.dynamicSliceSizes ?? []
 
@@ -3366,20 +3365,85 @@ public final class MPSGraphCompiler {
             throw CompilationError.missingAttribute("dynamicSliceSizes", operation: "dynamic_slice")
         }
 
-        // Start at 0 for each dimension (we can't read runtime tensor values statically)
-        // This works correctly when the dynamic indices happen to be 0, or when the
-        // slice size equals the input size (making start index irrelevant)
-        let starts = Array(repeating: NSNumber(value: 0), count: sliceSizes.count)
-        let ends = sliceSizes.map { NSNumber(value: $0) }
-        let strides = Array(repeating: NSNumber(value: 1), count: sliceSizes.count)
+        let rank = sliceSizes.count
 
-        return graph.sliceTensor(
-            input,
-            starts: starts,
-            ends: ends,
-            strides: strides,
-            name: op.result
+        // Collect start index tensors from operands[1:]
+        var startIndices: [MPSGraphTensor] = []
+        for i in 1..<op.operands.count {
+            let idx = try getOperand(op.operands[i])
+            startIndices.append(graph.cast(idx, to: .int32, name: "\(op.result)_start_\(i - 1)"))
+        }
+
+        // If all start indices are compile-time constants at 0, use static slicing
+        // (fast path for the common case)
+        let allZero = startIndices.isEmpty || op.operands.dropFirst().allSatisfy { name in
+            scalarConstantMap[name] == 0.0
+        }
+
+        if allZero || startIndices.isEmpty {
+            let starts = Array(repeating: NSNumber(value: 0), count: rank)
+            let ends = sliceSizes.map { NSNumber(value: $0) }
+            let strides = Array(repeating: NSNumber(value: 1), count: rank)
+            return graph.sliceTensor(input, starts: starts, ends: ends, strides: strides, name: op.result)
+        }
+
+        // Dynamic start indices: flatten input, compute flat offset, gather, reshape
+        guard let inputShape = input.shape?.map({ $0.intValue }) else {
+            throw CompilationError.undefinedValue("\(op.result)_input_shape")
+        }
+
+        let totalElements = inputShape.reduce(1, *)
+        let sliceElements = sliceSizes.reduce(1, *)
+
+        // Compute input strides (row-major)
+        var inputStrides = [Int](repeating: 1, count: rank)
+        for i in stride(from: rank - 2, through: 0, by: -1) {
+            inputStrides[i] = inputStrides[i + 1] * inputShape[i + 1]
+        }
+
+        // Static offsets: for each element in the slice, its offset relative to start position
+        var staticOffsets = [Int32](repeating: 0, count: sliceElements)
+        for flatIdx in 0..<sliceElements {
+            var remaining = flatIdx
+            var offset: Int32 = 0
+            for d in 0..<rank {
+                var sliceStride = 1
+                for dd in (d + 1)..<rank { sliceStride *= sliceSizes[dd] }
+                let coord = remaining / sliceStride
+                remaining %= sliceStride
+                offset += Int32(coord * inputStrides[d])
+            }
+            staticOffsets[flatIdx] = offset
+        }
+        let staticTensor = graph.constant(
+            staticOffsets.withUnsafeBufferPointer { Data(buffer: $0) },
+            shape: [NSNumber(value: sliceElements)],
+            dataType: .int32
         )
+
+        // Dynamic base: sum of start_i * stride_i
+        let zeroScalar = graph.constant(0, dataType: .int32)
+        var dynamicBase = zeroScalar
+        for d in 0..<min(rank, startIndices.count) {
+            let startVal = graph.reshape(startIndices[d], shape: [1], name: "\(op.result)_sv_\(d)")
+            let strideTensor = graph.constant(Double(inputStrides[d]), dataType: .int32)
+            let term = graph.multiplication(startVal, strideTensor, name: "\(op.result)_term_\(d)")
+            dynamicBase = graph.addition(dynamicBase, term, name: "\(op.result)_base_\(d)")
+        }
+
+        // Final indices = staticOffsets + dynamicBase
+        let finalIndices = graph.addition(staticTensor, dynamicBase, name: "\(op.result)_indices")
+
+        // Flatten input, gather, reshape
+        let flatInput = graph.reshape(input, shape: [NSNumber(value: totalElements)], name: "\(op.result)_flat")
+        let gathered = graph.gatherAlongAxis(
+            0,
+            updates: flatInput,
+            indices: finalIndices,
+            name: "\(op.result)_gather"
+        )
+
+        return graph.reshape(gathered, shape: sliceSizes.map { NSNumber(value: $0) }, name: op.result)
     }
 
     private func compileDynamicUpdateSlice(_ op: HLOOperation) throws -> MPSGraphTensor {
