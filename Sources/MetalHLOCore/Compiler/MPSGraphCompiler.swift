@@ -21,6 +21,7 @@ public final class MPSGraphCompiler {
     private var scalarConstantMap: [String: Double] = [:]  // Track scalar constants for ops like pad
     private var tupleOutputCounts: [String: Int] = [:]  // Track multi-output operations (while, if)
     private var currentModule: HLOModule?  // Module reference for function call resolution
+    private var constantOperations: [String: HLOOperation] = [:]  // Track constant ops for reshape fusion
 
     // MARK: - Initialization
 
@@ -80,6 +81,7 @@ public final class MPSGraphCompiler {
             let resultTensor = try compileOperation(operation)
             valueMap[operation.result] = resultTensor
             typeMap[operation.result] = operation.resultType
+            constantOperations[operation.result] = operation
         }
 
         // Pass 2: Compile remaining operations in order
@@ -556,6 +558,11 @@ public final class MPSGraphCompiler {
             }
         }
 
+        // Pre-register constants in the function body for reshape fusion
+        for bodyOp in function.operations where bodyOp.kind == .constant {
+            constantOperations[prefix + bodyOp.result] = bodyOp
+        }
+
         // Compile the function body with prefixed names
         for bodyOp in function.operations {
             // Remap operands to use prefixed names
@@ -956,46 +963,44 @@ public final class MPSGraphCompiler {
     }
 
     private func compileReshape(_ op: HLOOperation) throws -> MPSGraphTensor {
-        let input = try getOperand(op.operands[0])
-        let targetShape = op.resultType.mpsShape
-
         // Workaround for MPSGraph internal reshape optimization bug:
-        // When an integer constant tensor (e.g., shape [9,2]) is reshaped to add
-        // trailing size-1 dims (e.g., [9,2,1,1]), MPSGraph's internal IR optimizer
-        // can incorrectly connect unrelated integer tensors through its reshape fusion,
-        // causing shape mismatches (e.g., [2] -> [9,1,1]).
+        // MPSGraph's IR optimizer incorrectly fuses integer tensors during graph.compile(),
+        // confusing integer constants (e.g., shape [9,2]) with integer indices (e.g., [2])
+        // and creating invalid reshape operations.
         //
-        // Fix: if the input is a constant and we're just adding/removing size-1 dims,
-        // create a NEW constant with the target shape directly (avoiding the reshape op).
-        if let inputShape = input.shape {
-            let inputDims = inputShape.map { $0.intValue }
-            let targetDims = targetShape.map { $0.intValue }
-            let inputElements = inputDims.reduce(1, *)
-            let targetElements = targetDims.reduce(1, *)
-
-            if inputElements == targetElements && input.dataType == .int32 {
-                // For integer tensors, create a constant with the target shape
-                // directly to avoid MPSGraph's reshape optimization bug
-                let inputNon1 = inputDims.filter { $0 != 1 }
-                let targetNon1 = targetDims.filter { $0 != 1 }
-                if inputNon1 == targetNon1 {
-                    // Just adding/removing size-1 dims on an int tensor.
-                    // Read the data from the input constant and recreate with target shape.
-                    // Since we can't extract data from MPSGraphTensor directly, use
-                    // expandDims which MPSGraph handles correctly for adding trailing dims.
-                    var result = input
-                    for axis in inputDims.count..<targetDims.count {
-                        if targetDims[axis] == 1 {
-                            result = graph.expandDims(result, axis: axis, name: nil)
-                        }
-                    }
-                    // Name the final result
-                    return graph.identity(with: result, name: op.result)
-                }
-            }
+        // Strategy: for integer constant reshapes, recreate the constant with the target
+        // shape directly (no reshape node for MPSGraph to misoptimize). Also store the
+        // constant as float32 in the graph to prevent the optimizer from confusing it
+        // with integer index tensors, and cast back to int32 when it's consumed.
+        if let constantOp = constantOperations[op.operands[0]],
+           constantOp.resultType.elementType.isInteger {
+            // Create a float32 constant with the target shape, then cast to int32.
+            // This hides the integer tensor from MPSGraph's reshape optimizer.
+            let floatType = TensorType(
+                shape: op.resultType.shape,
+                elementType: .float32
+            )
+            let floatOp = HLOOperation(
+                result: "\(op.result)_f32",
+                kind: .constant,
+                operands: [],
+                resultType: floatType,
+                attributes: constantOp.attributes,
+                resultCount: 1
+            )
+            let floatTensor = try compileConstant(floatOp)
+            let result = graph.cast(
+                floatTensor,
+                to: op.resultType.elementType.mpsDataType,
+                name: op.result
+            )
+            // Propagate: downstream reshapes of this result can also be fused
+            constantOperations[op.result] = constantOp
+            return result
         }
 
-        return graph.reshape(input, shape: targetShape, name: op.result)
+        let input = try getOperand(op.operands[0])
+        return graph.reshape(input, shape: op.resultType.mpsShape, name: op.result)
     }
 
     private func compileBroadcast(_ op: HLOOperation) throws -> MPSGraphTensor {

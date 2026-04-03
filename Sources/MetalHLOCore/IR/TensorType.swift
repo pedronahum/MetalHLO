@@ -143,4 +143,9 @@ public enum ElementType: String, CaseIterable, Sendable {
         default: return false
         }
     }
+
+    /// Whether this is any integer type (signed or unsigned).
+    public var isInteger: Bool {
+        isSignedInteger || isUnsignedInteger
+    }
 }

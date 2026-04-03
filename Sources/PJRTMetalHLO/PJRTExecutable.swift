@@ -381,6 +381,18 @@ private func inlineSimpleCallWrapper(_ mlir: String) -> String {
         return mlir
     }
 
+    // Only inline single-output functions. Multi-output functions (returning tuples)
+    // require O2 multi-output support which isn't fully implemented yet.
+    let funcDecl = String(lines[funcStart])
+    let returnArrow = funcDecl.range(of: "->")
+    if let arrowRange = returnArrow {
+        let returnPart = funcDecl[arrowRange.upperBound...]
+        // Multi-output: "-> (tensor<...>, tensor<...>, ...)"
+        if returnPart.contains(",") {
+            return mlir
+        }
+    }
+
     // Find the private function body (from its declaration to the matching closing brace)
     var braceDepth = 0
     var privateFuncEnd: Int? = nil
@@ -537,6 +549,9 @@ func pjrt_client_compile(
     // because the O2 Metal kernel path doesn't fully support multi-output functions
     // yet (PJRT output memory kind validation fails). The MPSGraph path handles
     // call inlining natively. Re-enable once O2 multi-output is fixed.
+    // Note: MLIR call inlining available but disabled — O2 path doesn't handle
+    // multi-output functions, and single-output functions still fail output
+    // memory kind validation. Enable once O2 output handling is fixed.
     // mlirSource = inlineSimpleCallWrapper(mlirSource)
 
     do {
@@ -577,6 +592,10 @@ func pjrt_client_compile(
         if debugCompile {
             let elapsed = CFAbsoluteTimeGetCurrent() - compileStart
             print("[MetalHLO] Compilation done in \(String(format: "%.3f", elapsed))s")
+        }
+
+        if debugCompile {
+            print("[MetalHLO] Executable: \(executable.outputCount) outputs, \(executable.inputTypes.count) inputs")
         }
 
         let meta = PJRTExecutableImpl(
