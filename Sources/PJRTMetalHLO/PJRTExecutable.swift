@@ -44,6 +44,28 @@ private func convertBytecodeToText(_ bytecode: Data) -> Result<String, BytecodeE
         # Convert generic form inherent attributes <{...}> to {...}
         text = text.replace('<{', '{')
         text = text.replace('}>', '}')
+        # Convert #stablehlo.gather<...> and #stablehlo.scatter<...> attributes
+        # to inline brace form: #stablehlo.gather<body> → {body}
+        text = re.sub(r'#stablehlo\.(?:gather|scatter)<([^>]*)>', r'{\1}', text)
+        # Convert generic form operations: "stablehlo.op"(%a, %b) <{attrs}> to stablehlo.op %a, %b, attrs
+        text = re.sub(r'"stablehlo\.(\w+)"\(([^)]*)\)\s*<', r'stablehlo.\1 \2, ', text)
+        # Handle "stablehlo.op"(%a, %b) {attrs} ({region}) : type
+        # The {attrs} block contains key=value pairs. For scatter/gather with regions,
+        # we need to unwrap the outer {} and leave attrs inline.
+        def convert_generic_op_with_attrs(m):
+            op = m.group(1)
+            operands = m.group(2)
+            attrs = m.group(3)
+            return f'stablehlo.{op} {operands}, {attrs}'
+        # Match: "stablehlo.op"(operands) {attrs-no-nested-braces}
+        # Use [^{}]* for attrs without nested braces, handle nested {} for dim_numbers
+        text = re.sub(
+            r'"stablehlo\.(\w+)"\(([^)]*)\)\s*\{((?:[^{}]|\{[^{}]*\})*)\}',
+            convert_generic_op_with_attrs,
+            text
+        )
+        # Strip 'array<i64: ...>' wrapping on slice_sizes (convert to plain list)
+        text = re.sub(r'array<i\d+:\s*([^>]*)>', r'[\1]', text)
         # Convert dynamic_slice 'sizes' to 'slice_sizes'
         text = re.sub(r',\s*sizes\s*=\s*\[', ', slice_sizes = [', text)
         # Convert convolution parenthesized operands to standard form
@@ -543,6 +565,13 @@ func pjrt_client_compile(
         }
     } else {
         mlirSource = String(decoding: rawBytes, as: UTF8.self)
+    }
+
+    // Debug: save MLIR source to file when METALHLO_DUMP_MLIR is set
+    if let dumpDir = ProcessInfo.processInfo.environment["METALHLO_DUMP_MLIR"] {
+        let lineCount = mlirSource.components(separatedBy: "\n").count
+        let filename = "\(dumpDir)/mlir_\(lineCount)_\(ProcessInfo.processInfo.systemUptime).txt"
+        try? mlirSource.write(toFile: filename, atomically: true, encoding: .utf8)
     }
 
     // Note: MLIR call inlining is available (inlineSimpleCallWrapper) but disabled

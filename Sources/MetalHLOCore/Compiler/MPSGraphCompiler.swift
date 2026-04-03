@@ -77,12 +77,15 @@ public final class MPSGraphCompiler {
         // Pass 1: Pre-compile all constants so they're available regardless of
         // definition order. JAX/StableHLO may emit constants after their first use
         // when multiple functions are involved.
+        var precompiledConstants = 0
         for operation in function.operations where operation.kind == .constant {
             let resultTensor = try compileOperation(operation)
             valueMap[operation.result] = resultTensor
             typeMap[operation.result] = operation.resultType
             constantOperations[operation.result] = operation
+            precompiledConstants += 1
         }
+        fputs("[MetalHLO] Pre-compiled \(precompiledConstants) constants, \(function.operations.count) total ops in '\(function.name)'\n", stderr)
 
         // Pass 2: Compile remaining operations in order
         for operation in function.operations where operation.kind != .constant {
@@ -665,6 +668,12 @@ public final class MPSGraphCompiler {
 
     private func getOperand(_ name: String) throws -> MPSGraphTensor {
         guard let tensor = valueMap[name] else {
+            fputs("[MetalHLO] Undefined value '\(name)' — valueMap has \(valueMap.count) entries\n", stderr)
+            // Check if a similar name exists (debug aid)
+            let similar = valueMap.keys.filter { $0.contains(name.replacingOccurrences(of: "%", with: "")) || name.contains($0.replacingOccurrences(of: "%", with: "")) }
+            if !similar.isEmpty {
+                fputs("[MetalHLO]   Similar keys: \(similar.prefix(5))\n", stderr)
+            }
             throw CompilationError.undefinedValue(name)
         }
         return tensor

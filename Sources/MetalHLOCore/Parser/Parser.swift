@@ -353,6 +353,23 @@ public final class Parser {
             attributes = try parseAttributes(for: kind)
         }
 
+        // Skip scatter/selectAndScatter reducer regions: ({^bb0(...): ...stablehlo.return...})
+        // These appear after attributes and before the type signature.
+        if (kind == .scatter || kind == .selectAndScatter) && check(.leftParen) {
+            // Skip the region: ({...})
+            try expect(.leftParen)
+            if check(.leftBrace) {
+                var depth = 1
+                advance() // skip {
+                while depth > 0 && !check(.eof) {
+                    if check(.leftBrace) { depth += 1 }
+                    if check(.rightBrace) { depth -= 1 }
+                    advance()
+                }
+            }
+            try expect(.rightParen)
+        }
+
         // Parse type signature
         try expect(.colon)
         let resultType = try parseTypeSignature(for: kind)
@@ -2265,9 +2282,12 @@ public final class Parser {
                     advance()
                 }
 
-                // Parse the inner content between < and >
-                if match(.leftAngle) {
-                    while !check(.rightAngle) && !check(.eof) {
+                // Parse the inner content between <...> or {...}
+                let useBraces = check(.leftBrace)
+                let openToken: TokenKind = useBraces ? .leftBrace : .leftAngle
+                let closeToken: TokenKind = useBraces ? .rightBrace : .rightAngle
+                if match(openToken) {
+                    while !check(closeToken) && !check(.eof) {
                         skipNewlines()
 
                         if checkIdentifier("offset_dims") {
@@ -2301,7 +2321,7 @@ public final class Parser {
                         _ = match(.comma)
                         skipNewlines()
                     }
-                    _ = match(.rightAngle)
+                    _ = match(closeToken)
                 }
             } else if checkIdentifier("slice_sizes") {
                 // Parse: slice_sizes = array<i64: 1, 3>
@@ -2416,18 +2436,23 @@ public final class Parser {
         var scatterIndicesBatchingDims: [Int] = []
         var computationKind: ScatterComputationKind? = nil
 
-        while !check(.colon) && !check(.eof) {
+        while !check(.colon) && !check(.eof) && !check(.leftParen) {
             // Handle #stablehlo.scatter<...> wrapper format:
             // scatter_dimension_numbers = #stablehlo.scatter<update_window_dims = ..., ...>
             if checkIdentifier("scatter_dimension_numbers") {
                 try expectIdentifier("scatter_dimension_numbers")
                 try expect(.equal)
-                // Skip #stablehlo.scatter or #stablehlo<scatter<...>>
+                // Handle multiple formats:
+                // 1. #stablehlo.scatter<attrs> (hash identifier + angle brackets)
+                // 2. {attrs} (brace-wrapped, from our regex conversion)
                 if check(.hashIdentifier) {
                     advance() // skip #stablehlo.scatter
                 }
                 if check(.leftAngle) {
                     advance() // skip <
+                    skipNewlines()
+                } else if check(.leftBrace) {
+                    advance() // skip {
                     skipNewlines()
                 }
                 continue
@@ -2440,8 +2465,8 @@ public final class Parser {
                 _ = match(.comma)
                 skipNewlines()
                 continue
-            } else if check(.rightAngle) {
-                // End of #stablehlo.scatter<...> block
+            } else if check(.rightAngle) || check(.rightBrace) {
+                // End of #stablehlo.scatter<...> or {...} block
                 advance()
                 _ = match(.comma)
                 skipNewlines()
