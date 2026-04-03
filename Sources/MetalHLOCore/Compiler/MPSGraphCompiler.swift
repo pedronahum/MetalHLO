@@ -820,6 +820,39 @@ public final class MPSGraphCompiler {
         let lhsRemaining = (0..<lhsRank).filter { !lhsBatching.contains($0) && !lhsContracting.contains($0) }
         let rhsRemaining = (0..<rhsRank).filter { !rhsBatching.contains($0) && !rhsContracting.contains($0) }
 
+        // Handle batched outer product: no contracting dims means broadcast multiply, not matmul.
+        // e.g. einsum("bi,bj->bij", lhs, rhs) = lhs[:,:,None] * rhs[:,None,:]
+        if lhsContracting.isEmpty && rhsContracting.isEmpty {
+            // Transpose both to [batch..., remaining...]
+            let lhsPerm = lhsBatching + lhsRemaining
+            let rhsPerm = rhsBatching + rhsRemaining
+
+            var lhsT = lhs
+            if lhsPerm != Array(0..<lhsRank) {
+                lhsT = graph.transpose(lhs, permutation: lhsPerm.map { NSNumber(value: $0) }, name: nil)
+            }
+            var rhsT = rhs
+            if rhsPerm != Array(0..<rhsRank) {
+                rhsT = graph.transpose(rhs, permutation: rhsPerm.map { NSNumber(value: $0) }, name: nil)
+            }
+
+            // Build broadcast shapes:
+            // LHS: [batch..., lhsRemaining..., 1, 1, ...] (ones for each rhsRemaining dim)
+            // RHS: [batch..., 1, 1, ..., rhsRemaining...] (ones for each lhsRemaining dim)
+            let batchDims = lhsBatching.map { lhsType.shape[$0] }
+            let lhsRemainingDims = lhsRemaining.map { lhsType.shape[$0] }
+            let rhsRemainingDims = rhsRemaining.map { rhsType.shape[$0] }
+
+            let lhsBroadcastShape = batchDims + lhsRemainingDims + rhsRemainingDims.map { _ in 1 }
+            let rhsBroadcastShape = batchDims + lhsRemainingDims.map { _ in 1 } + rhsRemainingDims
+
+            let lhsExpanded = graph.reshape(lhsT, shape: lhsBroadcastShape.map { NSNumber(value: $0) }, name: nil)
+            let rhsExpanded = graph.reshape(rhsT, shape: rhsBroadcastShape.map { NSNumber(value: $0) }, name: nil)
+
+            let product = graph.multiplication(lhsExpanded, rhsExpanded, name: nil)
+            return graph.reshape(product, shape: op.resultType.mpsShape, name: op.result)
+        }
+
         // Build permutation for LHS: [batching, remaining, contracting]
         let lhsPermutation = lhsBatching + lhsRemaining + lhsContracting
         // Build permutation for RHS: [batching, contracting, remaining]
