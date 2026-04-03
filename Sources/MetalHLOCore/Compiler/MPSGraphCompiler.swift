@@ -773,17 +773,18 @@ public final class MPSGraphCompiler {
         let rhs = try getOperand(op.operands[1])
 
         // Check if operands are floating point - MPSGraph matmul only supports float/complex
-        guard let lhsType = typeMap[op.operands[0]],
-              let rhsType = typeMap[op.operands[1]] else {
-            throw CompilationError.undefinedValue(op.operands[0])
-        }
+        // Use typeMap if available, otherwise infer from MPSGraphTensor dataType
+        let lhsType = typeMap[op.operands[0]]
+        let rhsType = typeMap[op.operands[1]]
 
         let supportedTypes: Set<MetalHLOCore.ElementType> = [.float16, .float32, .float64, .bfloat16]
-        if !supportedTypes.contains(lhsType.elementType) || !supportedTypes.contains(rhsType.elementType) {
-            throw CompilationError.unsupportedOperation(
-                "dot_general with \(lhsType.elementType) operands is not supported by MPSGraph. " +
-                "Only floating-point types (float16, float32, float64, bfloat16) are supported."
-            )
+        if let lt = lhsType, let rt = rhsType {
+            if !supportedTypes.contains(lt.elementType) || !supportedTypes.contains(rt.elementType) {
+                throw CompilationError.unsupportedOperation(
+                    "dot_general with \(lt.elementType) operands is not supported by MPSGraph. " +
+                    "Only floating-point types (float16, float32, float64, bfloat16) are supported."
+                )
+            }
         }
 
         guard let dimNumbers = op.attributes.dotDimensionNumbers else {
@@ -791,9 +792,19 @@ public final class MPSGraphCompiler {
             return graph.matrixMultiplication(primary: lhs, secondary: rhs, name: op.result)
         }
 
-        // Get shapes from type map
-        guard let lhsType = typeMap[op.operands[0]],
-              let rhsType = typeMap[op.operands[1]] else {
+        // Get shapes from type map (or infer from MPSGraphTensor shape)
+        guard let lhsType = typeMap[op.operands[0]] ?? {
+            if let shape = lhs.shape?.map({ $0.intValue }) {
+                return TensorType(shape: shape, elementType: lhs.dataType == .int32 ? .int32 : .float32)
+            }
+            return nil
+        }(),
+              let rhsType = typeMap[op.operands[1]] ?? {
+            if let shape = rhs.shape?.map({ $0.intValue }) {
+                return TensorType(shape: shape, elementType: rhs.dataType == .int32 ? .int32 : .float32)
+            }
+            return nil
+        }() else {
             throw CompilationError.undefinedValue(op.operands[0])
         }
 
