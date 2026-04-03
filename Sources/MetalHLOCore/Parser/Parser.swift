@@ -126,6 +126,9 @@ public final class Parser {
             skipNewlines()
         }
 
+        // Debug: uncomment to trace parser output
+        // print("[MetalHLO Parser] Parsed \(operations.count) ops in '\(funcName)'")
+
         skipNewlines()
         try expect(.rightBrace)
 

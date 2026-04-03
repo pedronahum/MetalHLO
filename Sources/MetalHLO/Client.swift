@@ -87,22 +87,32 @@ public final class Client: @unchecked Sendable {
         // Restrict to pattern-only passes — structural transforms (TransposeMatmulFolding,
         // LayoutAssignment, SiblingFusion, HorizontalFusion) assume the integrated
         // executor and corrupt the graph for the MPSGraph backend.
-        let optimizerConfig = HLOOptimizerConfig(
-            enableFusion: true,
-            enableConstantFolding: false,
-            enableProducerConsumerFusion: false,
-            enableSiblingFusion: false,
-            enableHorizontalFusion: false,
-            enableLayoutAssignment: false,
-            enableTransposeMatmulFolding: false,
-            emitFusedCustomCalls: true
-        )
-        let optimizer = HLOOptimizer(config: optimizerConfig)
-        let optimizedFunction = optimizer.optimize(module.function)
-        // Preserve all functions (main + private helpers needed by call ops)
-        var allFunctions = module.functions.filter { $0.isPrivate }
-        allFunctions.insert(optimizedFunction, at: 0)
-        let optimizedModule = HLOModule(name: module.name, functions: allFunctions)
+        //
+        // Skip optimization for large functions (>200 ops) to avoid optimizer bugs
+        // that can incorrectly drop operations from complex graphs (e.g., LBM simulations
+        // with scatter/gather/while patterns). The pattern fusions are designed for
+        // transformer-like models and don't apply to these workloads anyway.
+        let optimizedModule: HLOModule
+        if module.function.operations.count > 200 {
+            optimizedModule = module
+        } else {
+            let optimizerConfig = HLOOptimizerConfig(
+                enableFusion: true,
+                enableConstantFolding: false,
+                enableProducerConsumerFusion: false,
+                enableSiblingFusion: false,
+                enableHorizontalFusion: false,
+                enableLayoutAssignment: false,
+                enableTransposeMatmulFolding: false,
+                emitFusedCustomCalls: true
+            )
+            let optimizer = HLOOptimizer(config: optimizerConfig)
+            let optimizedFunction = optimizer.optimize(module.function)
+            // Preserve all functions (main + private helpers needed by call ops)
+            var allFunctions = module.functions.filter { $0.isPrivate }
+            allFunctions.insert(optimizedFunction, at: 0)
+            optimizedModule = HLOModule(name: module.name, functions: allFunctions)
+        }
 
         // Compile HLOModule to MPSGraph executable
         let compiled = try executor.compile(module: optimizedModule)
