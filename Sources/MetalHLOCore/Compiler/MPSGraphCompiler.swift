@@ -558,13 +558,25 @@ public final class MPSGraphCompiler {
             }
         }
 
-        // Pre-register constants in the function body for reshape fusion
+        // Pre-compile constants in the function body so they're available
+        // regardless of definition order. Also register for reshape fusion.
         for bodyOp in function.operations where bodyOp.kind == .constant {
             constantOperations[prefix + bodyOp.result] = bodyOp
+            let remappedConstOp = HLOOperation(
+                result: prefix + bodyOp.result,
+                kind: bodyOp.kind,
+                operands: [],
+                resultType: bodyOp.resultType,
+                attributes: bodyOp.attributes,
+                resultCount: bodyOp.resultCount
+            )
+            let constResult = try compileOperation(remappedConstOp)
+            valueMap[prefix + bodyOp.result] = constResult
+            typeMap[prefix + bodyOp.result] = bodyOp.resultType
         }
 
-        // Compile the function body with prefixed names
-        for bodyOp in function.operations {
+        // Compile remaining (non-constant) operations in the function body
+        for bodyOp in function.operations where bodyOp.kind != .constant {
             // Remap operands to use prefixed names
             let remappedOperands = bodyOp.operands.map { operand -> String in
                 // Check if this operand refers to a value defined in this inlined function
