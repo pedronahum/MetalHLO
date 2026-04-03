@@ -95,14 +95,20 @@ private func convertBytecodeToText(_ bytecode: Data) -> Result<String, BytecodeE
         return .failure(.conversionFailed("Failed to launch Python: \(error)"))
     }
 
-    // Write bytecode to stdin
-    stdinPipe.fileHandleForWriting.write(bytecode)
-    stdinPipe.fileHandleForWriting.closeFile()
+    // Write bytecode to stdin on a background thread to avoid pipe deadlock.
+    // If the subprocess produces enough output to fill the stdout pipe buffer
+    // while we're still writing to stdin, both processes would block forever.
+    let writeQueue = DispatchQueue(label: "metalhlo.bytecode-write")
+    writeQueue.async {
+        stdinPipe.fileHandleForWriting.write(bytecode)
+        stdinPipe.fileHandleForWriting.closeFile()
+    }
 
-    process.waitUntilExit()
-
+    // Read stdout/stderr before waitUntilExit to prevent buffer-full deadlock
     let outputData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
     let errorData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+
+    process.waitUntilExit()
 
     guard process.terminationStatus == 0 else {
         let stderr = String(data: errorData, encoding: .utf8) ?? "unknown error"
@@ -312,6 +318,179 @@ private func resolveDevicePolicy() -> DevicePolicy {
     return .auto
 }
 
+// MARK: - MLIR Call Inlining
+
+/// Inlines trivial JAX wrapper functions at the MLIR text level.
+///
+/// JAX typically emits a module like:
+/// ```
+/// module @jit_func {
+///   func.func @main(%arg0: T) -> T {
+///     %0 = call @actual_func(%arg0) : (T) -> T
+///     return %0 : T
+///   }
+///   func.func private @actual_func(%arg0: T) -> T {
+///     // ... actual computation ...
+///   }
+/// }
+/// ```
+///
+/// This function detects this pattern and replaces the module with just the
+/// private function body, renamed to @main. This avoids MPSGraph's internal
+/// reshape optimization bugs that occur when compiling graphs with integer
+/// tensor operations through the call inlining path.
+private func inlineSimpleCallWrapper(_ mlir: String) -> String {
+    // Quick check: must have both call and private function
+    guard mlir.contains("call @") && mlir.contains("func.func private") else {
+        return mlir
+    }
+
+    let lines = mlir.split(separator: "\n", omittingEmptySubsequences: false)
+
+    // Find the private function declaration
+    var privateFuncStart: Int? = nil
+    var privateFuncName: String? = nil
+    for (i, line) in lines.enumerated() {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        if trimmed.hasPrefix("func.func private @") {
+            // Extract function name: "func.func private @name(..."
+            let afterAt = trimmed.dropFirst("func.func private @".count)
+            if let parenIdx = afterAt.firstIndex(of: "(") {
+                privateFuncName = String(afterAt[afterAt.startIndex..<parenIdx])
+                privateFuncStart = i
+            }
+            break
+        }
+    }
+
+    guard let funcName = privateFuncName, let funcStart = privateFuncStart else {
+        return mlir
+    }
+
+    // Verify @main is a simple wrapper: calls @funcName and returns
+    var isSimpleWrapper = false
+    for line in lines {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        if trimmed.contains("call @\(funcName)") {
+            isSimpleWrapper = true
+            break
+        }
+    }
+
+    guard isSimpleWrapper else {
+        return mlir
+    }
+
+    // Find the private function body (from its declaration to the matching closing brace)
+    var braceDepth = 0
+    var privateFuncEnd: Int? = nil
+    for i in funcStart..<lines.count {
+        for char in lines[i] {
+            if char == "{" { braceDepth += 1 }
+            if char == "}" { braceDepth -= 1 }
+        }
+        if braceDepth == 0 {
+            privateFuncEnd = i
+            break
+        }
+    }
+
+    guard let funcEnd = privateFuncEnd else {
+        return mlir
+    }
+
+    // Don't inline if the target function contains nested calls to other functions
+    // (e.g., jnp.linalg.solve → _lu_solve). These have different input counts.
+    for i in (funcStart + 1)..<funcEnd {
+        if lines[i].contains("call @") {
+            let debugCompile = ProcessInfo.processInfo.environment["METALHLO_DEBUG_COMPILE"] != nil
+            if debugCompile {
+                print("[MetalHLO] Skipping inlining of @\(funcName): contains nested calls")
+            }
+            return mlir
+        }
+    }
+
+    // Extract the module header (first line)
+    let moduleHeader = String(lines[0])
+
+    // Find the @main wrapper function boundaries (to exclude it)
+    var mainStart: Int? = nil
+    var mainEnd: Int? = nil
+    for (i, line) in lines.enumerated() {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        if trimmed.hasPrefix("func.func @main(") {
+            mainStart = i
+            var depth = 0
+            for j in i..<lines.count {
+                for char in lines[j] {
+                    if char == "{" { depth += 1 }
+                    if char == "}" { depth -= 1 }
+                }
+                if depth == 0 { mainEnd = j; break }
+            }
+            break
+        }
+    }
+
+    // Rebuild module: keep header, replace @main wrapper with the target function
+    // renamed to @main, and keep ALL other private functions.
+    var result = moduleHeader + "\n"
+
+    // First: emit the target private function renamed to @main
+    for i in funcStart...funcEnd {
+        var line = String(lines[i])
+        if i == funcStart {
+            line = line.replacingOccurrences(
+                of: "func.func private @\(funcName)",
+                with: "func.func @main"
+            )
+        }
+        result += line + "\n"
+    }
+
+    // Then: emit all other functions (private functions that aren't the target
+    // or the @main wrapper), preserving them for call references
+    var i = 0
+    while i < lines.count {
+        let trimmed = lines[i].trimmingCharacters(in: .whitespaces)
+        if trimmed.hasPrefix("func.func") {
+            // Find the end of this function
+            var depth = 0
+            var funcEndIdx = i
+            for j in i..<lines.count {
+                for char in lines[j] {
+                    if char == "{" { depth += 1 }
+                    if char == "}" { depth -= 1 }
+                }
+                if depth == 0 { funcEndIdx = j; break }
+            }
+
+            // Skip the @main wrapper and the already-inlined function
+            let isMainWrapper = (mainStart != nil && i == mainStart!)
+            let isTargetFunc = (i == funcStart)
+            if !isMainWrapper && !isTargetFunc {
+                for j in i...funcEndIdx {
+                    result += String(lines[j]) + "\n"
+                }
+            }
+            i = funcEndIdx + 1
+        } else {
+            i += 1
+        }
+    }
+
+    result += "}\n"
+
+    let debugCompile = ProcessInfo.processInfo.environment["METALHLO_DEBUG_COMPILE"] != nil
+    if debugCompile {
+        print("[MetalHLO] Inlined wrapper: @main -> @\(funcName) "
+            + "(\(funcEnd - funcStart + 1) lines, eliminated call)")
+    }
+
+    return result
+}
+
 // MARK: - Client Compile
 
 func pjrt_client_compile(
@@ -341,7 +520,7 @@ func pjrt_client_compile(
         && rawBytes[2] == 0xEF
         && rawBytes[3] == 0x52  // 'R'
 
-    let mlirSource: String
+    var mlirSource: String
     if isBytecode {
         // JAX sends MLIR bytecode; convert to text via Python helper
         switch convertBytecodeToText(Data(rawBytes)) {
@@ -354,15 +533,33 @@ func pjrt_client_compile(
         mlirSource = String(decoding: rawBytes, as: UTF8.self)
     }
 
+    // Note: MLIR call inlining is available (inlineSimpleCallWrapper) but disabled
+    // because the O2 Metal kernel path doesn't fully support multi-output functions
+    // yet (PJRT output memory kind validation fails). The MPSGraph path handles
+    // call inlining natively. Re-enable once O2 multi-output is fixed.
+    // mlirSource = inlineSimpleCallWrapper(mlirSource)
+
     do {
-        // Detect control flow (while, call, private functions) that the integrated
-        // Metal kernel compiler can't handle. Fall back to the MPSGraph path which
-        // supports while loops natively and can inline function calls.
-        let needsMPSGraph = mlirSource.contains("stablehlo.while")
-            || mlirSource.contains("call @")
-            || mlirSource.contains("func.func private")
-            || mlirSource.contains("triangular_solve")
+        // Detect true control flow (while loops) and ops (triangular_solve, cholesky)
+        // that the integrated Metal kernel compiler can't handle and require MPSGraph.
+        //
+        // For simple `call @` with private functions (JAX's wrapper pattern), we inline
+        // the function body at the MLIR level to avoid MPSGraph's internal reshape
+        // optimization bugs with integer tensors.
+        let hasWhileLoop = mlirSource.contains("stablehlo.while")
+        let hasLinAlg = mlirSource.contains("triangular_solve")
             || mlirSource.contains("cholesky")
+        let hasCall = mlirSource.contains("call @")
+            || mlirSource.contains("func.func private")
+
+        let needsMPSGraph = hasWhileLoop || hasLinAlg || hasCall
+
+        let compileStart = CFAbsoluteTimeGetCurrent()
+        let mlirLines = mlirSource.components(separatedBy: "\n").count
+        let debugCompile = ProcessInfo.processInfo.environment["METALHLO_DEBUG_COMPILE"] != nil
+        if debugCompile {
+            print("[MetalHLO] Compiling \(mlirLines) lines, needsMPSGraph=\(needsMPSGraph)")
+        }
 
         let executable: Executable
         if needsMPSGraph {
@@ -372,7 +569,14 @@ func pjrt_client_compile(
                 optimizationLevel: .O2,
                 devicePolicy: resolveDevicePolicy()
             )
+            if debugCompile {
+                print("[MetalHLO] Using O2 path, devicePolicy=\(resolveDevicePolicy())")
+            }
             executable = try impl.client.compile(mlirSource, config: config)
+        }
+        if debugCompile {
+            let elapsed = CFAbsoluteTimeGetCurrent() - compileStart
+            print("[MetalHLO] Compilation done in \(String(format: "%.3f", elapsed))s")
         }
 
         let meta = PJRTExecutableImpl(

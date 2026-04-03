@@ -73,8 +73,17 @@ public final class MPSGraphCompiler {
             inputTensors.append(placeholder)
         }
 
-        // Compile each operation
-        for operation in function.operations {
+        // Pass 1: Pre-compile all constants so they're available regardless of
+        // definition order. JAX/StableHLO may emit constants after their first use
+        // when multiple functions are involved.
+        for operation in function.operations where operation.kind == .constant {
+            let resultTensor = try compileOperation(operation)
+            valueMap[operation.result] = resultTensor
+            typeMap[operation.result] = operation.resultType
+        }
+
+        // Pass 2: Compile remaining operations in order
+        for operation in function.operations where operation.kind != .constant {
             let resultTensor = try compileOperation(operation)
             valueMap[operation.result] = resultTensor
             typeMap[operation.result] = operation.resultType
@@ -948,7 +957,45 @@ public final class MPSGraphCompiler {
 
     private func compileReshape(_ op: HLOOperation) throws -> MPSGraphTensor {
         let input = try getOperand(op.operands[0])
-        return graph.reshape(input, shape: op.resultType.mpsShape, name: op.result)
+        let targetShape = op.resultType.mpsShape
+
+        // Workaround for MPSGraph internal reshape optimization bug:
+        // When an integer constant tensor (e.g., shape [9,2]) is reshaped to add
+        // trailing size-1 dims (e.g., [9,2,1,1]), MPSGraph's internal IR optimizer
+        // can incorrectly connect unrelated integer tensors through its reshape fusion,
+        // causing shape mismatches (e.g., [2] -> [9,1,1]).
+        //
+        // Fix: if the input is a constant and we're just adding/removing size-1 dims,
+        // create a NEW constant with the target shape directly (avoiding the reshape op).
+        if let inputShape = input.shape {
+            let inputDims = inputShape.map { $0.intValue }
+            let targetDims = targetShape.map { $0.intValue }
+            let inputElements = inputDims.reduce(1, *)
+            let targetElements = targetDims.reduce(1, *)
+
+            if inputElements == targetElements && input.dataType == .int32 {
+                // For integer tensors, create a constant with the target shape
+                // directly to avoid MPSGraph's reshape optimization bug
+                let inputNon1 = inputDims.filter { $0 != 1 }
+                let targetNon1 = targetDims.filter { $0 != 1 }
+                if inputNon1 == targetNon1 {
+                    // Just adding/removing size-1 dims on an int tensor.
+                    // Read the data from the input constant and recreate with target shape.
+                    // Since we can't extract data from MPSGraphTensor directly, use
+                    // expandDims which MPSGraph handles correctly for adding trailing dims.
+                    var result = input
+                    for axis in inputDims.count..<targetDims.count {
+                        if targetDims[axis] == 1 {
+                            result = graph.expandDims(result, axis: axis, name: nil)
+                        }
+                    }
+                    // Name the final result
+                    return graph.identity(with: result, name: op.result)
+                }
+            }
+        }
+
+        return graph.reshape(input, shape: targetShape, name: op.result)
     }
 
     private func compileBroadcast(_ op: HLOOperation) throws -> MPSGraphTensor {
@@ -2280,6 +2327,12 @@ public final class MPSGraphCompiler {
             )
 
         case .dense(let values, _):
+            // Validate element count matches declared shape
+            let declaredElements = op.resultType.shape.reduce(1, *)
+            if values.count != declaredElements && declaredElements > 0 {
+                print("[MetalHLO] Warning: constant \(op.result) has \(values.count) values "
+                    + "but declared shape \(op.resultType.shape) requires \(declaredElements) elements")
+            }
             // Create data from values with correct element type
             let data: Data
             switch op.resultType.elementType {
@@ -4133,7 +4186,24 @@ public final class MPSGraphCompiler {
 
         case .reshape:
             let input = try getLocalOperand(op.operands[0])
-            return graph.reshape(input, shape: op.resultType.mpsShape, name: op.result)
+            let targetShape = op.resultType.mpsShape
+            if let inputShape = input.shape {
+                let inputElements = inputShape.reduce(1) { $0 * $1.intValue }
+                let targetElements = targetShape.reduce(1) { $0 * $1.intValue }
+                if inputElements != targetElements {
+                    print("[MetalHLO] Warning: region reshape mismatch for \(op.result): "
+                        + "input \(inputShape.map { $0.intValue }) -> target \(targetShape.map { $0.intValue })")
+                    // Try to correct using declared type
+                    if let declaredType = typeMap[op.operands[0]] {
+                        let declaredElements = declaredType.shape.reduce(1, *)
+                        if declaredElements == targetElements {
+                            let corrected = graph.reshape(input, shape: declaredType.mpsShape, name: "\(op.result)_fixshape")
+                            return graph.reshape(corrected, shape: targetShape, name: op.result)
+                        }
+                    }
+                }
+            }
+            return graph.reshape(input, shape: targetShape, name: op.result)
 
         case .constant:
             guard let constantValue = op.attributes.constantValue else {
