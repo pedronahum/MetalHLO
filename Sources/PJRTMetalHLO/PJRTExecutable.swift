@@ -1106,8 +1106,9 @@ private func expandMultiResultDef(_ def: String) -> [(useRef: String, baseName: 
 private func inlineCallsInBody(_ mlir: String) -> String {
     let debugCompile = ProcessInfo.processInfo.environment["METALHLO_DEBUG_COMPILE"] != nil
 
-    // Quick check
-    guard mlir.contains("func.call @") && mlir.contains("func.func private @") else {
+    // Quick check: need both a call site and a private function definition.
+    // Calls may appear as "func.call @name" or just "call @name" depending on MLIR form.
+    guard mlir.contains("call @") && mlir.contains("func.func private @") else {
         return mlir
     }
 
