@@ -646,6 +646,7 @@ private func unrollStaticWhileLoops(_ mlir: String) -> String {
     var parenDepth = 0
     var headerText = ""
     var foundWhileOpen = false
+    var foundWhileClose = false
     for i in whileStart..<lines.count {
         for char in lines[i] {
             if foundWhileOpen {
@@ -653,6 +654,7 @@ private func unrollStaticWhileLoops(_ mlir: String) -> String {
                 if char == ")" {
                     if parenDepth == 0 {
                         whileHeaderEnd = i
+                        foundWhileClose = true
                         break
                     }
                     parenDepth -= 1
@@ -663,7 +665,7 @@ private func unrollStaticWhileLoops(_ mlir: String) -> String {
                 foundWhileOpen = true
             }
         }
-        if whileHeaderEnd != whileStart { break }
+        if foundWhileClose { break }
     }
 
     // Parse iterArg assignments from headerText
@@ -712,6 +714,15 @@ private func unrollStaticWhileLoops(_ mlir: String) -> String {
         }
 
         if inCond {
+            // Special case: "} do {" on one line closes cond and opens do
+            if trimmed == "} do {" || trimmed.hasSuffix("} do {") {
+                condEnd = i
+                inCond = false
+                doStart = i
+                inDo = true
+                braceDepth = 1
+                continue
+            }
             for char in lines[i] {
                 if char == "{" { braceDepth += 1 }
                 if char == "}" { braceDepth -= 1 }
@@ -877,6 +888,25 @@ private func unrollStaticWhileLoops(_ mlir: String) -> String {
         currentValues[arg.argName] = arg.initValue
     }
 
+    // Pre-compute body definitions and their expanded use-references.
+    // For multi-result defs like %result:3, we need to rename %result#0, %result#1, etc.
+    struct BodyDef {
+        let rawDef: String       // e.g., "%result:3" or "%foo"
+        let baseName: String     // e.g., "%result" or "%foo"
+        let count: Int           // e.g., 3 or 1
+    }
+    var bodyDefs: [BodyDef] = []
+    for bodyLine in doBodyLines {
+        if let eqR = bodyLine.range(of: " = ") {
+            let defVar = String(bodyLine[bodyLine.startIndex..<eqR.lowerBound])
+                .trimmingCharacters(in: .whitespaces)
+            if defVar.hasPrefix("%") {
+                let (baseName, count) = parseMultiResultDef(defVar)
+                bodyDefs.append(BodyDef(rawDef: defVar, baseName: baseName, count: count))
+            }
+        }
+    }
+
     var unrolledLines: [String] = []
 
     for iter in 0..<loopBound {
@@ -886,61 +916,63 @@ private func unrollStaticWhileLoops(_ mlir: String) -> String {
         for bodyLine in doBodyLines {
             var line = bodyLine
 
-            // First: rename all SSA definitions (%name = ...) with iteration prefix
-            // Find the defined variable (left side of =)
+            // First: rename the SSA definition on this line with iteration prefix
             if let eqR = line.range(of: " = ") {
                 let defVar = String(line[line.startIndex..<eqR.lowerBound])
                     .trimmingCharacters(in: .whitespaces)
                 if defVar.hasPrefix("%") {
-                    let baseName = String(defVar.dropFirst()) // without %
-                    let newName = "%\(prefix)_\(baseName)"
-                    // Replace the definition
-                    line = line.replacingOccurrences(of: defVar + " = ", with: newName + " = ")
-                    // Replace all uses of this variable in the same line after the =
-                    // (shouldn't happen but be safe)
+                    let (baseName, count) = parseMultiResultDef(defVar)
+                    let newBaseName = "%\(prefix)_\(baseName.dropFirst())"
+                    let newDef = count > 1 ? "\(newBaseName):\(count)" : newBaseName
+                    line = line.replacingOccurrences(of: defVar + " = ", with: newDef + " = ")
                 }
             }
 
             // Substitute iterArg references with current values
             for (argName, currentVal) in currentValues {
-                // Replace %iterArg with its current value, being careful about boundaries
-                // Use word-boundary-aware replacement
                 line = replaceSSAVariable(in: line, variable: argName, with: currentVal)
             }
 
-            // Replace any body-internal SSA references with prefixed versions
-            // We need to handle references to variables defined in earlier body lines of THIS iteration
-            for otherBodyLine in doBodyLines {
-                if let eqR = otherBodyLine.range(of: " = ") {
-                    let otherDef = String(otherBodyLine[otherBodyLine.startIndex..<eqR.lowerBound])
-                        .trimmingCharacters(in: .whitespaces)
-                    if otherDef.hasPrefix("%") {
-                        let baseName = String(otherDef.dropFirst())
-                        let newRef = "%\(prefix)_\(baseName)"
-                        line = replaceSSAVariable(in: line, variable: otherDef, with: newRef)
+            // Replace body-internal SSA references with prefixed versions.
+            // For multi-result defs, replace each individual result ref (%name#i).
+            for def in bodyDefs {
+                if def.count > 1 {
+                    // Multi-result: replace %name#0, %name#1, ... with prefixed versions
+                    for idx in 0..<def.count {
+                        let oldRef = "\(def.baseName)#\(idx)"
+                        let newRef = "%\(prefix)_\(def.baseName.dropFirst())#\(idx)"
+                        line = replaceSSAVariable(in: line, variable: oldRef, with: newRef)
                     }
+                } else {
+                    let newRef = "%\(prefix)_\(def.baseName.dropFirst())"
+                    line = replaceSSAVariable(in: line, variable: def.baseName, with: newRef)
                 }
             }
 
             unrolledLines.append("    " + line)
         }
 
-        // Update currentValues based on return mapping
-        // Each return value corresponds to an iterArg
+        // Update currentValues based on return mapping.
+        // Each return value corresponds to an iterArg.
         var newValues: [String: String] = [:]
         for (argIdx, arg) in iterArgs.enumerated() {
             var retVal = returnValues[argIdx]
-            // The return value might reference a body-local variable that was prefixed
-            for otherBodyLine in doBodyLines {
-                if let eqR = otherBodyLine.range(of: " = ") {
-                    let otherDef = String(otherBodyLine[otherBodyLine.startIndex..<eqR.lowerBound])
-                        .trimmingCharacters(in: .whitespaces)
-                    if otherDef.hasPrefix("%") && retVal == otherDef {
-                        let baseName = String(otherDef.dropFirst())
-                        retVal = "%\(prefix)_\(baseName)"
+
+            // The return value might reference a body-local variable that was prefixed.
+            // For multi-result defs, match individual result refs (%name#i).
+            for def in bodyDefs {
+                if def.count > 1 {
+                    for idx in 0..<def.count {
+                        let oldRef = "\(def.baseName)#\(idx)"
+                        if retVal == oldRef {
+                            retVal = "%\(prefix)_\(def.baseName.dropFirst())#\(idx)"
+                        }
                     }
+                } else if retVal == def.baseName {
+                    retVal = "%\(prefix)_\(def.baseName.dropFirst())"
                 }
             }
+
             // It might also be an iterArg reference (loop-invariant values)
             if let curVal = currentValues[retVal] {
                 retVal = curVal
@@ -1007,22 +1039,21 @@ private func unrollStaticWhileLoops(_ mlir: String) -> String {
 ///
 /// SSA variables in MLIR are like `%foo`, `%foo_1`, `%foo#0`. We need to replace
 /// `%foo` without accidentally replacing `%foo_1` or `%foobar`.
+/// For variables with `#N` suffixes (like `%result#1`), we must not match
+/// inside `%result#10` — the character after must not be a digit.
 private func replaceSSAVariable(in line: String, variable: String, with replacement: String) -> String {
-    // If the variable contains # (like %11#0), do exact string replacement
-    if variable.contains("#") {
-        return line.replacingOccurrences(of: variable, with: replacement)
-    }
-
     var result = ""
     var remaining = line[line.startIndex...]
 
     while let range = remaining.range(of: variable) {
-        // Check what follows the match — must not be alphanumeric or underscore
-        // (but # is OK, as in %foo#0 — we're replacing %foo, not %foo#0)
         let afterIdx = range.upperBound
         if afterIdx < remaining.endIndex {
             let nextChar = remaining[afterIdx]
-            if nextChar.isLetter || nextChar.isNumber || nextChar == "_" {
+            // Must not be followed by alphanumeric, underscore, or '#'.
+            // - Letters/digits/underscore: prevents %foo matching %foo_1 or %foobar
+            // - '#': prevents %foo matching inside %foo#0 (multi-result ref)
+            // - Digits after '#': prevents %result#1 matching inside %result#10
+            if nextChar.isLetter || nextChar.isNumber || nextChar == "_" || nextChar == "#" {
                 // Not a word boundary — skip this occurrence
                 result += String(remaining[remaining.startIndex..<remaining.index(after: range.lowerBound)])
                 remaining = remaining[remaining.index(after: range.lowerBound)...]
@@ -1037,6 +1068,32 @@ private func replaceSSAVariable(in line: String, variable: String, with replacem
 
     result += String(remaining)
     return result
+}
+
+/// Parses a multi-result SSA definition like `%result:3` into base name and count.
+/// Returns `(baseName, count)` where baseName is `%result` and count is 3.
+/// For single-result definitions like `%foo`, returns `("%foo", 1)`.
+private func parseMultiResultDef(_ def: String) -> (baseName: String, count: Int) {
+    // Multi-result: %name:N where N is the result count
+    if let colonIdx = def.lastIndex(of: ":"),
+       colonIdx > def.startIndex,
+       let count = Int(String(def[def.index(after: colonIdx)...])),
+       count > 1 {
+        return (String(def[def.startIndex..<colonIdx]), count)
+    }
+    return (def, 1)
+}
+
+/// Expands a multi-result definition into individual result references.
+/// E.g., `%result:3` → `[("%result#0", "%result"), ("%result#1", "%result"), ("%result#2", "%result")]`
+/// For single results, returns `[("%foo", "%foo")]`.
+/// Each tuple is `(useRef, defBaseName)` — the `useRef` is what appears in code.
+private func expandMultiResultDef(_ def: String) -> [(useRef: String, baseName: String)] {
+    let (baseName, count) = parseMultiResultDef(def)
+    if count > 1 {
+        return (0..<count).map { i in ("\(baseName)#\(i)", baseName) }
+    }
+    return [(baseName, baseName)]
 }
 
 // MARK: - Function Call Inlining in Body
@@ -1252,14 +1309,21 @@ private func inlineCallsInBody(_ mlir: String) -> String {
                     subst[paramName] = argValue
                 }
 
-                // Collect SSA definitions in the body for prefixing
-                var bodyDefs: [String] = []
+                // Collect SSA definitions in the body for prefixing.
+                // For multi-result defs (%name:N), expand into individual refs.
+                struct InlineBodyDef {
+                    let rawDef: String
+                    let baseName: String
+                    let count: Int
+                }
+                var bodyDefs: [InlineBodyDef] = []
                 for bodyLine in funcDef.bodyLines {
                     if let eqR = bodyLine.range(of: " = ") {
                         let def = String(bodyLine[bodyLine.startIndex..<eqR.lowerBound])
                             .trimmingCharacters(in: .whitespaces)
                         if def.hasPrefix("%") {
-                            bodyDefs.append(def)
+                            let (baseName, count) = parseMultiResultDef(def)
+                            bodyDefs.append(InlineBodyDef(rawDef: def, baseName: baseName, count: count))
                         }
                     }
                 }
@@ -1268,11 +1332,30 @@ private func inlineCallsInBody(_ mlir: String) -> String {
                 for bodyLine in funcDef.bodyLines {
                     var line = bodyLine
 
-                    // Prefix all body-local definitions
+                    // Rename the definition on this line
+                    if let eqR = line.range(of: " = ") {
+                        let defVar = String(line[line.startIndex..<eqR.lowerBound])
+                            .trimmingCharacters(in: .whitespaces)
+                        if defVar.hasPrefix("%") {
+                            let (baseName, count) = parseMultiResultDef(defVar)
+                            let newBaseName = "%\(inlinePrefix)_\(baseName.dropFirst())"
+                            let newDef = count > 1 ? "\(newBaseName):\(count)" : newBaseName
+                            line = line.replacingOccurrences(of: defVar + " = ", with: newDef + " = ")
+                        }
+                    }
+
+                    // Prefix all body-local references (uses of defs from other lines)
                     for def in bodyDefs {
-                        let baseName = String(def.dropFirst())
-                        let newName = "%\(inlinePrefix)_\(baseName)"
-                        line = replaceSSAVariable(in: line, variable: def, with: newName)
+                        if def.count > 1 {
+                            for idx in 0..<def.count {
+                                let oldRef = "\(def.baseName)#\(idx)"
+                                let newRef = "%\(inlinePrefix)_\(def.baseName.dropFirst())#\(idx)"
+                                line = replaceSSAVariable(in: line, variable: oldRef, with: newRef)
+                            }
+                        } else {
+                            let newName = "%\(inlinePrefix)_\(def.baseName.dropFirst())"
+                            line = replaceSSAVariable(in: line, variable: def.baseName, with: newName)
+                        }
                     }
 
                     // Substitute parameters with call arguments
@@ -1290,10 +1373,18 @@ private func inlineCallsInBody(_ mlir: String) -> String {
                     var resultMap: [(String, String)] = []
                     for (retIdx, retVal) in funcDef.returnValues.enumerated() {
                         var mappedVal = retVal
+                        // Apply same renaming to return values
                         for def in bodyDefs {
-                            let baseName = String(def.dropFirst())
-                            let newName = "%\(inlinePrefix)_\(baseName)"
-                            mappedVal = replaceSSAVariable(in: mappedVal, variable: def, with: newName)
+                            if def.count > 1 {
+                                for idx in 0..<def.count {
+                                    let oldRef = "\(def.baseName)#\(idx)"
+                                    let newRef = "%\(inlinePrefix)_\(def.baseName.dropFirst())#\(idx)"
+                                    mappedVal = replaceSSAVariable(in: mappedVal, variable: oldRef, with: newRef)
+                                }
+                            } else {
+                                let newName = "%\(inlinePrefix)_\(def.baseName.dropFirst())"
+                                mappedVal = replaceSSAVariable(in: mappedVal, variable: def.baseName, with: newName)
+                            }
                         }
                         for (paramName, argValue) in subst {
                             mappedVal = replaceSSAVariable(in: mappedVal, variable: paramName, with: argValue)
