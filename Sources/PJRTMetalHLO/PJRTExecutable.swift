@@ -389,17 +389,55 @@ private func inlineSimpleCallWrapper(_ mlir: String) -> String {
         return mlir
     }
 
-    // Verify @main is a simple wrapper: calls @funcName and returns
-    var isSimpleWrapper = false
-    for line in lines {
+    // Verify @main is a simple wrapper: its body must contain ONLY a call to @funcName
+    // and a return. If @main has other operations (slice, broadcast, reshape, etc.),
+    // it's a non-trivial wrapper with a different signature — skip inlining.
+    var mainBodyStart: Int? = nil
+    var mainBodyEnd: Int? = nil
+    for (i, line) in lines.enumerated() {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
-        if trimmed.contains("call @\(funcName)") {
-            isSimpleWrapper = true
+        if trimmed.hasPrefix("func.func @main(") {
+            // Find body boundaries (skip the declaration line itself)
+            var depth = 0
+            for j in i..<lines.count {
+                for char in lines[j] {
+                    if char == "{" { depth += 1 }
+                    if char == "}" { depth -= 1 }
+                }
+                if j == i { mainBodyStart = j + 1 }
+                if depth == 0 { mainBodyEnd = j; break }
+            }
             break
         }
     }
 
-    guard isSimpleWrapper else {
+    guard let bodyStart = mainBodyStart, let bodyEnd = mainBodyEnd else {
+        return mlir
+    }
+
+    // Check that all non-empty body lines are either the call or the return
+    var hasCall = false
+    // hasReturn tracked but not checked (return always present)
+    var hasOtherOps = false
+    for i in bodyStart..<bodyEnd {
+        let trimmed = lines[i].trimmingCharacters(in: .whitespaces)
+        if trimmed.isEmpty || trimmed == "{" || trimmed == "}" || trimmed.hasPrefix("^bb") {
+            continue
+        }
+        if trimmed.contains("call @\(funcName)") {
+            hasCall = true
+        } else if trimmed.hasPrefix("return ") || trimmed == "return" {
+            continue
+        } else {
+            hasOtherOps = true
+        }
+    }
+
+    let debugCompileEarly = ProcessInfo.processInfo.environment["METALHLO_DEBUG_COMPILE"] != nil
+    guard hasCall && !hasOtherOps else {
+        if debugCompileEarly && hasOtherOps {
+            print("[MetalHLO] Skipping inlining of @main -> @\(funcName): @main has non-trivial body")
+        }
         return mlir
     }
 
@@ -450,19 +488,10 @@ private func inlineSimpleCallWrapper(_ mlir: String) -> String {
 
     // Find the @main wrapper function boundaries (to exclude it)
     var mainStart: Int? = nil
-    var mainEnd: Int? = nil
     for (i, line) in lines.enumerated() {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
         if trimmed.hasPrefix("func.func @main(") {
             mainStart = i
-            var depth = 0
-            for j in i..<lines.count {
-                for char in lines[j] {
-                    if char == "{" { depth += 1 }
-                    if char == "}" { depth -= 1 }
-                }
-                if depth == 0 { mainEnd = j; break }
-            }
             break
         }
     }
@@ -525,6 +554,851 @@ private func inlineSimpleCallWrapper(_ mlir: String) -> String {
     return result
 }
 
+// MARK: - While Loop Unrolling
+
+/// Unrolls static while loops (from JAX's `fori_loop`) at the MLIR text level.
+///
+/// Detects the pattern:
+/// ```
+/// %r:N = stablehlo.while(%iterArg = %init0, ...) : types...
+///   cond { compare LT, %counter, %bound }
+///   do { body ops + increment counter }
+/// ```
+///
+/// If the loop bound is a known constant and the counter starts at 0 with
+/// increment 1, unrolls the loop by replicating the body N times with
+/// appropriate variable renaming.
+private func unrollStaticWhileLoops(_ mlir: String) -> String {
+    let debugCompile = ProcessInfo.processInfo.environment["METALHLO_DEBUG_COMPILE"] != nil
+
+    // Quick check
+    guard mlir.contains("stablehlo.while") else { return mlir }
+
+    let lines = mlir.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+
+    // Find all constant definitions: %name = stablehlo.constant dense<VALUE> : tensor<i32>
+    // These are needed to resolve loop bounds.
+    var intConstants: [String: Int] = [:]
+    for line in lines {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        // Match: %name = stablehlo.constant dense<N> : tensor<i32>
+        // Also match: %name = stablehlo.constant dense<N> : tensor<i64>
+        if trimmed.contains("stablehlo.constant dense<"),
+           trimmed.contains(": tensor<i") {
+            // Extract name
+            if let eqRange = trimmed.range(of: " = ") {
+                let name = String(trimmed[trimmed.startIndex..<eqRange.lowerBound])
+                // Extract value from dense<VALUE>
+                if let openAngle = trimmed.range(of: "dense<"),
+                   let closeAngle = trimmed[openAngle.upperBound...].firstIndex(of: ">") {
+                    let valStr = String(trimmed[openAngle.upperBound..<closeAngle])
+                    if let val = Int(valStr) {
+                        intConstants[name] = val
+                    }
+                }
+            }
+        }
+    }
+
+    // Find the while loop start
+    var whileLineIdx: Int? = nil
+    for (i, line) in lines.enumerated() {
+        if line.contains("stablehlo.while(") || line.contains("stablehlo.while %") {
+            whileLineIdx = i
+            break
+        }
+    }
+
+    guard let whileStart = whileLineIdx else { return mlir }
+
+    // Parse the while loop header to get result name and count
+    // Pattern: %name:count = stablehlo.while(...) or %name = stablehlo.while(...)
+    let whileLine = lines[whileStart].trimmingCharacters(in: .whitespaces)
+
+    // Extract result variable and count
+    guard let eqRange = whileLine.range(of: " = ") else {
+        if debugCompile { print("[MetalHLO] While unroll: can't find '=' in while line") }
+        return mlir
+    }
+
+    let resultPart = String(whileLine[whileLine.startIndex..<eqRange.lowerBound])
+        .trimmingCharacters(in: .whitespaces)
+    var resultName: String
+    var resultCount: Int
+
+    if let colonIdx = resultPart.lastIndex(of: ":"),
+       colonIdx > resultPart.startIndex,
+       let count = Int(String(resultPart[resultPart.index(after: colonIdx)...])) {
+        resultName = String(resultPart[resultPart.startIndex..<colonIdx])
+        resultCount = count
+    } else {
+        resultName = resultPart
+        resultCount = 1
+    }
+
+    // Parse initial values: %iterArg = %init0, %iterArg_1 = %init1, ...
+    // These appear within stablehlo.while(...)
+    // The while(...) may span multiple lines
+    var iterArgs: [(argName: String, initValue: String)] = []
+    var whileHeaderEnd = whileStart
+
+    // Collect all text from "stablehlo.while(" to the matching ")"
+    var parenDepth = 0
+    var headerText = ""
+    var foundWhileOpen = false
+    for i in whileStart..<lines.count {
+        for char in lines[i] {
+            if foundWhileOpen {
+                if char == "(" { parenDepth += 1 }
+                if char == ")" {
+                    if parenDepth == 0 {
+                        whileHeaderEnd = i
+                        break
+                    }
+                    parenDepth -= 1
+                }
+                headerText.append(char)
+            }
+            if !foundWhileOpen && char == "(" {
+                foundWhileOpen = true
+            }
+        }
+        if whileHeaderEnd != whileStart { break }
+    }
+
+    // Parse iterArg assignments from headerText
+    // Format: %iterArg = %init0, %iterArg_1 = %init1, ...
+    let argPairs = headerText.components(separatedBy: ",")
+    for pair in argPairs {
+        let trimmed = pair.trimmingCharacters(in: .whitespaces)
+        if let eqR = trimmed.range(of: " = ") {
+            let argName = String(trimmed[trimmed.startIndex..<eqR.lowerBound])
+                .trimmingCharacters(in: .whitespaces)
+            let initVal = String(trimmed[eqR.upperBound...])
+                .trimmingCharacters(in: .whitespaces)
+            if argName.hasPrefix("%") && initVal.hasPrefix("%") {
+                iterArgs.append((argName: argName, initValue: initVal))
+            }
+        }
+    }
+
+    guard !iterArgs.isEmpty else {
+        if debugCompile { print("[MetalHLO] While unroll: no iterArgs found") }
+        return mlir
+    }
+
+    // Find the cond block, do block, and the overall while end
+    // Structure: ... cond { ... } do { ... }
+    var condStart: Int? = nil
+    var condEnd: Int? = nil
+    var doStart: Int? = nil
+    var doEnd: Int? = nil
+
+    // Scan from after the while header for "cond {" and "} do {"
+    var braceDepth = 0
+    var inCond = false
+    var inDo = false
+
+    for i in (whileHeaderEnd)..<lines.count {
+        let trimmed = lines[i].trimmingCharacters(in: .whitespaces)
+
+        if !inCond && !inDo {
+            if trimmed == "cond {" || trimmed.hasSuffix("cond {") {
+                condStart = i
+                inCond = true
+                braceDepth = 1
+                continue
+            }
+        }
+
+        if inCond {
+            for char in lines[i] {
+                if char == "{" { braceDepth += 1 }
+                if char == "}" { braceDepth -= 1 }
+            }
+            if i != condStart && braceDepth == 0 {
+                condEnd = i
+                inCond = false
+                continue
+            }
+        }
+
+        if !inCond && !inDo && condEnd != nil {
+            if trimmed == "} do {" || trimmed == "do {" || trimmed.hasSuffix("do {") {
+                doStart = i
+                inDo = true
+                braceDepth = 1
+                continue
+            }
+        }
+
+        if inDo {
+            for char in lines[i] {
+                if char == "{" { braceDepth += 1 }
+                if char == "}" { braceDepth -= 1 }
+            }
+            if i != doStart && braceDepth == 0 {
+                doEnd = i
+                break
+            }
+        }
+    }
+
+    guard let cStart = condStart, let cEnd = condEnd,
+          let dStart = doStart, let dEnd = doEnd else {
+        if debugCompile { print("[MetalHLO] While unroll: can't find cond/do blocks") }
+        return mlir
+    }
+
+    // Parse the condition block to find: compare LT, %counter, %bound
+    var counterArgName: String? = nil
+    var boundValue: Int? = nil
+
+    for i in (cStart + 1)..<cEnd {
+        let trimmed = lines[i].trimmingCharacters(in: .whitespaces)
+        // Match: %cond = stablehlo.compare LT, %counterArg, %boundVar, SIGNED : ...
+        // or: stablehlo.compare %counterArg, %boundVar, LT : ...
+        if trimmed.contains("stablehlo.compare") && trimmed.contains("LT") {
+            // Extract the two operands being compared
+            // Pattern 1: stablehlo.compare LT, %a, %b, SIGNED
+            // Pattern 2: stablehlo.compare %a, %b, LT
+            let parts = trimmed.components(separatedBy: ",")
+            for (_, part) in parts.enumerated() {
+                let p = part.trimmingCharacters(in: .whitespaces)
+                if p.hasPrefix("%") {
+                    // This is an operand — could be counter or bound
+                    let varName = "%" + p.dropFirst().prefix(while: { $0.isLetter || $0.isNumber || $0 == "_" })
+                    // Check if it's an iterArg (counter) or a constant (bound)
+                    if iterArgs.contains(where: { $0.argName == String(varName) }) {
+                        counterArgName = String(varName)
+                    } else if let constVal = intConstants[String(varName)] {
+                        boundValue = constVal
+                    }
+                }
+            }
+        }
+    }
+
+    guard let counterArg = counterArgName, let loopBound = boundValue else {
+        if debugCompile {
+            print("[MetalHLO] While unroll: can't determine counter/bound "
+                + "(counter=\(counterArgName ?? "nil"), bound=\(boundValue.map(String.init) ?? "nil"))")
+        }
+        return mlir
+    }
+
+    // Verify the counter starts at 0 (its init value should be a constant 0)
+    guard let counterIdx = iterArgs.firstIndex(where: { $0.argName == counterArg }) else {
+        if debugCompile { print("[MetalHLO] While unroll: counter not in iterArgs") }
+        return mlir
+    }
+    let counterInitVar = iterArgs[counterIdx].initValue
+    if let initVal = intConstants[counterInitVar], initVal != 0 {
+        if debugCompile { print("[MetalHLO] While unroll: counter doesn't start at 0 (starts at \(initVal))") }
+        return mlir
+    }
+    // If we can't find the constant, check if it's 0 — if unknown, bail
+    if intConstants[counterInitVar] == nil {
+        if debugCompile { print("[MetalHLO] While unroll: can't resolve counter init value \(counterInitVar)") }
+        return mlir
+    }
+
+    // Safety: don't unroll very large loops
+    guard loopBound <= 1000 else {
+        if debugCompile { print("[MetalHLO] While unroll: loop bound \(loopBound) too large") }
+        return mlir
+    }
+
+    // Parse the do-body to find the stablehlo.return and the body operations
+    var doBodyLines: [String] = []
+    var returnLine: String? = nil
+    for i in (dStart + 1)..<dEnd {
+        let trimmed = lines[i].trimmingCharacters(in: .whitespaces)
+        if trimmed.isEmpty || trimmed.hasPrefix("^bb") { continue }
+        if trimmed.hasPrefix("stablehlo.return ") {
+            returnLine = trimmed
+        } else {
+            doBodyLines.append(trimmed)
+        }
+    }
+
+    guard let retLine = returnLine else {
+        if debugCompile { print("[MetalHLO] While unroll: no stablehlo.return in do body") }
+        return mlir
+    }
+
+    // Parse the return values: stablehlo.return %a, %b, %c : types...
+    let retBodyStr: String
+    if let colonRange = retLine.range(of: " : ") {
+        let retStart = retLine.index(retLine.startIndex, offsetBy: "stablehlo.return ".count)
+        retBodyStr = String(retLine[retStart..<colonRange.lowerBound])
+    } else {
+        retBodyStr = String(retLine.dropFirst("stablehlo.return ".count))
+    }
+    let returnValues = retBodyStr.components(separatedBy: ",").map {
+        $0.trimmingCharacters(in: .whitespaces)
+    }
+
+    guard returnValues.count == iterArgs.count else {
+        if debugCompile {
+            print("[MetalHLO] While unroll: return count (\(returnValues.count)) != iterArgs count (\(iterArgs.count))")
+        }
+        return mlir
+    }
+
+    // Verify counter is incremented by 1: look for stablehlo.add %counter, %one
+    var counterIncrementFound = false
+    for bodyLine in doBodyLines {
+        if bodyLine.contains("stablehlo.add") && bodyLine.contains(counterArg) {
+            counterIncrementFound = true
+            break
+        }
+    }
+
+    if !counterIncrementFound {
+        if debugCompile { print("[MetalHLO] While unroll: no counter increment found") }
+        return mlir
+    }
+
+    if debugCompile {
+        print("[MetalHLO] While unroll: unrolling \(loopBound) iterations "
+            + "(counter=\(counterArg), \(iterArgs.count) iterArgs, \(doBodyLines.count) body lines)")
+    }
+
+    // Now generate the unrolled code.
+    // For each iteration, we:
+    // 1. Create prefixed versions of all body SSA values
+    // 2. Substitute iterArg references with current values
+    // 3. Track the return values for the next iteration
+
+    // Build the mapping: iterArg -> current value (starts with init values)
+    var currentValues: [String: String] = [:]
+    for arg in iterArgs {
+        currentValues[arg.argName] = arg.initValue
+    }
+
+    var unrolledLines: [String] = []
+
+    for iter in 0..<loopBound {
+        let prefix = "iter\(iter)"
+
+        // For each body line, rename SSA values and substitute iterArgs
+        for bodyLine in doBodyLines {
+            var line = bodyLine
+
+            // First: rename all SSA definitions (%name = ...) with iteration prefix
+            // Find the defined variable (left side of =)
+            if let eqR = line.range(of: " = ") {
+                let defVar = String(line[line.startIndex..<eqR.lowerBound])
+                    .trimmingCharacters(in: .whitespaces)
+                if defVar.hasPrefix("%") {
+                    let baseName = String(defVar.dropFirst()) // without %
+                    let newName = "%\(prefix)_\(baseName)"
+                    // Replace the definition
+                    line = line.replacingOccurrences(of: defVar + " = ", with: newName + " = ")
+                    // Replace all uses of this variable in the same line after the =
+                    // (shouldn't happen but be safe)
+                }
+            }
+
+            // Substitute iterArg references with current values
+            for (argName, currentVal) in currentValues {
+                // Replace %iterArg with its current value, being careful about boundaries
+                // Use word-boundary-aware replacement
+                line = replaceSSAVariable(in: line, variable: argName, with: currentVal)
+            }
+
+            // Replace any body-internal SSA references with prefixed versions
+            // We need to handle references to variables defined in earlier body lines of THIS iteration
+            for otherBodyLine in doBodyLines {
+                if let eqR = otherBodyLine.range(of: " = ") {
+                    let otherDef = String(otherBodyLine[otherBodyLine.startIndex..<eqR.lowerBound])
+                        .trimmingCharacters(in: .whitespaces)
+                    if otherDef.hasPrefix("%") {
+                        let baseName = String(otherDef.dropFirst())
+                        let newRef = "%\(prefix)_\(baseName)"
+                        line = replaceSSAVariable(in: line, variable: otherDef, with: newRef)
+                    }
+                }
+            }
+
+            unrolledLines.append("    " + line)
+        }
+
+        // Update currentValues based on return mapping
+        // Each return value corresponds to an iterArg
+        var newValues: [String: String] = [:]
+        for (argIdx, arg) in iterArgs.enumerated() {
+            var retVal = returnValues[argIdx]
+            // The return value might reference a body-local variable that was prefixed
+            for otherBodyLine in doBodyLines {
+                if let eqR = otherBodyLine.range(of: " = ") {
+                    let otherDef = String(otherBodyLine[otherBodyLine.startIndex..<eqR.lowerBound])
+                        .trimmingCharacters(in: .whitespaces)
+                    if otherDef.hasPrefix("%") && retVal == otherDef {
+                        let baseName = String(otherDef.dropFirst())
+                        retVal = "%\(prefix)_\(baseName)"
+                    }
+                }
+            }
+            // It might also be an iterArg reference (loop-invariant values)
+            if let curVal = currentValues[retVal] {
+                retVal = curVal
+            }
+            newValues[arg.argName] = retVal
+        }
+        currentValues = newValues
+    }
+
+    // Build the final replacement: map %resultName#i to the final values
+    var resultMapping: [String: String] = [:]
+    for (i, arg) in iterArgs.enumerated() {
+        let resultRef = resultCount > 1 ? "\(resultName)#\(i)" : resultName
+        if let finalVal = currentValues[arg.argName] {
+            resultMapping[resultRef] = finalVal
+        }
+    }
+
+    // Rebuild the MLIR: replace the while loop with unrolled code, then
+    // substitute result references in subsequent lines
+    var newLines: [String] = []
+
+    // Add lines before the while loop
+    for i in 0..<whileStart {
+        newLines.append(lines[i])
+    }
+
+    // Add unrolled body
+    for line in unrolledLines {
+        newLines.append(line)
+    }
+
+    // Find the actual end of the while construct (after the do block closing brace)
+    // The while might have a trailing type annotation on the same or next line
+    var whileEnd = dEnd
+    // Check if there's a trailing ": type" on the closing line or next lines
+    if whileEnd + 1 < lines.count {
+        let nextTrimmed = lines[whileEnd + 1].trimmingCharacters(in: .whitespaces)
+        if nextTrimmed.hasPrefix(": ") || nextTrimmed.hasPrefix(") :") {
+            whileEnd += 1
+        }
+    }
+
+    // Add lines after the while loop, with result substitution
+    for i in (whileEnd + 1)..<lines.count {
+        var line = lines[i]
+        for (resultRef, finalVal) in resultMapping {
+            line = replaceSSAVariable(in: line, variable: resultRef, with: finalVal)
+        }
+        newLines.append(line)
+    }
+
+    let result = newLines.joined(separator: "\n")
+
+    if debugCompile {
+        print("[MetalHLO] While unroll: successfully unrolled \(loopBound) iterations, "
+            + "replaced \(resultMapping.count) result references")
+    }
+
+    return result
+}
+
+/// Replaces an SSA variable reference in a line, respecting word boundaries.
+///
+/// SSA variables in MLIR are like `%foo`, `%foo_1`, `%foo#0`. We need to replace
+/// `%foo` without accidentally replacing `%foo_1` or `%foobar`.
+private func replaceSSAVariable(in line: String, variable: String, with replacement: String) -> String {
+    // If the variable contains # (like %11#0), do exact string replacement
+    if variable.contains("#") {
+        return line.replacingOccurrences(of: variable, with: replacement)
+    }
+
+    var result = ""
+    var remaining = line[line.startIndex...]
+
+    while let range = remaining.range(of: variable) {
+        // Check what follows the match — must not be alphanumeric or underscore
+        // (but # is OK, as in %foo#0 — we're replacing %foo, not %foo#0)
+        let afterIdx = range.upperBound
+        if afterIdx < remaining.endIndex {
+            let nextChar = remaining[afterIdx]
+            if nextChar.isLetter || nextChar.isNumber || nextChar == "_" {
+                // Not a word boundary — skip this occurrence
+                result += String(remaining[remaining.startIndex..<remaining.index(after: range.lowerBound)])
+                remaining = remaining[remaining.index(after: range.lowerBound)...]
+                continue
+            }
+        }
+
+        result += String(remaining[remaining.startIndex..<range.lowerBound])
+        result += replacement
+        remaining = remaining[range.upperBound...]
+    }
+
+    result += String(remaining)
+    return result
+}
+
+// MARK: - Function Call Inlining in Body
+
+/// Inlines private function calls within a function body at the MLIR text level.
+///
+/// After while loop unrolling, the @main function body may contain
+/// `func.call @some_func(...)` calls. This function finds the called private
+/// function definition and inlines its body at each call site.
+private func inlineCallsInBody(_ mlir: String) -> String {
+    let debugCompile = ProcessInfo.processInfo.environment["METALHLO_DEBUG_COMPILE"] != nil
+
+    // Quick check
+    guard mlir.contains("func.call @") && mlir.contains("func.func private @") else {
+        return mlir
+    }
+
+    let lines = mlir.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+
+    // Find all private function definitions
+    struct PrivateFunc {
+        let name: String
+        let paramNames: [String]  // %arg0, %arg1, ...
+        let startLine: Int
+        let endLine: Int
+        let bodyLines: [String]   // Lines between { and }, excluding ^bb and return
+        let returnValues: [String] // Values in the final return statement
+    }
+
+    var privateFuncs: [String: PrivateFunc] = [:]
+
+    var i = 0
+    while i < lines.count {
+        let trimmed = lines[i].trimmingCharacters(in: .whitespaces)
+        if trimmed.hasPrefix("func.func private @") {
+            let afterAt = trimmed.dropFirst("func.func private @".count)
+            guard let parenOpen = afterAt.firstIndex(of: "(") else { i += 1; continue }
+            let funcName = String(afterAt[afterAt.startIndex..<parenOpen])
+
+            // Extract parameter names
+            let afterParen = afterAt[afterAt.index(after: parenOpen)...]
+            var paramNames: [String] = []
+            let paramStr: String
+            if let parenClose = afterParen.firstIndex(of: ")") {
+                paramStr = String(afterParen[afterParen.startIndex..<parenClose])
+            } else {
+                paramStr = String(afterParen)
+            }
+            // Parse: %arg0: tensor<...>, %arg1: tensor<...>
+            for param in paramStr.components(separatedBy: ",") {
+                let p = param.trimmingCharacters(in: .whitespaces)
+                if p.hasPrefix("%") {
+                    if let colonIdx = p.firstIndex(of: ":") {
+                        paramNames.append(String(p[p.startIndex..<colonIdx]).trimmingCharacters(in: .whitespaces))
+                    } else {
+                        paramNames.append(p)
+                    }
+                }
+            }
+
+            // Find function body
+            var depth = 0
+            var funcEndLine = i
+            for j in i..<lines.count {
+                for char in lines[j] {
+                    if char == "{" { depth += 1 }
+                    if char == "}" { depth -= 1 }
+                }
+                if depth == 0 { funcEndLine = j; break }
+            }
+
+            // Extract body lines and return values
+            var bodyLines: [String] = []
+            var returnVals: [String] = []
+            for j in (i + 1)..<funcEndLine {
+                let btrimmed = lines[j].trimmingCharacters(in: .whitespaces)
+                if btrimmed.isEmpty || btrimmed.hasPrefix("^bb") || btrimmed == "{" || btrimmed == "}" { continue }
+                if btrimmed.hasPrefix("return ") || btrimmed.hasPrefix("stablehlo.return ") {
+                    // Parse return values
+                    let retKeyword = btrimmed.hasPrefix("return ") ? "return " : "stablehlo.return "
+                    let afterRet = String(btrimmed.dropFirst(retKeyword.count))
+                    let retBody: String
+                    if let colonR = afterRet.range(of: " : ") {
+                        retBody = String(afterRet[afterRet.startIndex..<colonR.lowerBound])
+                    } else {
+                        retBody = afterRet
+                    }
+                    returnVals = retBody.components(separatedBy: ",").map {
+                        $0.trimmingCharacters(in: .whitespaces)
+                    }
+                } else {
+                    bodyLines.append(btrimmed)
+                }
+            }
+
+            // Don't inline functions that contain while loops or nested calls
+            let hasWhile = bodyLines.contains { $0.contains("stablehlo.while") }
+            let hasNestedCall = bodyLines.contains { $0.contains("func.call @") || $0.contains("call @") }
+            if !hasWhile && !hasNestedCall {
+                privateFuncs[funcName] = PrivateFunc(
+                    name: funcName,
+                    paramNames: paramNames,
+                    startLine: i,
+                    endLine: funcEndLine,
+                    bodyLines: bodyLines,
+                    returnValues: returnVals
+                )
+            }
+
+            i = funcEndLine + 1
+        } else {
+            i += 1
+        }
+    }
+
+    guard !privateFuncs.isEmpty else { return mlir }
+
+    // Find call sites in @main's body ONLY and inline them
+    // (Don't inline calls inside other private functions — they may have
+    // different structures like while loops that we shouldn't modify.)
+    var mainBodyStart: Int? = nil
+    var mainBodyEnd: Int? = nil
+    for (idx, line) in lines.enumerated() {
+        let t = line.trimmingCharacters(in: .whitespaces)
+        if t.hasPrefix("func.func") && t.contains("@main(") {
+            var depth = 0
+            for j in idx..<lines.count {
+                for char in lines[j] {
+                    if char == "{" { depth += 1 }
+                    if char == "}" { depth -= 1 }
+                }
+                if depth == 0 { mainBodyEnd = j; break }
+            }
+            mainBodyStart = idx + 1
+            break
+        }
+    }
+
+    var newLines: [String] = []
+    var callsInlined = 0
+    var inlinedFunctions: Set<String> = []
+
+    i = 0
+    while i < lines.count {
+        let trimmed = lines[i].trimmingCharacters(in: .whitespaces)
+
+        // Only inline calls within @main's body
+        let insideMain = (mainBodyStart != nil && mainBodyEnd != nil
+            && i >= mainBodyStart! && i < mainBodyEnd!)
+
+        // Check if this line is a call to a private function we can inline
+        // Pattern: %result:N = func.call @name(%arg0, %arg1) : (types) -> (types)
+        // or: %result = func.call @name(...) : ...
+        // or: func.call @name(...) : ... (no result)
+        var matched = false
+        for (funcName, funcDef) in privateFuncs {
+            if insideMain && trimmed.contains("call @\(funcName)(") {
+                matched = true
+
+                // Extract result variable(s)
+                var resultVar: String? = nil
+                var resultCount = 1
+                if let eqR = trimmed.range(of: " = ") {
+                    let lhs = String(trimmed[trimmed.startIndex..<eqR.lowerBound])
+                        .trimmingCharacters(in: .whitespaces)
+                    if let colonIdx = lhs.lastIndex(of: ":"),
+                       colonIdx > lhs.startIndex,
+                       let count = Int(String(lhs[lhs.index(after: colonIdx)...])) {
+                        resultVar = String(lhs[lhs.startIndex..<colonIdx])
+                        resultCount = count
+                    } else {
+                        resultVar = lhs
+                        resultCount = 1
+                    }
+                }
+
+                // Extract call arguments
+                let callStr = trimmed
+                var callArgs: [String] = []
+                if let openParen = callStr.range(of: "@\(funcName)(") {
+                    let afterOpen = callStr[openParen.upperBound...]
+                    // Find matching close paren
+                    var depth = 1
+                    var argStr = ""
+                    for char in afterOpen {
+                        if char == "(" { depth += 1 }
+                        if char == ")" {
+                            depth -= 1
+                            if depth == 0 { break }
+                        }
+                        argStr.append(char)
+                    }
+                    callArgs = argStr.components(separatedBy: ",").map {
+                        $0.trimmingCharacters(in: .whitespaces)
+                    }
+                }
+
+                // Verify argument count matches
+                guard callArgs.count == funcDef.paramNames.count else {
+                    if debugCompile {
+                        print("[MetalHLO] Inline call: arg count mismatch for @\(funcName) "
+                            + "(\(callArgs.count) vs \(funcDef.paramNames.count))")
+                    }
+                    break
+                }
+
+                // Generate unique prefix for this inlining
+                let inlinePrefix = "inl\(callsInlined)"
+
+                // Build parameter substitution map
+                var subst: [String: String] = [:]
+                for (paramName, argValue) in zip(funcDef.paramNames, callArgs) {
+                    subst[paramName] = argValue
+                }
+
+                // Collect SSA definitions in the body for prefixing
+                var bodyDefs: [String] = []
+                for bodyLine in funcDef.bodyLines {
+                    if let eqR = bodyLine.range(of: " = ") {
+                        let def = String(bodyLine[bodyLine.startIndex..<eqR.lowerBound])
+                            .trimmingCharacters(in: .whitespaces)
+                        if def.hasPrefix("%") {
+                            bodyDefs.append(def)
+                        }
+                    }
+                }
+
+                // Emit inlined body
+                for bodyLine in funcDef.bodyLines {
+                    var line = bodyLine
+
+                    // Prefix all body-local definitions
+                    for def in bodyDefs {
+                        let baseName = String(def.dropFirst())
+                        let newName = "%\(inlinePrefix)_\(baseName)"
+                        line = replaceSSAVariable(in: line, variable: def, with: newName)
+                    }
+
+                    // Substitute parameters with call arguments
+                    for (paramName, argValue) in subst {
+                        line = replaceSSAVariable(in: line, variable: paramName, with: argValue)
+                    }
+
+                    newLines.append("    " + line)
+                }
+
+                // Map result references to the function's return values
+                if let rv = resultVar {
+                    // Build result mapping for post-processing
+                    // We need to replace %result#i references in lines after this call
+                    var resultMap: [(String, String)] = []
+                    for (retIdx, retVal) in funcDef.returnValues.enumerated() {
+                        var mappedVal = retVal
+                        for def in bodyDefs {
+                            let baseName = String(def.dropFirst())
+                            let newName = "%\(inlinePrefix)_\(baseName)"
+                            mappedVal = replaceSSAVariable(in: mappedVal, variable: def, with: newName)
+                        }
+                        for (paramName, argValue) in subst {
+                            mappedVal = replaceSSAVariable(in: mappedVal, variable: paramName, with: argValue)
+                        }
+
+                        let refStr = resultCount > 1 ? "\(rv)#\(retIdx)" : rv
+                        resultMap.append((refStr, mappedVal))
+                    }
+
+                    // Apply result mapping to all previously added lines AND track for future lines
+                    // We need to apply to future lines as we add them
+                    // Store as a global mapping
+                    // Actually, let's just collect all lines first, then do a final pass
+                    // Mark these result mappings for the final pass
+                    for (refStr, mappedVal) in resultMap {
+                        // Tag the newLines array end so we can apply in final pass
+                        newLines.append("// __INLINE_MAP__ \(refStr) -> \(mappedVal)")
+                    }
+                }
+
+                inlinedFunctions.insert(funcName)
+                callsInlined += 1
+                break
+            }
+        }
+
+        if !matched {
+            newLines.append(lines[i])
+        }
+        i += 1
+    }
+
+    guard callsInlined > 0 else { return mlir }
+
+    // Post-process: extract inline maps and apply substitutions
+    var inlineMaps: [(String, String)] = []
+    var cleanLines: [String] = []
+    for line in newLines {
+        if line.trimmingCharacters(in: .whitespaces).hasPrefix("// __INLINE_MAP__") {
+            // Parse: // __INLINE_MAP__ %ref -> %val
+            let parts = line.components(separatedBy: " -> ")
+            if parts.count == 2 {
+                let ref = parts[0].components(separatedBy: " ").last ?? ""
+                let val = parts[1].trimmingCharacters(in: .whitespaces)
+                inlineMaps.append((ref, val))
+            }
+        } else {
+            cleanLines.append(line)
+        }
+    }
+
+    // Apply inline maps to all lines
+    var finalLines: [String] = []
+    for line in cleanLines {
+        var l = line
+        for (ref, val) in inlineMaps {
+            l = replaceSSAVariable(in: l, variable: ref, with: val)
+        }
+        finalLines.append(l)
+    }
+
+    // Remove the bodies of inlined functions (they span multiple lines)
+    var result: [String] = []
+    var skipDepth = 0
+    var skipping = false
+    for line in finalLines {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        if !skipping {
+            var shouldSkip = false
+            for funcName in inlinedFunctions {
+                if trimmed.hasPrefix("func.func private @\(funcName)") {
+                    shouldSkip = true
+                    break
+                }
+            }
+            if shouldSkip {
+                skipping = true
+                skipDepth = 0
+                for char in line {
+                    if char == "{" { skipDepth += 1 }
+                    if char == "}" { skipDepth -= 1 }
+                }
+                if skipDepth == 0 { skipping = false }
+                continue
+            }
+        }
+        if skipping {
+            for char in line {
+                if char == "{" { skipDepth += 1 }
+                if char == "}" { skipDepth -= 1 }
+            }
+            if skipDepth <= 0 { skipping = false }
+            continue
+        }
+        result.append(line)
+    }
+
+    if debugCompile {
+        print("[MetalHLO] Inlined \(callsInlined) call(s) to "
+            + "\(inlinedFunctions.joined(separator: ", ")), removed function definitions")
+    }
+
+    return result.joined(separator: "\n")
+}
+
 // MARK: - Client Compile
 
 func pjrt_client_compile(
@@ -574,22 +1448,33 @@ func pjrt_client_compile(
         try? mlirSource.write(toFile: filename, atomically: true, encoding: .utf8)
     }
 
-    // Note: MLIR call inlining is available (inlineSimpleCallWrapper) but disabled
-    // because the O2 Metal kernel path doesn't fully support multi-output functions
-    // yet (PJRT output memory kind validation fails). The MPSGraph path handles
-    // call inlining natively. Re-enable once O2 multi-output is fixed.
-    // Note: MLIR call inlining available but disabled — O2 path doesn't handle
-    // multi-output functions, and single-output functions still fail output
-    // memory kind validation. Enable once O2 output handling is fixed.
-    // mlirSource = inlineSimpleCallWrapper(mlirSource)
+    // Step 1: Inline simple call wrappers (@main -> @private_func)
+    mlirSource = inlineSimpleCallWrapper(mlirSource)
+    // Step 2: Unroll static while loops (from fori_loop)
+    mlirSource = unrollStaticWhileLoops(mlirSource)
+    // Step 3: Inline remaining private function calls exposed by unrolling
+    // Run in a loop until convergence (unrolling may expose new call sites)
+    var transformChanged = true
+    while transformChanged {
+        let before = mlirSource
+        mlirSource = inlineCallsInBody(mlirSource)
+        mlirSource = unrollStaticWhileLoops(mlirSource)
+        transformChanged = (mlirSource != before)
+    }
+
+    // Debug: dump MLIR after transformations
+    if let dumpDir = ProcessInfo.processInfo.environment["METALHLO_DUMP_MLIR"] {
+        let lineCount = mlirSource.components(separatedBy: "\n").count
+        let filename = "\(dumpDir)/mlir_POST_\(lineCount)_\(ProcessInfo.processInfo.systemUptime).txt"
+        try? mlirSource.write(toFile: filename, atomically: true, encoding: .utf8)
+    }
 
     do {
-        // Detect true control flow (while loops) and ops (triangular_solve, cholesky)
-        // that the integrated Metal kernel compiler can't handle and require MPSGraph.
-        //
-        // For simple `call @` with private functions (JAX's wrapper pattern), we inline
-        // the function body at the MLIR level to avoid MPSGraph's internal reshape
-        // optimization bugs with integer tensors.
+        // After inlining and unrolling, re-check what's needed.
+        // The call inliner removes `call @` / `func.func private`, and the
+        // unroller removes `stablehlo.while`. After both, needsMPSGraph should
+        // be false for functions that were previously routed to MPSGraph only
+        // because of fori_loop control flow.
         let hasWhileLoop = mlirSource.contains("stablehlo.while")
         let hasLinAlg = mlirSource.contains("triangular_solve")
             || mlirSource.contains("cholesky")
