@@ -548,14 +548,13 @@ public final class CommonSubexpressionEliminationPass: OptimizationPass, @unchec
     }
 
     /// Computes a signature for an operation (kind + operands + key attributes).
+    /// All attributes that affect computation must be included — otherwise CSE
+    /// will incorrectly merge operations that produce different results.
     private func computeSignature(_ op: HLOOperation) -> String {
         var parts: [String] = [op.kind.rawValue]
         parts.append(contentsOf: op.operands)
 
         // Add relevant attributes
-        if let perm = op.attributes.dimensions {
-            parts.append("perm:\(perm)")
-        }
         if let dims = op.attributes.dimensions {
             parts.append("dims:\(dims)")
         }
@@ -564,6 +563,63 @@ public final class CommonSubexpressionEliminationPass: OptimizationPass, @unchec
         if let constantValue = op.attributes.constantValue {
             parts.append("const:\(constantValue)")
         }
+
+        // Slice attributes — different start/limit/stride = different result
+        if let starts = op.attributes.sliceStarts {
+            parts.append("sliceStarts:\(starts)")
+        }
+        if let limits = op.attributes.sliceLimits {
+            parts.append("sliceLimits:\(limits)")
+        }
+        if let strides = op.attributes.sliceStrides {
+            parts.append("sliceStrides:\(strides)")
+        }
+
+        // Pad attributes
+        if let padLow = op.attributes.padLow {
+            parts.append("padLow:\(padLow)")
+        }
+        if let padHigh = op.attributes.padHigh {
+            parts.append("padHigh:\(padHigh)")
+        }
+        if let padInterior = op.attributes.padInterior {
+            parts.append("padInterior:\(padInterior)")
+        }
+
+        // Gather/scatter dimension numbers
+        if let gatherDims = op.attributes.gatherDimensionNumbers {
+            parts.append("gatherDims:\(gatherDims)")
+        }
+        if let scatterDims = op.attributes.scatterDimensionNumbers {
+            parts.append("scatterDims:\(scatterDims)")
+        }
+
+        // Dot dimension numbers
+        if let dotDims = op.attributes.dotDimensionNumbers {
+            parts.append("dotDims:\(dotDims)")
+        }
+
+        // Convolution attributes
+        if let windowStrides = op.attributes.windowStrides {
+            parts.append("windowStrides:\(windowStrides)")
+        }
+        if let padding = op.attributes.convPadding {
+            parts.append("padding:\(padding)")
+        }
+
+        // Comparison direction
+        if let dir = op.attributes.comparisonDirection {
+            parts.append("cmpDir:\(dir)")
+        }
+
+        // Reduce/scatter computation
+        if let kind = op.attributes.scatterComputationKind {
+            parts.append("compKind:\(kind)")
+        }
+
+        // Result type shape — operations with same kind/operands but different
+        // output shapes (e.g. broadcast_in_dim) are not equivalent
+        parts.append("shape:\(op.resultType.shape)")
 
         return parts.joined(separator: "|")
     }
