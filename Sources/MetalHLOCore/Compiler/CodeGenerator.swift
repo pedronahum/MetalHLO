@@ -592,7 +592,7 @@ public final class CodeGenerator: @unchecked Sendable {
 
         // Reduction operations
         case .reduce:
-            return generateReductionSource(inputShapes: inputShapes, attributes: attributes)
+            return generateReductionSource(inputShapes: inputShapes, attributes: attributes, elementType: elementType)
 
         // Shape operations
         case .reshape:
@@ -1065,6 +1065,19 @@ public final class CodeGenerator: @unchecked Sendable {
         operandType: String,
         indicesType: String
     ) -> String {
+        // Check for batched gather (operand_batching_dims is non-empty)
+        if !dimNumbers.operandBatchingDims.isEmpty {
+            return generateBatchedGatherKernel(
+                entryPoint: entryPoint,
+                operandShape: operandShape,
+                indicesShape: indicesShape,
+                outputShape: outputShape,
+                dimNumbers: dimNumbers,
+                operandType: operandType,
+                indicesType: indicesType
+            )
+        }
+
         // Calculate dimensions
         let numIndices = indicesShape.reduce(1, *)
         let sliceSizes = dimNumbers.sliceSizes
@@ -1133,6 +1146,106 @@ public final class CodeGenerator: @unchecked Sendable {
             // Calculate source position
             uint srcPos = idx * \(operandInnerStride) + sliceOffset;
 
+            output[tid] = operand[srcPos];
+        }
+        """
+    }
+
+    /// Generates a batched gather kernel where the first dimension is a batch dimension.
+    ///
+    /// Supports multiple start indices mapping to different operand dimensions.
+    /// Common pattern: vmap'd jnp.roll compiles to batched gather with 2 start
+    /// indices for 2D rolls (one per spatial axis).
+    private func generateBatchedGatherKernel(
+        entryPoint: String,
+        operandShape: [Int],
+        indicesShape: [Int],
+        outputShape: [Int],
+        dimNumbers: GatherDimensionNumbers,
+        operandType: String,
+        indicesType: String
+    ) -> String {
+        let batchDim = dimNumbers.operandBatchingDims[0]
+        let batchSize = operandShape[batchDim]
+        let startIndexMap = dimNumbers.startIndexMap
+        let sliceSizes = dimNumbers.sliceSizes
+        let numStartIndices = startIndexMap.count
+
+        // Compute operand strides for each dimension
+        var operandStrides = [Int](repeating: 1, count: operandShape.count)
+        for i in stride(from: operandShape.count - 2, through: 0, by: -1) {
+            operandStrides[i] = operandStrides[i + 1] * operandShape[i + 1]
+        }
+
+        // Compute output strides
+        var outputStrides = [Int](repeating: 1, count: outputShape.count)
+        for i in stride(from: outputShape.count - 2, through: 0, by: -1) {
+            outputStrides[i] = outputStrides[i + 1] * outputShape[i + 1]
+        }
+
+        // Slice shape for offset dimensions (non-batch, non-collapsed)
+        var offsetDimSizes: [(dim: Int, size: Int, operandDim: Int)] = []
+        for od in dimNumbers.offsetDims {
+            offsetDimSizes.append((dim: od, size: outputShape[od], operandDim: startIndexMap.count > 0 ? 0 : od))
+        }
+
+        // Indices per batch element
+        let indicesPerBatch = numStartIndices
+
+        let totalOutputElements = outputShape.reduce(1, *)
+        let outputBatchStride = outputShape.suffix(from: 1).reduce(1, *)
+
+        // For each offset dim, its stride in the output and operand
+        // offset_dims maps output dims to the non-batch, non-collapsed operand dims
+        // The operand dims corresponding to offset_dims are the ones NOT in
+        // collapsedSliceDims and NOT in operandBatchingDims, in order
+        var nonBatchNonCollapsedDims: [Int] = []
+        for i in 0..<operandShape.count {
+            if !dimNumbers.operandBatchingDims.contains(i) && !dimNumbers.collapsedSliceDims.contains(i) {
+                nonBatchNonCollapsedDims.append(i)
+            }
+        }
+
+        // Build code to decompose offsetInBatch into per-dimension offsets
+        // and compute the source position
+        var decompose = ""
+        var srcCalc = "uint srcPos = batchIdx * \(operandStrides[batchDim]);\n"
+
+        // Add start index contributions
+        for (i, mappedDim) in startIndexMap.enumerated() {
+            let dimSize = operandShape[mappedDim]
+            decompose += "            \(indicesType) startIdx\(i) = indices[batchIdx * \(indicesPerBatch) + \(i)];\n"
+            decompose += "            uint si\(i) = uint(startIdx\(i));\n"
+            decompose += "            if (si\(i) >= \(dimSize)) si\(i) = \(dimSize - 1);\n"
+            srcCalc += "            srcPos += si\(i) * \(operandStrides[mappedDim]);\n"
+        }
+
+        // Decompose offsetInBatch into per-offset-dim coordinates
+        for (i, od) in dimNumbers.offsetDims.enumerated() {
+            let outputDimStride = outputStrides[od]
+            let outputDimSize = outputShape[od]
+            let operandDim = nonBatchNonCollapsedDims[i]
+            let operandDimStride = operandStrides[operandDim]
+            decompose += "            uint od\(i) = (offsetInBatch / \(outputDimStride)) % \(outputDimSize);\n"
+            srcCalc += "            srcPos += od\(i) * \(operandDimStride);\n"
+        }
+
+        return """
+        kernel void \(entryPoint)(
+            device const \(operandType)* operand [[buffer(0)]],
+            device const \(indicesType)* indices [[buffer(1)]],
+            device \(operandType)* output [[buffer(2)]],
+            constant uint& outputCount [[buffer(3)]],
+            uint tid [[thread_position_in_grid]])
+        {
+            if (tid >= \(totalOutputElements)) return;
+
+            uint batchIdx = tid / \(outputBatchStride);
+            uint offsetInBatch = tid % \(outputBatchStride);
+
+            if (batchIdx >= \(batchSize)) return;
+            \(decompose)
+            \(srcCalc)
             output[tid] = operand[srcPos];
         }
         """
@@ -1969,6 +2082,116 @@ public final class CodeGenerator: @unchecked Sendable {
         """
 
         return code
+    }
+
+    /// Generates a simple scalar reduction kernel for integer/boolean types.
+    /// Uses 1 thread per output element with a sequential loop over the reduction dimension.
+    private func generateIntegerReductionSource(
+        inputShape: [Int],
+        reduceDims: [Int],
+        reductionKind: ReductionKind,
+        metalType: String,
+        elementType: ElementType
+    ) -> (String, String, TuningConfig?) {
+        // Compute reduction parameters
+        let totalInputElements = inputShape.reduce(1, *)
+        let reduceDimSorted = reduceDims.sorted()
+
+        // Compute reduction size and inner/outer sizes
+        var reduceSize = 1
+        for d in reduceDimSorted {
+            if d < inputShape.count { reduceSize *= inputShape[d] }
+        }
+
+        // Compute output shape (input shape with reduce dims removed)
+        var outputShape: [Int] = []
+        for (i, s) in inputShape.enumerated() {
+            if !reduceDimSorted.contains(i) { outputShape.append(s) }
+        }
+        let outputCount = max(outputShape.reduce(1, *), 1)
+
+        // innerSize = product of dims after last reduce dim
+        let lastReduceDim = reduceDimSorted.last ?? 0
+        let innerSize = lastReduceDim + 1 < inputShape.count
+            ? inputShape.suffix(from: lastReduceDim + 1).reduce(1, *)
+            : 1
+
+        // Determine identity and operation
+        let isSigned = elementType == .int8 || elementType == .int16 || elementType == .int32 || elementType == .int64
+        let is1Bit = elementType == .int1
+
+        let initValue: String
+        let accumOp: String
+        switch reductionKind {
+        case .sum, .mean:
+            initValue = "0"
+            accumOp = "accum += val;"
+        case .max:
+            if is1Bit {
+                initValue = "0"
+                accumOp = "accum = accum | val;"
+            } else if isSigned {
+                // Use minimum value for signed types
+                let bits = elementByteSize(for: elementType) * 8
+                initValue = bits == 32 ? "(-2147483647 - 1)" : "(\(metalType)(-1) << \(bits - 1))"
+                accumOp = "accum = (val > accum) ? val : accum;"
+            } else {
+                initValue = "0"
+                accumOp = "accum = (val > accum) ? val : accum;"
+            }
+        case .min:
+            if is1Bit {
+                initValue = "1"
+                accumOp = "accum = accum & val;"
+            } else if isSigned {
+                let bits = elementByteSize(for: elementType) * 8
+                initValue = bits == 32 ? "2147483647" : "((\(metalType))((1u << \(bits - 1)) - 1))"
+                accumOp = "accum = (val < accum) ? val : accum;"
+            } else {
+                let bits = elementByteSize(for: elementType) * 8
+                initValue = bits <= 32 ? "(\(metalType))((1u << \(bits)) - 1)" : "(\(metalType))(-1)"
+                accumOp = "accum = (val < accum) ? val : accum;"
+            }
+        case .product:
+            initValue = "1"
+            accumOp = "accum *= val;"
+        case .and:
+            initValue = is1Bit ? "1" : "(\(metalType))(-1)"
+            accumOp = "accum = accum & val;"
+        case .or:
+            initValue = "0"
+            accumOp = "accum = accum | val;"
+        }
+
+        let source = """
+        #include <metal_stdlib>
+        using namespace metal;
+
+        kernel void kernel_reduce(
+            device const \(metalType)* input [[buffer(0)]],
+            device const \(metalType)* initVal [[buffer(1)]],
+            device \(metalType)* output [[buffer(2)]],
+            constant uint& outputCount [[buffer(3)]],
+            constant uint& reduceSize [[buffer(4)]],
+            constant uint& innerSize [[buffer(5)]],
+            uint tgid [[threadgroup_position_in_grid]])
+        {
+            if (tgid >= outputCount) return;
+
+            uint outerIdx = tgid / innerSize;
+            uint innerIdx = tgid % innerSize;
+            uint baseIdx = outerIdx * reduceSize * innerSize + innerIdx;
+
+            \(metalType) accum = \(initValue);
+            for (uint i = 0; i < reduceSize; i++) {
+                \(metalType) val = input[baseIdx + i * innerSize];
+                \(accumOp)
+            }
+            output[tgid] = accum;
+        }
+        """
+
+        return (source, "kernel_reduce", TuningConfig(blockSize: 1))
     }
 
     /// Generates a reduce_window (pooling) kernel.
@@ -3163,7 +3386,7 @@ public final class CodeGenerator: @unchecked Sendable {
     }
 
     /// Generates reduction source.
-    private func generateReductionSource(inputShapes: [[Int]], attributes: HLOAttributes) -> (String, String, TuningConfig?) {
+    private func generateReductionSource(inputShapes: [[Int]], attributes: HLOAttributes, elementType: ElementType = .float32) -> (String, String, TuningConfig?) {
         // Get reduction dimensions from attributes
         let reduceDims = attributes.dimensions ?? [0]
 
@@ -3172,6 +3395,17 @@ public final class CodeGenerator: @unchecked Sendable {
 
         // Determine reduction operation based on reductionKind
         let reductionKind = attributes.reductionKind ?? .sum
+
+        let metalType = metalTypeName(for: elementType)
+
+        // For non-float types, use a simple scalar reduction kernel
+        // The optimized SIMD/shared-memory kernels assume float
+        if !isFloatType(elementType) {
+            return generateIntegerReductionSource(
+                inputShape: inputShape, reduceDims: reduceDims,
+                reductionKind: reductionKind, metalType: metalType, elementType: elementType
+            )
+        }
 
         // Map HLO reduction kind to ReductionKernelGenerator op
         let reductionOp: ReductionKernelGenerator.ReductionOp
@@ -3191,27 +3425,20 @@ public final class CodeGenerator: @unchecked Sendable {
         // For row and column reductions, use optimized specialized kernels
         switch pattern {
         case .row:
-            // Row reduction: [M, N] -> [M], reduce over last axis
-            // Each thread handles one complete row
             let source = ReductionKernelGenerator.generateRowReductionKernel(
                 op: reductionOp,
-                entryPoint: "kernel_reduce"  // Use same name for consistent dispatch
+                entryPoint: "kernel_reduce"
             )
-            // TuningConfig blockSize signals to dispatch that this is a 1D dispatch
-            // Use 1024 threadgroup size for efficiency
             return (source, "kernel_reduce", TuningConfig(blockSize: 1024, useRowReduction: true))
 
         case .column:
-            // Column reduction: [M, N] -> [N], reduce over first axis
-            // Each thread handles one complete column
             let source = ReductionKernelGenerator.generateColumnReductionKernel(
                 op: reductionOp,
-                entryPoint: "kernel_reduce"  // Use same name for consistent dispatch
+                entryPoint: "kernel_reduce"
             )
             return (source, "kernel_reduce", TuningConfig(blockSize: 1024, useColumnReduction: true))
 
         case .global, .general:
-            // Fall back to the general tree reduction
             break
         }
 
@@ -3231,7 +3458,6 @@ public final class CodeGenerator: @unchecked Sendable {
             reduceOp = "min(a, b)"
             initValue = "INFINITY"
         case .mean:
-            // Mean reduction: sum then divide by count (handled as sum here, divide done separately)
             accumOp = "accum += val;"
             reduceOp = "a + b"
             initValue = "0.0f"

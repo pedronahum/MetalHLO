@@ -48,6 +48,83 @@ private func convertBytecodeToText(_ bytecode: Data) -> Result<String, BytecodeE
         # Strip precision attributes
         text = re.sub(r',\s*precision_config\s*=\s*\[[^\]]*\]', '', text)
         text = re.sub(r',\s*precision\s*=\s*\[[^\]]*\]', '', text)
+        # Fix SSA name collisions: JAX's MLIR printer can redefine %argN in a
+        # function body with a different type. The redef creates a new value but
+        # the text reuses the same name. We detect the result type of the redef
+        # and rename the def + uses that match that type.
+        def _fix_ssa_shadows(text):
+            lines = text.split('\n')
+            out = []
+            params = {}  # param_name -> param_type_str
+            shd = 0
+            i = 0
+            while i < len(lines):
+                line = lines[i]
+                # Detect function header to collect parameter names and types
+                fm = re.match(r'\s*func\.func\s+(?:private\s+)?@\w+\(([^)]*)\)', line)
+                if fm:
+                    params = {}
+                    for pm in re.finditer(r'(%arg\d+):\s*(tensor<[^>]+>)', fm.group(1)):
+                        params[pm.group(1)] = pm.group(2)
+                if re.match(r'\s*\}\s*$', line):
+                    params = {}
+                # Detect redef: %argN = op ... -> result_type
+                dm = re.match(r'^(\s*)(%arg\d+)(\s*=\s*)', line)
+                if dm and dm.group(2) in params:
+                    old = dm.group(2)
+                    param_type = params[old]
+                    # Extract result type from the line
+                    tm = re.search(r'->\s*(?:\()?\s*(tensor<[^>]+>)', line)
+                    if not tm:
+                        # For ops like `xor %a, %b : tensor<ui32>`, type is after last `:`
+                        tm = re.search(r':\s*(tensor<[^>]+>)\s*$', line)
+                    redef_type = tm.group(1) if tm else None
+                    if redef_type and redef_type != param_type:
+                        # Types differ — this is a true shadow. Rename def + matching uses.
+                        new = f'%_shd{shd}'
+                        shd += 1
+                        line = line[:dm.start(2)] + new + line[dm.end(2):]
+                        out.append(line)
+                        i += 1
+                        # Rename subsequent uses that reference the shadow type
+                        while i < len(lines):
+                            ln = lines[i]
+                            if re.match(r'\s*\}\s*$', ln):
+                                break
+                            # Check if this line redefines the same param again
+                            dm2 = re.match(r'^(\s*)' + re.escape(old) + r'(\s*=\s*)', ln)
+                            if dm2:
+                                break
+                            # Replace uses: only if the line's type context matches redef_type
+                            # Simple heuristic: if the line mentions the redef type, rename
+                            if redef_type.replace('x', 'x') in ln:
+                                ln = re.sub(re.escape(old) + r'(?=[^a-zA-Z0-9_#]|$)', new, ln)
+                            out.append(ln)
+                            i += 1
+                        continue
+                    elif redef_type == param_type:
+                        # Same type shadow (like threefry's %arg0 = xor %arg0, %arg1)
+                        # Rename def and ALL subsequent uses
+                        new = f'%_shd{shd}'
+                        shd += 1
+                        line = line[:dm.start(2)] + new + line[dm.end(2):]
+                        out.append(line)
+                        i += 1
+                        while i < len(lines):
+                            ln = lines[i]
+                            if re.match(r'\s*\}\s*$', ln):
+                                break
+                            dm2 = re.match(r'^(\s*)' + re.escape(old) + r'(\s*=\s*)', ln)
+                            if dm2:
+                                break
+                            ln = re.sub(re.escape(old) + r'(?=[^a-zA-Z0-9_#]|$)', new, ln)
+                            out.append(ln)
+                            i += 1
+                        continue
+                out.append(line)
+                i += 1
+            return '\n'.join(out)
+        text = _fix_ssa_shadows(text)
         # Convert generic form inherent attributes <{...}> to {...}
         text = text.replace('<{', '{')
         text = text.replace('}>', '}')
@@ -1326,35 +1403,13 @@ private func inlineCallsInBody(_ mlir: String, startingCounter: inout Int) -> St
                     let count: Int
                 }
 
-                // Pre-process: handle parameter shadowing.
-                // JAX emits MLIR like `%arg0 = xor %arg0, %arg1` where the body
-                // redefines a parameter. We must rename the redefinition so it
-                // doesn't conflict with parameter substitution.
+                // Shadow handling: The Python bytecode converter already renamed
+                // LHS definitions that collide with parameter names (%argN → %_shdN).
+                // No further shadow handling needed — parameter substitution will
+                // replace all remaining %argN references with call arguments.
                 let paramSet = Set(subst.keys)
-                var resolvedBodyLines = funcDef.bodyLines
-                var shadowedParams: Set<String> = []
-
-                for (lineIdx, bodyLine) in funcDef.bodyLines.enumerated() {
-                    if let eqR = bodyLine.range(of: " = ") {
-                        let def = String(bodyLine[bodyLine.startIndex..<eqR.lowerBound])
-                            .trimmingCharacters(in: .whitespaces)
-                        if def.hasPrefix("%") {
-                            let (baseName, _) = parseMultiResultDef(def)
-                            if paramSet.contains(baseName) {
-                                shadowedParams.insert(baseName)
-                                let shadowName = "%\(inlinePrefix)_\(baseName.dropFirst())"
-                                // Rename LHS on the defining line
-                                resolvedBodyLines[lineIdx] = resolvedBodyLines[lineIdx]
-                                    .replacingOccurrences(of: def + " = ", with: shadowName + " = ")
-                                // Rename subsequent references to use the shadow name
-                                for j in (lineIdx + 1)..<resolvedBodyLines.count {
-                                    resolvedBodyLines[j] = replaceSSAVariable(
-                                        in: resolvedBodyLines[j], variable: baseName, with: shadowName)
-                                }
-                            }
-                        }
-                    }
-                }
+                let resolvedBodyLines = funcDef.bodyLines
+                let shadowedParams: Set<String> = []
 
                 var bodyDefs: [InlineBodyDef] = []
                 for bodyLine in resolvedBodyLines {
