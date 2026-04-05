@@ -472,6 +472,16 @@ public final class ProducerConsumerFusion: @unchecked Sendable {
                     if !usesPrevious || externalOperands.count != 1 {
                         return false
                     }
+                    // The code generator places the previous result as the LEFT operand
+                    // and the external input as the RIGHT operand. For non-commutative ops
+                    // (subtract, divide, remainder), this is only correct when the previous
+                    // result is actually the first operand. Reject if the previous result
+                    // is the second operand (would reverse the operation).
+                    if op.kind == .subtract || op.kind == .divide || op.kind == .remainder {
+                        if op.operands.count >= 2 && op.operands[1] == previousResult {
+                            return false
+                        }
+                    }
                     // Check the external input is the next expected one
                     if expectedInputIndex < externalInputs.count &&
                        externalOperands[0] == externalInputs[expectedInputIndex] {

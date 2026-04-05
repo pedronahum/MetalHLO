@@ -38,6 +38,13 @@ private func convertBytecodeToText(_ bytecode: Data) -> Result<String, BytecodeE
         # Strip SDY sharding mesh declarations and annotations
         text = re.sub(r'^\s*sdy\.mesh\s+@\S+\s*=\s*<[^>]*>\s*$', '', text, flags=re.MULTILINE)
         text = re.sub(r'\{sdy\.sharding\s*=\s*#sdy\.sharding<[^>]*>\}', '', text)
+        # Strip sdy.sharding_constraint passthrough ops:
+        #   %out = sdy.sharding_constraint %in <@mesh, [...]> : type
+        # Replace all uses of %out with %in since the op is identity.
+        for m in re.finditer(r'^\s*(%\S+)\s*=\s*sdy\.sharding_constraint\s+(%\S+)\s.*$', text, re.MULTILINE):
+            text = text.replace(m.group(0), '')  # remove the constraint line
+            # Word-boundary-aware replacement: %out followed by non-identifier char
+            text = re.sub(re.escape(m.group(1)) + r'(?=[^a-zA-Z0-9_#]|$)', m.group(2), text)
         # Strip precision attributes
         text = re.sub(r',\s*precision_config\s*=\s*\[[^\]]*\]', '', text)
         text = re.sub(r',\s*precision\s*=\s*\[[^\]]*\]', '', text)
@@ -1586,8 +1593,19 @@ func pjrt_client_compile(
         if needsMPSGraph {
             executable = try impl.client.compile(mlirSource)
         } else {
+            let optLevel: OptimizationLevel
+            if let envOpt = ProcessInfo.processInfo.environment["METALHLO_OPT_LEVEL"] {
+                switch envOpt {
+                case "O0": optLevel = .O0
+                case "O1": optLevel = .O1
+                case "O3": optLevel = .O3
+                default: optLevel = .O2
+                }
+            } else {
+                optLevel = .O2
+            }
             let config = CompilationConfig(
-                optimizationLevel: .O2,
+                optimizationLevel: optLevel,
                 devicePolicy: resolveDevicePolicy()
             )
             if debugCompile {

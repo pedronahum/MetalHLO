@@ -526,6 +526,12 @@ public final class CodeGenerator: @unchecked Sendable {
             source += generateBinaryKernel(entryPoint: entryPoint, operation: "a * b", metalType: metalType)
         case .divide:
             source += generateBinaryKernel(entryPoint: entryPoint, operation: "a / b", metalType: metalType)
+        case .remainder:
+            if isFloat {
+                source += generateBinaryKernel(entryPoint: entryPoint, operation: "fmod(a, b)", metalType: metalType)
+            } else {
+                source += generateBinaryKernel(entryPoint: entryPoint, operation: "a % b", metalType: metalType)
+            }
         case .maximum:
             source += generateBinaryKernel(entryPoint: entryPoint, operation: "max(a, b)", metalType: metalType)
         case .minimum:
@@ -3760,7 +3766,7 @@ public final class CodeGenerator: @unchecked Sendable {
     /// Checks if an operation is binary.
     private func isBinaryOp(_ op: HLOOpKind) -> Bool {
         switch op {
-        case .add, .subtract, .multiply, .divide, .maximum, .minimum, .power, .and, .or, .xor:
+        case .add, .subtract, .multiply, .divide, .remainder, .maximum, .minimum, .power, .and, .or, .xor:
             return true
         default:
             return false
@@ -3779,6 +3785,8 @@ public final class CodeGenerator: @unchecked Sendable {
             return "\(prefix)\(left) * \(right);\n"
         case .divide:
             return "\(prefix)\(left) / \(right);\n"
+        case .remainder:
+            return "\(prefix)fmod(\(left), \(right));\n"
         case .maximum:
             return "\(prefix)max(\(left), \(right));\n"
         case .minimum:
@@ -4591,7 +4599,7 @@ public final class CodeGenerator: @unchecked Sendable {
         case .original(let opKind):
             // Elementwise operations need count parameter
             switch opKind {
-            case .add, .subtract, .multiply, .divide, .maximum, .minimum, .power,
+            case .add, .subtract, .multiply, .divide, .remainder, .maximum, .minimum, .power,
                  .negate, .abs, .exponential, .log, .sqrt, .rsqrt, .ceil, .floor, .roundNearestEven,
                  .sine, .cosine, .tanh, .sign, .logistic, .expm1, .log1p, .cbrt,
                  .and, .or, .xor, .not,

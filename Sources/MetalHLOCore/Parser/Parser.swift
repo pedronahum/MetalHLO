@@ -38,9 +38,17 @@ public final class Parser {
         // Skip any leading newlines
         skipNewlines()
 
-        // Expect: module @name {
+        // Expect: module @name { or module "name" { or module {
         try expect(.keyword(.module))
-        let moduleName = try parseAtIdentifier()
+        let moduleName: String
+        if check(.atIdentifier) {
+            moduleName = try parseAtIdentifier()
+        } else if case .string(let name) = currentToken.kind {
+            moduleName = name
+            advance()
+        } else {
+            moduleName = "module"
+        }
         try expect(.leftBrace)
         skipNewlines()
 
@@ -75,8 +83,15 @@ public final class Parser {
 
         let funcName = try parseAtIdentifier()
         let inputs = try parseFunctionArguments()
-        try expect(.arrow)
-        let outputTypes = try parseReturnTypes()
+        // Return types are optional — some functions (e.g., scatter computations)
+        // have no explicit return type: func.func @name(...) { ... }
+        let outputTypes: [TensorType]
+        if check(.arrow) {
+            advance()
+            outputTypes = try parseReturnTypes()
+        } else {
+            outputTypes = []
+        }
         try expect(.leftBrace)
         skipNewlines()
 

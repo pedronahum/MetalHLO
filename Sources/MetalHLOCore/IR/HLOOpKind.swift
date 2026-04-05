@@ -5,10 +5,10 @@
 
 /// Supported StableHLO operation kinds.
 ///
-/// This enum covers the 47 operations supported by MetalHLO.
+/// This enum covers the 48 operations supported by MetalHLO.
 public enum HLOOpKind: String, CaseIterable, Sendable {
 
-    // MARK: - Binary Arithmetic (7 ops)
+    // MARK: - Binary Arithmetic (8 ops)
 
     /// Element-wise addition.
     case add
@@ -21,6 +21,9 @@ public enum HLOOpKind: String, CaseIterable, Sendable {
 
     /// Element-wise division.
     case divide
+
+    /// Element-wise remainder (modulo).
+    case remainder
 
     /// Element-wise maximum.
     case maximum
@@ -334,7 +337,7 @@ extension HLOOpKind {
     /// Whether this is a binary arithmetic operation.
     public var isBinaryArithmetic: Bool {
         switch self {
-        case .add, .subtract, .multiply, .divide, .maximum, .minimum, .power:
+        case .add, .subtract, .multiply, .divide, .remainder, .maximum, .minimum, .power:
             return true
         default:
             return false
@@ -442,7 +445,7 @@ extension HLOOpKind {
             return .exactly(1)
 
         // Binary
-        case .add, .subtract, .multiply, .divide, .maximum, .minimum,
+        case .add, .subtract, .multiply, .divide, .remainder, .maximum, .minimum,
              .power, .compare, .and, .or, .xor, .dot, .dotGeneral,
              .convolution, .uniformQuantize, .uniformDequantize,
              .shiftLeft, .shiftRightArithmetic, .shiftRightLogical,

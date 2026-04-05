@@ -301,7 +301,18 @@ public final class Lexer {
     private func scanAtIdentifier() -> Token {
         let startLocation = currentLocation
         var text = ""
-        text.append(advance())  // consume '@'
+        text.append(advance())  // consume '@', text is now "@"
+
+        // Handle quoted identifiers: @"name-with-hyphens"
+        if !isAtEnd && peek() == "\"" {
+            advance()  // consume opening quote
+            while !isAtEnd && peek() != "\"" {
+                text.append(advance())
+            }
+            if !isAtEnd { advance() }  // consume closing quote
+            // text is "@name-with-hyphens" (@ prefix, no quotes)
+            return makeToken(.atIdentifier, text: text, location: startLocation)
+        }
 
         while !isAtEnd && (peek().isLetter || peek().isNumber || peek() == "_") {
             text.append(advance())

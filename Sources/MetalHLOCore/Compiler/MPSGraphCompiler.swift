@@ -272,6 +272,8 @@ public final class MPSGraphCompiler {
             return try compileBinaryOp(op) { graph.multiplication($0, $1, name: op.result) }
         case .divide:
             return try compileBinaryOp(op) { graph.division($0, $1, name: op.result) }
+        case .remainder:
+            return try compileBinaryOp(op) { graph.modulo($0, $1, name: op.result) }
         case .maximum:
             return try compileBinaryOp(op) { graph.maximum($0, $1, name: op.result) }
         case .minimum:
