@@ -1110,7 +1110,7 @@ private func expandMultiResultDef(_ def: String) -> [(useRef: String, baseName: 
 /// After while loop unrolling, the @main function body may contain
 /// `func.call @some_func(...)` calls. This function finds the called private
 /// function definition and inlines its body at each call site.
-private func inlineCallsInBody(_ mlir: String) -> String {
+private func inlineCallsInBody(_ mlir: String, startingCounter: inout Int) -> String {
     let debugCompile = ProcessInfo.processInfo.environment["METALHLO_DEBUG_COMPILE"] != nil
 
     // Quick check: need both a call site and a private function definition.
@@ -1242,7 +1242,7 @@ private func inlineCallsInBody(_ mlir: String) -> String {
     }
 
     var newLines: [String] = []
-    var callsInlined = 0
+    var callsInlined = startingCounter
     var inlinedFunctions: Set<String> = []
 
     i = 0
@@ -1426,7 +1426,7 @@ private func inlineCallsInBody(_ mlir: String) -> String {
         i += 1
     }
 
-    guard callsInlined > 0 else { return mlir }
+    guard callsInlined > startingCounter else { return mlir }
 
     // Post-process: extract inline maps and apply substitutions
     var inlineMaps: [(String, String)] = []
@@ -1492,9 +1492,11 @@ private func inlineCallsInBody(_ mlir: String) -> String {
     }
 
     if debugCompile {
-        print("[MetalHLO] Inlined \(callsInlined) call(s) to "
+        print("[MetalHLO] Inlined \(inlinedFunctions.count) call(s) to "
             + "\(inlinedFunctions.joined(separator: ", ")), removed function definitions")
     }
+
+    startingCounter = callsInlined  // persist counter for next convergence iteration
 
     return result.joined(separator: "\n")
 }
@@ -1554,10 +1556,11 @@ func pjrt_client_compile(
     mlirSource = unrollStaticWhileLoops(mlirSource)
     // Step 3: Inline remaining private function calls exposed by unrolling
     // Run in a loop until convergence (unrolling may expose new call sites)
+    var inlineCounter = 0  // unique counter across convergence iterations
     var transformChanged = true
     while transformChanged {
         let before = mlirSource
-        mlirSource = inlineCallsInBody(mlirSource)
+        mlirSource = inlineCallsInBody(mlirSource, startingCounter: &inlineCounter)
         mlirSource = unrollStaticWhileLoops(mlirSource)
         transformChanged = (mlirSource != before)
     }
