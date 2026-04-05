@@ -1078,44 +1078,129 @@ public final class CodeGenerator: @unchecked Sendable {
             )
         }
 
-        // Calculate dimensions
-        let numIndices = indicesShape.reduce(1, *)
-        let sliceSizes = dimNumbers.sliceSizes
+        // General gather kernel.
+        //
+        // Output layout: [batch_dims (from index grid)..., offset_dims...]
+        // For each output element:
+        //   1. Decompose tid into index-grid coordinates and offset coordinates
+        //   2. Look up start indices from the index tensor
+        //   3. Compute operand coordinates = start_indices + offset_coords
+        //   4. Read from operand at those coordinates
 
-        // Calculate the size of each gathered slice (product of non-collapsed slice dimensions)
-        let sliceSize: Int
-        if sliceSizes.isEmpty {
-            sliceSize = 1
-        } else {
-            var size = 1
-            for (i, sz) in sliceSizes.enumerated() {
-                if !dimNumbers.collapsedSliceDims.contains(i) {
-                    size *= sz
+        let sliceSizes = dimNumbers.sliceSizes
+        let totalOutputElements = outputShape.reduce(1, *)
+
+        // Compute operand strides (row-major)
+        var operandStrides = [Int](repeating: 1, count: operandShape.count)
+        for i in stride(from: operandShape.count - 2, through: 0, by: -1) {
+            operandStrides[i] = operandStrides[i + 1] * operandShape[i + 1]
+        }
+
+        // Compute output strides
+        var outputStrides = [Int](repeating: 1, count: outputShape.count)
+        for i in stride(from: outputShape.count - 2, through: 0, by: -1) {
+            outputStrides[i] = outputStrides[i + 1] * outputShape[i + 1]
+        }
+
+        // Index grid shape: indices shape without the index_vector_dim
+        var indexGridShape: [Int] = []
+        for (i, s) in indicesShape.enumerated() {
+            if i != dimNumbers.indexVectorDim { indexGridShape.append(s) }
+        }
+        let indexGridSize = max(indexGridShape.reduce(1, *), 1)
+
+        // Non-collapsed, non-batched operand dims → these are offset dims in order
+        var offsetOperandDims: [Int] = []
+        for i in 0..<operandShape.count {
+            if !dimNumbers.collapsedSliceDims.contains(i) && !dimNumbers.operandBatchingDims.contains(i) {
+                offsetOperandDims.append(i)
+            }
+        }
+
+        // Offset sizes (from slice_sizes for the offset operand dims)
+        var offsetSizes: [Int] = []
+        for d in offsetOperandDims {
+            offsetSizes.append(sliceSizes[d])
+        }
+        let offsetTotalSize = max(offsetSizes.reduce(1, *), 1)
+
+        // Number of index components per grid point
+        let numIndexComponents = dimNumbers.startIndexMap.count
+
+        // Indices stride for index_vector_dim
+        let ivd = dimNumbers.indexVectorDim
+        var indicesStrides = [Int](repeating: 1, count: indicesShape.count)
+        for i in stride(from: indicesShape.count - 2, through: 0, by: -1) {
+            indicesStrides[i] = indicesStrides[i + 1] * indicesShape[i + 1]
+        }
+
+        // Build the kernel body — decompose tid into output coordinates,
+        // then separate into grid coords (non-offset output dims) and offset coords.
+        var body = ""
+
+        // Decompose tid into output multi-index using output strides
+        for (d, _) in outputShape.enumerated() {
+            body += "            uint out\(d) = (tid / \(outputStrides[d])) % \(outputShape[d]);\n"
+        }
+
+        // Map output dims to grid coords and offset coords
+        // offset_dims tells us which output dims are offset dims
+        let offsetDimSet = Set(dimNumbers.offsetDims)
+        var gridDimIdx = 0
+        for (d, _) in outputShape.enumerated() {
+            if offsetDimSet.contains(d) {
+                // This output dim is an offset dim — find which offset index it is
+                if let oi = dimNumbers.offsetDims.firstIndex(of: d) {
+                    body += "            uint oc\(oi) = out\(d);\n"
+                }
+            } else {
+                // This output dim is a grid (batch/index) dim
+                body += "            uint gc\(gridDimIdx) = out\(d);\n"
+                gridDimIdx += 1
+            }
+        }
+
+        // Look up start indices from the indices tensor
+        // indices[grid_coords..., index_vector_dim_component]
+        for (comp, mappedDim) in dimNumbers.startIndexMap.enumerated() {
+            // Build flat index into indices tensor
+            var idxTerms: [String] = []
+            var gridDimIdx = 0
+            for d in 0..<indicesShape.count {
+                if d == ivd {
+                    idxTerms.append("\(comp) * \(indicesStrides[d])")
+                } else {
+                    idxTerms.append("gc\(gridDimIdx) * \(indicesStrides[d])")
+                    gridDimIdx += 1
                 }
             }
-            sliceSize = size
+            let idxExpr = idxTerms.joined(separator: " + ")
+            body += "            uint startIdx\(comp) = uint(indices[\(idxExpr)]);\n"
+            // Clamp
+            body += "            if (startIdx\(comp) >= \(operandShape[mappedDim])) startIdx\(comp) = \(operandShape[mappedDim] - 1);\n"
         }
 
-        // Calculate operand inner stride (elements per row/slice in operand)
-        // For a 2D operand [rows, cols], this is cols
-        let operandInnerStride: Int
-        if operandShape.count >= 2 && dimNumbers.startIndexMap.count == 1 && dimNumbers.startIndexMap[0] == 0 {
-            // Common case: gathering rows from 2D tensor
-            operandInnerStride = operandShape.dropFirst().reduce(1, *)
-        } else if operandShape.count == 1 {
-            operandInnerStride = 1
-        } else {
-            // General case: product of dimensions after the indexed dimension
-            let indexedDim = dimNumbers.startIndexMap.first ?? 0
-            if indexedDim < operandShape.count - 1 {
-                operandInnerStride = operandShape.suffix(from: indexedDim + 1).reduce(1, *)
+        // Compute flat operand index
+        body += "            uint srcPos = 0;\n"
+        var offsetDimCounter = 0
+        for d in 0..<operandShape.count {
+            if dimNumbers.collapsedSliceDims.contains(d) {
+                // Collapsed dim: use start index
+                if let comp = dimNumbers.startIndexMap.firstIndex(of: d) {
+                    body += "            srcPos += startIdx\(comp) * \(operandStrides[d]);\n"
+                }
+            } else if dimNumbers.operandBatchingDims.contains(d) {
+                // Batch dim (shouldn't reach here for non-batched)
             } else {
-                operandInnerStride = 1
+                // Offset dim: start_index (if indexed) + offset coordinate
+                if let comp = dimNumbers.startIndexMap.firstIndex(of: d) {
+                    body += "            srcPos += (startIdx\(comp) + oc\(offsetDimCounter)) * \(operandStrides[d]);\n"
+                } else {
+                    body += "            srcPos += oc\(offsetDimCounter) * \(operandStrides[d]);\n"
+                }
+                offsetDimCounter += 1
             }
         }
-
-        // Total output elements
-        let totalOutputElements = outputShape.reduce(1, *)
 
         return """
         kernel void \(entryPoint)(
@@ -1126,26 +1211,7 @@ public final class CodeGenerator: @unchecked Sendable {
             uint tid [[thread_position_in_grid]])
         {
             if (tid >= \(totalOutputElements)) return;
-
-            // Calculate which index and offset within slice
-            uint indexIdx = tid / \(sliceSize);
-            uint sliceOffset = tid % \(sliceSize);
-
-            // Bounds check for indices
-            if (indexIdx >= \(numIndices)) return;
-
-            // Get the index value (cast to uint for indexing)
-            uint idx = uint(indices[indexIdx]);
-
-            // Bounds check for operand
-            if (idx >= \(operandShape.first ?? 1)) {
-                output[tid] = 0;
-                return;
-            }
-
-            // Calculate source position
-            uint srcPos = idx * \(operandInnerStride) + sliceOffset;
-
+            \(body)
             output[tid] = operand[srcPos];
         }
         """
@@ -2947,19 +3013,36 @@ public final class CodeGenerator: @unchecked Sendable {
         let metalType = metalTypeName(for: elementType)
         let isFloat = isFloatType(elementType)
 
-        // Calculate batch size (product of all dimensions except last 2)
-        let batchSize = lhsShape.count > 2 ? lhsShape.dropLast(2).reduce(1, *) : 1
+        // Get contracting dimensions from dot_general attributes
+        let dotDimNums = attributes.dotDimensionNumbers
+        let lhsContractDims = dotDimNums?.lhsContractingDimensions ?? [lhsShape.count - 1]
+        let rhsContractDims = dotDimNums?.rhsContractingDimensions ?? (rhsShape.count >= 2 ? [rhsShape.count - 2] : [0])
+        let lhsBatchDims = dotDimNums?.lhsBatchingDimensions ?? []
+        let rhsBatchDims = dotDimNums?.rhsBatchingDimensions ?? []
 
-        // Extract M, K, N dimensions
-        // For matvec (RHS is 1D vector), treat as matrix-vector: M×K @ K → M (N=1)
-        let M = lhsShape.count >= 2 ? lhsShape[lhsShape.count - 2] : 1
-        let K = lhsShape.count >= 1 ? lhsShape[lhsShape.count - 1] : 1
-        let N = rhsShape.count >= 2 ? rhsShape[rhsShape.count - 1] : 1
+        // Calculate batch size from batch dimensions
+        let batchSize = lhsBatchDims.isEmpty ? (lhsShape.count > 2 ? lhsShape.dropLast(2).reduce(1, *) : 1) :
+            lhsBatchDims.reduce(1) { $0 * lhsShape[$1] }
 
-        // Use optimized simdgroup kernel only for float types with all dims >= 8.
-        // simdgroup_load/simdgroup_store always operate on 8x8 tiles and will
-        // read/write out of bounds for smaller matrices.
-        if isFloat && M >= 8 && K >= 8 && N >= 8 {
+        // Extract M, K, N:
+        // M = product of LHS non-contracting, non-batch dims
+        // K = product of contracting dims
+        // N = product of RHS non-contracting, non-batch dims
+        var M = 1
+        for (i, s) in lhsShape.enumerated() {
+            if !lhsContractDims.contains(i) && !lhsBatchDims.contains(i) { M *= s }
+        }
+        var K = 1
+        for d in lhsContractDims { K *= lhsShape[d] }
+        var N = 1
+        for (i, s) in rhsShape.enumerated() {
+            if !rhsContractDims.contains(i) && !rhsBatchDims.contains(i) { N *= s }
+        }
+
+        // Use optimized simdgroup kernel only for float types with dims that are
+        // multiples of 8. simdgroup_load/simdgroup_store operate on 8x8 tiles
+        // and will read/write out of bounds for non-aligned dimensions.
+        if isFloat && M % 8 == 0 && K % 8 == 0 && N % 8 == 0 && M >= 8 && K >= 8 && N >= 8 {
             return generateSimdgroupMatMulSource(batchSize: batchSize, metalType: metalType, elementType: elementType)
         } else {
             let zeroValue = isFloat ? "0.0" : "0"
@@ -4437,29 +4520,25 @@ public final class CodeGenerator: @unchecked Sendable {
         case .original(let opKind):
             switch opKind {
             case .dot, .dotGeneral:
-                // For matvec (1D output), N=1; for matmul (2D+ output), read from output shape
-                let M: Int
-                let N: Int
-                if outputShape.count >= 2 {
-                    M = outputShape[outputShape.count - 2]
-                    N = outputShape[outputShape.count - 1]
+                // Compute M, K, N from dot_general dimension numbers
+                let dims: (M: UInt32, K: UInt32, N: UInt32, batchSize: UInt32)
+                if inputShapes.count >= 2 {
+                    dims = dotGeneralDims(lhsShape: inputShapes[0], rhsShape: inputShapes[1], attributes: attributes)
                 } else {
-                    // matvec: output is 1D (M,), so M = output[0], N = 1
-                    M = outputShape.first ?? 1
-                    N = 1
+                    let m = outputShape.count >= 2 ? outputShape[outputShape.count - 2] : (outputShape.first ?? 1)
+                    let n = outputShape.count >= 2 ? outputShape[outputShape.count - 1] : 1
+                    dims = (UInt32(m), 1, UInt32(n), 1)
                 }
-                let batchSize = outputShape.count > 2 ? outputShape.dropLast(2).reduce(1, *) : 1
+                let M = Int(dims.M)
+                let N = Int(dims.N)
+                let K = Int(dims.K)
+                let batchSize = Int(dims.batchSize)
 
                 // Tile size for output: 32x32 per threadgroup
                 let tileSize = 32
                 let gridWidth = (N + tileSize - 1) / tileSize
                 let gridHeight = (M + tileSize - 1) / tileSize
-
-                // Check if using simdgroup kernel (float types with all dims >= 8)
-                // or basic tiled (integer types or small float matrices).
-                // simdgroup_load/store requires 8x8 tiles — small matrices use basic tiled.
-                let K = inputShapes.first.map { $0.count >= 1 ? $0[$0.count - 1] : 1 } ?? 1
-                let useSimdgroup = isFloatType(elementType) && M >= 8 && K >= 8 && N >= 8
+                let useSimdgroup = isFloatType(elementType) && M % 8 == 0 && K % 8 == 0 && N % 8 == 0 && M >= 8 && K >= 8 && N >= 8
 
                 if batchSize > 1 {
                     // 3D dispatch for batched matmul
@@ -4767,14 +4846,7 @@ public final class CodeGenerator: @unchecked Sendable {
                 let lhsShape = inputShapes[0]
                 let rhsShape = inputShapes[1]
 
-                // M = rows of A, K = cols of A = rows of B, N = cols of B
-                // For matvec (RHS is 1D vector), N = 1
-                let M = lhsShape.count >= 2 ? UInt32(lhsShape[lhsShape.count - 2]) : 1
-                let K = lhsShape.count >= 1 ? UInt32(lhsShape[lhsShape.count - 1]) : 1
-                let N = rhsShape.count >= 2 ? UInt32(rhsShape[rhsShape.count - 1]) : 1
-
-                // Calculate batch size for batched matmul
-                let batchSize = lhsShape.count > 2 ? UInt32(lhsShape.dropLast(2).reduce(1, *)) : 1
+                let (M, K, N, batchSize) = dotGeneralDims(lhsShape: lhsShape, rhsShape: rhsShape, attributes: op.attributes)
 
                 bindings.append(BufferBinding(
                     index: index,
@@ -4925,6 +4997,29 @@ public final class CodeGenerator: @unchecked Sendable {
     }
 
     // MARK: - Shared Memory
+
+    /// Computes M, K, N, batchSize for dot_general from dimension numbers.
+    private func dotGeneralDims(lhsShape: [Int], rhsShape: [Int], attributes: HLOAttributes) -> (M: UInt32, K: UInt32, N: UInt32, batchSize: UInt32) {
+        let dotDimNums = attributes.dotDimensionNumbers
+        let lhsContractDims = dotDimNums?.lhsContractingDimensions ?? [lhsShape.count - 1]
+        let rhsContractDims = dotDimNums?.rhsContractingDimensions ?? (rhsShape.count >= 2 ? [rhsShape.count - 2] : [0])
+        let lhsBatchDims = dotDimNums?.lhsBatchingDimensions ?? []
+
+        var mVal = 1
+        for (i, s) in lhsShape.enumerated() {
+            if !lhsContractDims.contains(i) && !lhsBatchDims.contains(i) { mVal *= s }
+        }
+        var kVal = 1
+        for d in lhsContractDims { kVal *= lhsShape[d] }
+        var nVal = 1
+        for (i, s) in rhsShape.enumerated() {
+            if !rhsContractDims.contains(i) && !(dotDimNums?.rhsBatchingDimensions ?? []).contains(i) { nVal *= s }
+        }
+        let batchVal = lhsBatchDims.isEmpty
+            ? (lhsShape.count > 2 ? lhsShape.dropLast(2).reduce(1, *) : 1)
+            : lhsBatchDims.reduce(1) { $0 * lhsShape[$1] }
+        return (UInt32(mVal), UInt32(kVal), UInt32(nVal), UInt32(batchVal))
+    }
 
     /// Returns the byte size of an element type.
     private func elementByteSize(for elementType: ElementType) -> Int {
