@@ -384,7 +384,7 @@ public final class CodeGenerator: @unchecked Sendable {
             return generateSiLUSource(inputShapes: inputShapes)
 
         case .fusedElementwise(let ops):
-            return generateElementwiseChainSource(ops, inputShapes: inputShapes)
+            return generateElementwiseChainSource(ops, inputShapes: inputShapes, elementType: elementType)
 
         case .fusedFFN(let config):
             return generateFFNSource(config, inputShapes: inputShapes)
@@ -553,9 +553,18 @@ public final class CodeGenerator: @unchecked Sendable {
         case .not:
             source += generateUnaryKernel(entryPoint: entryPoint, operation: "~x", metalType: metalType)
         case .shiftLeft:
-            source += generateBinaryKernel(entryPoint: entryPoint, operation: "a << b", metalType: metalType)
-        case .shiftRightArithmetic, .shiftRightLogical:
-            source += generateBinaryKernel(entryPoint: entryPoint, operation: "a >> b", metalType: metalType)
+            // StableHLO: shift_left(a, b) returns 0 if b >= bit_width.
+            // Metal/C: shifting by >= bit_width is undefined behavior.
+            let bitWidthL = elementByteSize(for: elementType) * 8
+            source += generateBinaryKernel(entryPoint: entryPoint, operation: "(b >= \(bitWidthL)) ? (\(metalType))(0) : (a << b)", metalType: metalType)
+        case .shiftRightLogical:
+            // StableHLO: shift_right_logical(a, b) returns 0 if b >= bit_width.
+            let bitWidthRL = elementByteSize(for: elementType) * 8
+            source += generateBinaryKernel(entryPoint: entryPoint, operation: "(b >= \(bitWidthRL)) ? (\(metalType))(0) : (a >> b)", metalType: metalType)
+        case .shiftRightArithmetic:
+            // StableHLO: shift_right_arithmetic(a, b) returns sign-fill if b >= bit_width.
+            let bitWidthRA = elementByteSize(for: elementType) * 8
+            source += generateBinaryKernel(entryPoint: entryPoint, operation: "(b >= \(bitWidthRA)) ? (a >> \(bitWidthRA - 1)) : (a >> b)", metalType: metalType)
 
         // Comparison operations (output is bool/i1)
         case .compare:
@@ -3720,16 +3729,17 @@ public final class CodeGenerator: @unchecked Sendable {
     /// - Input buffers at indices 0..<inputShapes.count
     /// - Output buffer at index inputShapes.count
     /// - Count scalar at index inputShapes.count + 1
-    private func generateElementwiseChainSource(_ ops: [HLOOpKind], inputShapes: [[Int]]) -> (String, String, TuningConfig?) {
+    private func generateElementwiseChainSource(_ ops: [HLOOpKind], inputShapes: [[Int]], elementType: ElementType = .float32) -> (String, String, TuningConfig?) {
         // Use the actual number of inputs passed to the operation.
         // This MUST match op.inputs.count used by buildBindings() to ensure
         // buffer indices are aligned between kernel signature and buffer bindings.
         let inputCount = max(inputShapes.count, 1)
+        let metalType = metalTypeName(for: elementType)
 
         // Generate kernel parameters for all inputs
         var inputParams: [String] = []
         for i in 0..<inputCount {
-            inputParams.append("device const float* input\(i) [[buffer(\(i))]]")
+            inputParams.append("device const \(metalType)* input\(i) [[buffer(\(i))]]")
         }
 
         // Output buffer comes after inputs (must match buildBindings layout)
@@ -3756,12 +3766,12 @@ public final class CodeGenerator: @unchecked Sendable {
                     inputIndex += 1
                 }
 
-                code += generateBinaryOpCode(op, left: left, right: right, declareX: !hasX)
+                code += generateBinaryOpCode(op, left: left, right: right, declareX: !hasX, metalType: metalType)
                 hasX = true
             } else {
                 // Unary operation
                 if !hasX {
-                    code += "float x = input\(inputIndex)[tid];\n"
+                    code += "\(metalType) x = input\(inputIndex)[tid];\n"
                     inputIndex += 1
                     hasX = true
                 }
@@ -3771,7 +3781,7 @@ public final class CodeGenerator: @unchecked Sendable {
 
         // If no operations, just copy input
         if !hasX && inputCount > 0 {
-            code = "float x = input0[tid];\n"
+            code = "\(metalType) x = input0[tid];\n"
         }
 
         let source = """
@@ -3780,7 +3790,7 @@ public final class CodeGenerator: @unchecked Sendable {
 
         kernel void kernel_elementwise_chain(
             \(inputParams.joined(separator: ",\n            ")),
-            device float* output [[buffer(\(outputBufferIndex))]],
+            device \(metalType)* output [[buffer(\(outputBufferIndex))]],
             constant uint& count [[buffer(\(outputBufferIndex + 1))]],
             uint tid [[thread_position_in_grid]])
         {
@@ -3796,7 +3806,8 @@ public final class CodeGenerator: @unchecked Sendable {
     /// Checks if an operation is binary.
     private func isBinaryOp(_ op: HLOOpKind) -> Bool {
         switch op {
-        case .add, .subtract, .multiply, .divide, .remainder, .maximum, .minimum, .power, .and, .or, .xor:
+        case .add, .subtract, .multiply, .divide, .remainder, .maximum, .minimum, .power,
+             .and, .or, .xor, .shiftLeft, .shiftRightLogical, .shiftRightArithmetic:
             return true
         default:
             return false
@@ -3804,8 +3815,8 @@ public final class CodeGenerator: @unchecked Sendable {
     }
 
     /// Generates code for a binary operation.
-    private func generateBinaryOpCode(_ op: HLOOpKind, left: String, right: String, declareX: Bool) -> String {
-        let prefix = declareX ? "float x = " : "x = "
+    private func generateBinaryOpCode(_ op: HLOOpKind, left: String, right: String, declareX: Bool, metalType: String = "float") -> String {
+        let prefix = declareX ? "\(metalType) x = " : "x = "
         switch op {
         case .add:
             return "\(prefix)\(left) + \(right);\n"
@@ -3823,6 +3834,21 @@ public final class CodeGenerator: @unchecked Sendable {
             return "\(prefix)min(\(left), \(right));\n"
         case .power:
             return "\(prefix)pow(\(left), \(right));\n"
+        case .and:
+            return "\(prefix)\(left) & \(right);\n"
+        case .or:
+            return "\(prefix)\(left) | \(right);\n"
+        case .xor:
+            return "\(prefix)\(left) ^ \(right);\n"
+        case .shiftLeft:
+            let bwL = metalType == "ulong" || metalType == "long" ? 64 : (metalType == "ushort" || metalType == "short" ? 16 : (metalType == "uchar" || metalType == "char" ? 8 : 32))
+            return "\(prefix)((\(right)) >= \(bwL)) ? (\(metalType))(0) : ((\(left)) << (\(right)));\n"
+        case .shiftRightLogical:
+            let bwRL = metalType == "ulong" || metalType == "long" ? 64 : (metalType == "ushort" || metalType == "short" ? 16 : (metalType == "uchar" || metalType == "char" ? 8 : 32))
+            return "\(prefix)((\(right)) >= \(bwRL)) ? (\(metalType))(0) : ((\(left)) >> (\(right)));\n"
+        case .shiftRightArithmetic:
+            let bwRA = metalType == "ulong" || metalType == "long" ? 64 : (metalType == "ushort" || metalType == "short" ? 16 : (metalType == "uchar" || metalType == "char" ? 8 : 32))
+            return "\(prefix)((\(right)) >= \(bwRA)) ? ((\(left)) >> \(bwRA - 1)) : ((\(left)) >> (\(right)));\n"
         default:
             return "\(prefix)\(left);\n"  // Fallback
         }

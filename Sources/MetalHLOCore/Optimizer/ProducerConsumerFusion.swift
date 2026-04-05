@@ -474,10 +474,11 @@ public final class ProducerConsumerFusion: @unchecked Sendable {
                     }
                     // The code generator places the previous result as the LEFT operand
                     // and the external input as the RIGHT operand. For non-commutative ops
-                    // (subtract, divide, remainder), this is only correct when the previous
-                    // result is actually the first operand. Reject if the previous result
-                    // is the second operand (would reverse the operation).
-                    if op.kind == .subtract || op.kind == .divide || op.kind == .remainder {
+                    // (subtract, divide, remainder, shifts), this is only correct when the
+                    // previous result is actually the first operand. Reject if the previous
+                    // result is the second operand (would reverse the operation).
+                    if op.kind == .subtract || op.kind == .divide || op.kind == .remainder ||
+                       op.kind == .shiftLeft || op.kind == .shiftRightLogical || op.kind == .shiftRightArithmetic {
                         if op.operands.count >= 2 && op.operands[1] == previousResult {
                             return false
                         }

@@ -1325,20 +1325,54 @@ private func inlineCallsInBody(_ mlir: String, startingCounter: inout Int) -> St
                     let baseName: String
                     let count: Int
                 }
+
+                // Pre-process: handle parameter shadowing.
+                // JAX emits MLIR like `%arg0 = xor %arg0, %arg1` where the body
+                // redefines a parameter. We must rename the redefinition so it
+                // doesn't conflict with parameter substitution.
+                let paramSet = Set(subst.keys)
+                var resolvedBodyLines = funcDef.bodyLines
+                var shadowedParams: Set<String> = []
+
+                for (lineIdx, bodyLine) in funcDef.bodyLines.enumerated() {
+                    if let eqR = bodyLine.range(of: " = ") {
+                        let def = String(bodyLine[bodyLine.startIndex..<eqR.lowerBound])
+                            .trimmingCharacters(in: .whitespaces)
+                        if def.hasPrefix("%") {
+                            let (baseName, _) = parseMultiResultDef(def)
+                            if paramSet.contains(baseName) {
+                                shadowedParams.insert(baseName)
+                                let shadowName = "%\(inlinePrefix)_\(baseName.dropFirst())"
+                                // Rename LHS on the defining line
+                                resolvedBodyLines[lineIdx] = resolvedBodyLines[lineIdx]
+                                    .replacingOccurrences(of: def + " = ", with: shadowName + " = ")
+                                // Rename subsequent references to use the shadow name
+                                for j in (lineIdx + 1)..<resolvedBodyLines.count {
+                                    resolvedBodyLines[j] = replaceSSAVariable(
+                                        in: resolvedBodyLines[j], variable: baseName, with: shadowName)
+                                }
+                            }
+                        }
+                    }
+                }
+
                 var bodyDefs: [InlineBodyDef] = []
-                for bodyLine in funcDef.bodyLines {
+                for bodyLine in resolvedBodyLines {
                     if let eqR = bodyLine.range(of: " = ") {
                         let def = String(bodyLine[bodyLine.startIndex..<eqR.lowerBound])
                             .trimmingCharacters(in: .whitespaces)
                         if def.hasPrefix("%") {
                             let (baseName, count) = parseMultiResultDef(def)
-                            bodyDefs.append(InlineBodyDef(rawDef: def, baseName: baseName, count: count))
+                            // Skip shadow defs — already renamed with inline prefix
+                            if !shadowedParams.contains(baseName) {
+                                bodyDefs.append(InlineBodyDef(rawDef: def, baseName: baseName, count: count))
+                            }
                         }
                     }
                 }
 
                 // Emit inlined body
-                for bodyLine in funcDef.bodyLines {
+                for bodyLine in resolvedBodyLines {
                     var line = bodyLine
 
                     // Rename the definition on this line
@@ -1608,12 +1642,17 @@ func pjrt_client_compile(
             } else {
                 optLevel = .O2
             }
+            var disabledPasses: Set<String> = []
+            if let disabledStr = ProcessInfo.processInfo.environment["METALHLO_DISABLED_PASSES"] {
+                disabledPasses = Set(disabledStr.split(separator: ",").map(String.init))
+            }
             let config = CompilationConfig(
                 optimizationLevel: optLevel,
+                disabledPasses: disabledPasses,
                 devicePolicy: resolveDevicePolicy()
             )
             if debugCompile {
-                print("[MetalHLO] Using O2 path, devicePolicy=\(resolveDevicePolicy())")
+                print("[MetalHLO] Using \(optLevel) path, devicePolicy=\(resolveDevicePolicy())")
             }
             executable = try impl.client.compile(mlirSource, config: config)
         }
