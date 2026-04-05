@@ -1197,10 +1197,11 @@ private func inlineCallsInBody(_ mlir: String) -> String {
                 }
             }
 
-            // Don't inline functions that contain while loops or nested calls
+            // Don't inline functions that contain while loops (control flow
+            // that can't be flattened). Functions with nested calls ARE allowed —
+            // the convergence loop will inline them level by level.
             let hasWhile = bodyLines.contains { $0.contains("stablehlo.while") }
-            let hasNestedCall = bodyLines.contains { $0.contains("func.call @") || $0.contains("call @") }
-            if !hasWhile && !hasNestedCall {
+            if !hasWhile {
                 privateFuncs[funcName] = PrivateFunc(
                     name: funcName,
                     paramNames: paramNames,
