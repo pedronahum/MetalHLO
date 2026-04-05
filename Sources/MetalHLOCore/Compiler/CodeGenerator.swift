@@ -609,10 +609,17 @@ public final class CodeGenerator: @unchecked Sendable {
             )
 
         // Type conversion operations
-        case .convert, .bitcastConvert:
-            // Get input element type from input shape info or default
+        case .convert:
             let inputType = attributes.inputElementTypes?.first ?? .float32
             source += generateConvertKernel(
+                entryPoint: entryPoint,
+                inputType: inputType,
+                outputType: elementType
+            )
+
+        case .bitcastConvert:
+            let inputType = attributes.inputElementTypes?.first ?? .float32
+            source += generateBitcastConvertKernel(
                 entryPoint: entryPoint,
                 inputType: inputType,
                 outputType: elementType
@@ -980,6 +987,29 @@ public final class CodeGenerator: @unchecked Sendable {
             if (tid >= count) return;
             \(inputMetal) x = input[tid];
             output[tid] = \(conversion);
+        }
+        """
+    }
+
+    /// Generates a bitcast conversion kernel that reinterprets bits without changing values.
+    /// Uses Metal's as_type<T>() for same-size types.
+    private func generateBitcastConvertKernel(
+        entryPoint: String,
+        inputType: ElementType,
+        outputType: ElementType
+    ) -> String {
+        let inputMetal = metalTypeName(for: inputType)
+        let outputMetal = metalTypeName(for: outputType)
+
+        return """
+        kernel void \(entryPoint)(
+            device const \(inputMetal)* input [[buffer(0)]],
+            device \(outputMetal)* output [[buffer(1)]],
+            constant uint& count [[buffer(2)]],
+            uint tid [[thread_position_in_grid]])
+        {
+            if (tid >= count) return;
+            output[tid] = as_type<\(outputMetal)>(input[tid]);
         }
         """
     }
