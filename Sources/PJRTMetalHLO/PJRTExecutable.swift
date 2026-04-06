@@ -888,9 +888,10 @@ private func unrollStaticWhileLoops(_ mlir: String) -> String {
         return mlir
     }
 
-    // Safety: don't unroll very large loops
-    guard loopBound <= 1000 else {
-        if debugCompile { print("[MetalHLO] While unroll: loop bound \(loopBound) too large") }
+    // Safety: don't unroll very large loops, and don't unroll 0-iteration
+    // loops (they should be preserved for MPSGraph to handle the while).
+    guard loopBound > 0 && loopBound <= 1000 else {
+        if debugCompile { print("[MetalHLO] While unroll: loop bound \(loopBound) out of range (must be 1-1000)") }
         return mlir
     }
 

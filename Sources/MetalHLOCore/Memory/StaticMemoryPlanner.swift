@@ -452,8 +452,14 @@ public final class StaticMemoryPlanner: @unchecked Sendable {
         var offsets: [TensorID: Int] = [:]
         var allocatedRegions: [(start: Int, end: Int, tensor: TensorID)] = []
 
-        // Sort tensors by size (largest first) for better packing
-        let sortedTensors = lifetimes.sorted { $0.value.byteSize > $1.value.byteSize }
+        // Sort tensors by size (largest first) for better packing.
+        // Use tensor ID as tiebreaker for deterministic ordering.
+        let sortedTensors = lifetimes.sorted {
+            if $0.value.byteSize != $1.value.byteSize {
+                return $0.value.byteSize > $1.value.byteSize
+            }
+            return $0.key < $1.key
+        }
 
         for (tensorID, lifetime) in sortedTensors {
             let size = lifetime.byteSize

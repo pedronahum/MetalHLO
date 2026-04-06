@@ -3039,14 +3039,30 @@ public final class CodeGenerator: @unchecked Sendable {
             if !rhsContractDims.contains(i) && !rhsBatchDims.contains(i) { N *= s }
         }
 
+        // Determine if LHS or RHS needs transposition.
+        // The kernel assumes A is [M, K] and B is [K, N] in memory.
+        // If the contracting dim is not in the expected position, we need to
+        // adjust the read pattern.
+        let lhsNonBatchDims = lhsShape.enumerated().filter { !lhsBatchDims.contains($0.offset) }.map { $0.offset }
+        let rhsNonBatchDims = rhsShape.enumerated().filter { !rhsBatchDims.contains($0.offset) }.map { $0.offset }
+        // LHS: contracting dim should be last among non-batch dims for [M, K] layout
+        let transA = !lhsNonBatchDims.isEmpty && lhsContractDims.contains(lhsNonBatchDims.first!)
+        // RHS: contracting dim should be first among non-batch dims for [K, N] layout
+        let transB = !rhsNonBatchDims.isEmpty && lhsContractDims.count == 1 &&
+                     rhsContractDims.contains(rhsNonBatchDims.last!)
+
         // Use optimized simdgroup kernel only for float types with dims that are
-        // multiples of 8. simdgroup_load/simdgroup_store operate on 8x8 tiles
-        // and will read/write out of bounds for non-aligned dimensions.
-        if isFloat && M % 8 == 0 && K % 8 == 0 && N % 8 == 0 && M >= 8 && K >= 8 && N >= 8 {
+        // multiples of 8 AND no transposition needed.
+        if isFloat && !transA && !transB && M % 8 == 0 && K % 8 == 0 && N % 8 == 0 && M >= 8 && K >= 8 && N >= 8 {
             return generateSimdgroupMatMulSource(batchSize: batchSize, metalType: metalType, elementType: elementType)
         } else {
             let zeroValue = isFloat ? "0.0" : "0"
-            return generateBasicTiledMatMulSource(batchSize: batchSize, metalType: metalType, zeroValue: zeroValue)
+            // Generate read expressions that handle transposition
+            let aRead = transA ? "batchA[k * \(M) + row]" : "batchA[row * K + k]"
+            let bRead = transB ? "batchB[col * K + k]" : "batchB[k * N + col]"
+            return generateBasicMatMulSourceWithTranspose(
+                batchSize: batchSize, metalType: metalType, zeroValue: zeroValue, M: M, N: N, K: K,
+                aRead: aRead, bRead: bRead)
         }
     }
 
@@ -3330,6 +3346,48 @@ public final class CodeGenerator: @unchecked Sendable {
 
     /// Generates a basic tiled matmul kernel for integer types or small float matrices
     /// (simdgroup_matrix requires all dims >= 8).
+    /// Generates a basic matmul kernel with custom A/B read expressions for transposed access.
+    private func generateBasicMatMulSourceWithTranspose(
+        batchSize: Int, metalType: String, zeroValue: String,
+        M: Int, N: Int, K: Int,
+        aRead: String, bRead: String
+    ) -> (String, String, TuningConfig?) {
+        // Simple non-tiled kernel — 1 thread per output element
+        let source = """
+        #include <metal_stdlib>
+        using namespace metal;
+
+        kernel void kernel_matmul(
+            device const \(metalType)* A [[buffer(0)]],
+            device const \(metalType)* B [[buffer(1)]],
+            device \(metalType)* C [[buffer(2)]],
+            constant uint& M [[buffer(3)]],
+            constant uint& N [[buffer(4)]],
+            constant uint& K [[buffer(5)]],
+            constant uint& batchCount [[buffer(6)]],
+            uint tid [[thread_position_in_grid]])
+        {
+            uint totalOutputs = \(batchSize) * M * N;
+            if (tid >= totalOutputs) return;
+
+            uint batch = tid / (M * N);
+            uint rem = tid % (M * N);
+            uint row = rem / N;
+            uint col = rem % N;
+
+            device const \(metalType)* batchA = A + batch * M * K;
+            device const \(metalType)* batchB = B + batch * K * N;
+
+            \(metalType) sum = \(zeroValue);
+            for (uint k = 0; k < K; k++) {
+                sum += \(aRead) * \(bRead);
+            }
+            C[tid] = sum;
+        }
+        """
+        return (source, "kernel_matmul", TuningConfig(blockSize: 1))
+    }
+
     private func generateBasicTiledMatMulSource(batchSize: Int, metalType: String, zeroValue: String) -> (String, String, TuningConfig?) {
         let tuning = TuningConfig(
             tileM: 32, tileN: 32, tileK: 32,
@@ -4539,6 +4597,11 @@ public final class CodeGenerator: @unchecked Sendable {
                 let gridWidth = (N + tileSize - 1) / tileSize
                 let gridHeight = (M + tileSize - 1) / tileSize
                 let useSimdgroup = isFloatType(elementType) && M % 8 == 0 && K % 8 == 0 && N % 8 == 0 && M >= 8 && K >= 8 && N >= 8
+
+                // Non-tiled kernel (1 thread per output): for transposed matmul
+                if let t = tuning, t.blockSize == 1 {
+                    return DispatchConfig.dispatch1D(elements: M * N * batchSize, threadgroupSize: 256)
+                }
 
                 if batchSize > 1 {
                     // 3D dispatch for batched matmul

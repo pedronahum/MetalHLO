@@ -155,10 +155,6 @@ public final class IntegratedExecutor: @unchecked Sendable {
         }
 
         // Zero the unified buffer to prevent stale data from affecting results.
-        // The memory planner reuses buffer regions for tensors with non-overlapping
-        // lifetimes, but lifetime computation bugs can cause a region to be read
-        // before being written, producing nondeterministic results from uninitialized
-        // memory. Zeroing is a safety net (~0.01ms for typical buffer sizes).
         memset(unifiedBuffer.contents(), 0, unifiedBuffer.length)
 
         // Create command buffer
