@@ -553,6 +553,10 @@ public final class CommonSubexpressionEliminationPass: OptimizationPass, @unchec
     private func computeSignature(_ op: HLOOperation) -> String {
         var parts: [String] = [op.kind.rawValue]
         parts.append(contentsOf: op.operands)
+        // Include result type — operations with the same kind/operands but
+        // different result types (e.g., broadcast to uint32 vs float32) must
+        // not be merged.
+        parts.append("type:\(op.resultType)")
 
         // Add relevant attributes
         if let dims = op.attributes.dimensions {
