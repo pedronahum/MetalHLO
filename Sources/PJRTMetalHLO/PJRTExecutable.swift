@@ -41,11 +41,46 @@ private func convertBytecodeToText(_ bytecode: Data) -> Result<String, BytecodeE
         text = re.sub(r'\{sdy\.sharding\s*=\s*#sdy\.sharding<[^>]*>\}', '', text)
         # Strip sdy.sharding_constraint passthrough ops:
         #   %out = sdy.sharding_constraint %in <@mesh, [...]> : type
-        # Replace all uses of %out with %in since the op is identity.
-        for m in re.finditer(r'^\s*(%\S+)\s*=\s*sdy\.sharding_constraint\s+(%\S+)\s.*$', text, re.MULTILINE):
-            text = text.replace(m.group(0), '')  # remove the constraint line
-            # Word-boundary-aware replacement: %out followed by non-identifier char
-            text = re.sub(re.escape(m.group(1)) + r'(?=[^a-zA-Z0-9_#]|$)', m.group(2), text)
+        # Replace uses of %out with %in ONLY within the same function body.
+        # Global replacement would rename %out in other functions too, which
+        # can create SSA name collisions (e.g., %0 in @threefry2x32).
+        def _strip_sdy_constraints(text):
+            constraints = list(re.finditer(
+                r'^\s*(%\S+)\s*=\s*sdy\.sharding_constraint\s+(%\S+)\s.*$',
+                text, re.MULTILINE))
+            if not constraints:
+                return text
+            lines = text.split('\n')
+            # Find function boundaries
+            func_bounds = []  # (start_line, end_line)
+            cur_start = None
+            for i, line in enumerate(lines):
+                if re.match(r'\s*func\.func\b', line):
+                    cur_start = i
+                elif re.match(r'\s*\}\s*$', line) and cur_start is not None:
+                    func_bounds.append((cur_start, i))
+                    cur_start = None
+            # Process each constraint
+            for m in constraints:
+                out_name, in_name = m.group(1), m.group(2)
+                line_num = text[:m.start()].count('\n')
+                # Find which function this constraint belongs to
+                func_start, func_end = 0, len(lines) - 1
+                for start, end in func_bounds:
+                    if start <= line_num <= end:
+                        func_start, func_end = start, end
+                        break
+                # Remove the constraint line
+                for i in range(func_start, func_end + 1):
+                    if 'sdy.sharding_constraint' in lines[i] and out_name in lines[i]:
+                        lines[i] = ''
+                        break
+                # Replace %out with %in only within this function
+                pat = re.compile(re.escape(out_name) + r'(?=[^a-zA-Z0-9_#]|$)')
+                for i in range(func_start, func_end + 1):
+                    lines[i] = pat.sub(in_name, lines[i])
+            return '\n'.join(lines)
+        text = _strip_sdy_constraints(text)
         # Strip precision attributes
         text = re.sub(r',\s*precision_config\s*=\s*\[[^\]]*\]', '', text)
         text = re.sub(r',\s*precision\s*=\s*\[[^\]]*\]', '', text)
