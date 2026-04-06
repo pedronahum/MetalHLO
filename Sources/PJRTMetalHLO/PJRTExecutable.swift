@@ -1497,9 +1497,16 @@ private func inlineCallsInBody(_ mlir: String, startingCounter: inout Int) -> St
                     // Store as a global mapping
                     // Actually, let's just collect all lines first, then do a final pass
                     // Mark these result mappings for the final pass
+                    if ProcessInfo.processInfo.environment["METALHLO_DEBUG_INLINE"] != nil {
+                        print("[Inline] Function \(funcName): returnValues=\(funcDef.returnValues)")
+                        print("[Inline] resultVar=\(rv), resultCount=\(resultCount)")
+                    }
                     for (refStr, mappedVal) in resultMap {
                         // Tag the newLines array end so we can apply in final pass
                         newLines.append("// __INLINE_MAP__ \(refStr) -> \(mappedVal)")
+                        if ProcessInfo.processInfo.environment["METALHLO_DEBUG_INLINE"] != nil {
+                            print("[Inline] Map: \(refStr) -> \(mappedVal)")
+                        }
                     }
                 }
 
