@@ -194,8 +194,23 @@ public final class StaticMemoryPlanner: @unchecked Sendable {
         // 4. Filter out inputs and constants - they come from external buffers, not the unified buffer
         let intermediateLifetimes = orderedLifetimes.filter { !$0.value.isInput && !$0.value.isConstant }
 
-        // 5. Assign offsets using best-fit decreasing bin packing (only for intermediates)
-        let (offsets, totalSize, peakMemory) = assignOffsets(intermediateLifetimes, interference: interference)
+        // 5. Assign offsets — disable reuse to test buffer aliasing hypothesis
+        let (offsets, totalSize, peakMemory): ([TensorID: Int], Int, Int)
+        if ProcessInfo.processInfo.environment["METALHLO_NO_REUSE"] != nil {
+            var offs: [TensorID: Int] = [:]
+            var next = 0
+            let a = config.bufferAlignment
+            for (id, lt) in intermediateLifetimes.sorted(by: { $0.key < $1.key }) {
+                next = ((next + a - 1) / a) * a
+                offs[id] = next
+                next += lt.byteSize
+            }
+            offsets = offs
+            totalSize = next
+            peakMemory = next
+        } else {
+            (offsets, totalSize, peakMemory) = assignOffsets(intermediateLifetimes, interference: interference)
+        }
 
         // 5. Identify sharing groups
         let groups = findSharingGroups(offsets, interference: interference, lifetimes: orderedLifetimes)

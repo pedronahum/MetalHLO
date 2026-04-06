@@ -568,6 +568,11 @@ public final class CommonSubexpressionEliminationPass: OptimizationPass, @unchec
             parts.append("const:\(constantValue)")
         }
 
+        // Iota dimension — different dims produce different results
+        if let iotaDim = op.attributes.iotaDimension {
+            parts.append("iotaDim:\(iotaDim)")
+        }
+
         // Slice attributes — different start/limit/stride = different result
         if let starts = op.attributes.sliceStarts {
             parts.append("sliceStarts:\(starts)")
