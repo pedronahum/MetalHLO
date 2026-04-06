@@ -29,6 +29,7 @@ private func convertBytecodeToText(_ bytecode: Data) -> Result<String, BytecodeE
         bytecode = sys.stdin.buffer.read()
         module = _stablehlo.deserialize_portable_artifact(ctx, bytecode)
         text = str(module)
+        # Note: shadow fixing moved after sdy stripping (see _fix_shadows below)
         # Strip module attributes (our parser doesn't handle them)
         text = re.sub(r'(module @\S+)\s+attributes\s+\{[^}]*\}', r'\1', text)
         # Strip 'public' visibility on func.func
@@ -48,83 +49,37 @@ private func convertBytecodeToText(_ bytecode: Data) -> Result<String, BytecodeE
         # Strip precision attributes
         text = re.sub(r',\s*precision_config\s*=\s*\[[^\]]*\]', '', text)
         text = re.sub(r',\s*precision\s*=\s*\[[^\]]*\]', '', text)
-        # Fix SSA name collisions: JAX's MLIR printer can redefine %argN in a
-        # function body with a different type. The redef creates a new value but
-        # the text reuses the same name. We detect the result type of the redef
-        # and rename the def + uses that match that type.
-        def _fix_ssa_shadows(text):
-            lines = text.split('\n')
-            out = []
-            params = {}  # param_name -> param_type_str
-            shd = 0
-            i = 0
-            while i < len(lines):
-                line = lines[i]
-                # Detect function header to collect parameter names and types
-                fm = re.match(r'\s*func\.func\s+(?:private\s+)?@\w+\(([^)]*)\)', line)
+        # Fix SSA shadows AFTER sdy stripping — the sdy.sharding_constraint
+        # replacement can rename %0 to %arg0 globally, creating collisions
+        # in other functions. Rename LHS of shadow defs + next-line uses.
+        def _fix_shadows(t):
+            ls = t.split('\n')
+            o = []
+            ps = set()
+            sn = 0
+            rn = None
+            for l in ls:
+                fm = re.match(r'\s*func\.func\s+(?:private\s+)?@\w+\(([^)]*)\)', l)
                 if fm:
-                    params = {}
-                    for pm in re.finditer(r'(%arg\d+):\s*(tensor<[^>]+>)', fm.group(1)):
-                        params[pm.group(1)] = pm.group(2)
-                if re.match(r'\s*\}\s*$', line):
-                    params = {}
-                # Detect redef: %argN = op ... -> result_type
-                dm = re.match(r'^(\s*)(%arg\d+)(\s*=\s*)', line)
-                if dm and dm.group(2) in params:
-                    old = dm.group(2)
-                    param_type = params[old]
-                    # Extract result type from the line
-                    tm = re.search(r'->\s*(?:\()?\s*(tensor<[^>]+>)', line)
-                    if not tm:
-                        # For ops like `xor %a, %b : tensor<ui32>`, type is after last `:`
-                        tm = re.search(r':\s*(tensor<[^>]+>)\s*$', line)
-                    redef_type = tm.group(1) if tm else None
-                    if redef_type and redef_type != param_type:
-                        # Types differ — this is a true shadow. Rename def + matching uses.
-                        new = f'%_shd{shd}'
-                        shd += 1
-                        line = line[:dm.start(2)] + new + line[dm.end(2):]
-                        out.append(line)
-                        i += 1
-                        # Rename subsequent uses that reference the shadow type
-                        while i < len(lines):
-                            ln = lines[i]
-                            if re.match(r'\s*\}\s*$', ln):
-                                break
-                            # Check if this line redefines the same param again
-                            dm2 = re.match(r'^(\s*)' + re.escape(old) + r'(\s*=\s*)', ln)
-                            if dm2:
-                                break
-                            # Replace uses: only if the line's type context matches redef_type
-                            # Simple heuristic: if the line mentions the redef type, rename
-                            if redef_type.replace('x', 'x') in ln:
-                                ln = re.sub(re.escape(old) + r'(?=[^a-zA-Z0-9_#]|$)', new, ln)
-                            out.append(ln)
-                            i += 1
-                        continue
-                    elif redef_type == param_type:
-                        # Same type shadow (like threefry's %arg0 = xor %arg0, %arg1)
-                        # Rename def and ALL subsequent uses
-                        new = f'%_shd{shd}'
-                        shd += 1
-                        line = line[:dm.start(2)] + new + line[dm.end(2):]
-                        out.append(line)
-                        i += 1
-                        while i < len(lines):
-                            ln = lines[i]
-                            if re.match(r'\s*\}\s*$', ln):
-                                break
-                            dm2 = re.match(r'^(\s*)' + re.escape(old) + r'(\s*=\s*)', ln)
-                            if dm2:
-                                break
-                            ln = re.sub(re.escape(old) + r'(?=[^a-zA-Z0-9_#]|$)', new, ln)
-                            out.append(ln)
-                            i += 1
-                        continue
-                out.append(line)
-                i += 1
-            return '\n'.join(out)
-        text = _fix_ssa_shadows(text)
+                    ps = set(re.findall(r'(%arg\d+)', fm.group(1)))
+                    rn = None
+                if re.match(r'\s*\}\s*$', l):
+                    ps = set()
+                    rn = None
+                if rn:
+                    old2, new2 = rn
+                    l = re.sub(re.escape(old2) + r'(?=[^a-zA-Z0-9_#]|$)', new2, l)
+                    rn = None
+                dm = re.match(r'^(\s*)(%arg\d+)(\s*=\s*)', l)
+                if dm and dm.group(2) in ps:
+                    old2 = dm.group(2)
+                    new2 = f'%_shd{sn}'
+                    sn += 1
+                    l = l[:dm.start(2)] + new2 + l[dm.end(2):]
+                    rn = (old2, new2)
+                o.append(l)
+            return '\n'.join(o)
+        text = _fix_shadows(text)
         # Convert generic form inherent attributes <{...}> to {...}
         text = text.replace('<{', '{')
         text = text.replace('}>', '}')
