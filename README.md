@@ -883,6 +883,8 @@ Some operations only support floating-point types in MPSGraph:
 | `dynamic_slice` | Working | Works when slice_sizes equal input dims (start indices clamped) |
 | `reduce_window` | Partial | Works for common patterns; complex regions limited |
 | `convolution` | Partial | Standard patterns work; complex dimension permutations may fail |
+| `scatter` (region form) | Not supported | Parser does not handle the generic-form region syntax `({ ^bb0(...): ... })` required for scatter's update computation body |
+| `stablehlo.while` | Partial | Small loop counts (≤ 1000 iterations) are unrolled inline; large loops fall back to MPSGraph which may crash on complex loop bodies (see below) |
 
 **Scatter computation modes:**
 ```mlir
@@ -896,6 +898,27 @@ scatter %operand, %indices, %updates                      // Default: replaces v
 
 **Batching dimension support:**
 Gather and scatter parse batching dimension attributes (`operand_batching_dims`, `start_indices_batching_dims` for gather; `input_batching_dims`, `scatter_indices_batching_dims` for scatter). The implementation includes a transpose-gather/scatter-transpose pattern for arbitrary batch dimension positions. Best tested with batch dimensions at leading positions; complex non-leading configurations may require additional work.
+
+### Known Issues Under Investigation
+
+**Scatter region parsing:**
+The StableHLO `scatter` operation requires an inline region body to specify the update computation (e.g., identity/replace or add/accumulate). The MLIR uses a generic form with a region followed by an attribute dictionary:
+```mlir
+%1 = "stablehlo.scatter"(%input, %indices, %updates) ({
+  ^bb0(%arg0: tensor<f32>, %arg1: tensor<f32>):
+    stablehlo.return %arg1 : tensor<f32>
+}) { scatter_dimension_numbers = ... }
+```
+The parser does not currently handle this `({ ... })` region syntax. We are working on extending the parser to support generic-form operations with region bodies.
+
+**Large `stablehlo.while` loops (`jax.lax.scan`):**
+Programs that use `jax.lax.scan` with large iteration counts (e.g., 20,000 time steps in a simulation) compile to `stablehlo.while` loops. MetalHLO handles these in two ways:
+- **Small loops (≤ 1000 iterations)** are unrolled inline into a single flat kernel. This works but produces very large Metal shaders.
+- **Large loops (> 1000 iterations)** fall back to the MPSGraph backend, which has a native while-loop executor. However, the MPSGraph while-loop handler currently crashes on complex loop bodies that include multiple operations (collision, forcing, streaming, boundary conditions).
+
+We are investigating two approaches to resolve this:
+1. **Fix MPSGraph while-loop compilation** for complex multi-operation loop bodies.
+2. **Implement a Metal-native loop executor** that dispatches the loop body kernel repeatedly from the CPU/command buffer level, avoiding the need to unroll into a single shader or rely on MPSGraph's while-loop support.
 
 ## StableHLO Conformance
 
