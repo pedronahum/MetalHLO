@@ -14,6 +14,7 @@ import Foundation
 import Metal
 import QuartzCore
 @testable import MetalHLOCore
+import MetalHLOBenchmarks
 
 // MARK: - Configuration
 
@@ -502,9 +503,8 @@ func runRealisticEndToEnd(device: MTLDevice, commandQueue: MTLCommandQueue, conf
         // Estimate layer compute cost: a [batch, 768] × [768, 768] matmul takes ~X µs on GPU.
         // We measure 12 trivial GPU dispatches as proxy for forward pass dispatch cost.
         // The actual matmul compute scales with batch size.
-        // Reference: M1 does ~2.6 TFLOPS fp32. matmul flops = 2*B*768*768.
         let matmulFlops = Double(2 * batchSize * hiddenDim * hiddenDim)
-        let peakTflops = 2.6  // M1 fp32
+        let peakTflops = AppleSiliconSpecs.detect()?.fp32TFLOPS ?? 2.6
         let matmulTheoretical = matmulFlops / (peakTflops * 1e12)  // seconds
         let layerEstimateUs = max(matmulTheoretical * 1e6, 10.0)  // at least 10µs
         let totalLayerUs = layerEstimateUs * Double(numLayers)

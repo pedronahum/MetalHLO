@@ -24,7 +24,10 @@ public struct AppleSiliconSpecs: Sendable {
         self.memoryBandwidthGBps = memoryBandwidthGBps
     }
 
-    /// Known Apple Silicon specifications (from benchmark proposal Appendix A.1).
+    /// Known Apple Silicon specifications.
+    /// M1–M4 figures from Apple spec sheets. M5 family figures are estimates
+    /// (TODO: verify against final Apple documentation) and feed only the
+    /// utilization-% reporting; calibration measures actual throughput.
     public static let knownChips: [String: AppleSiliconSpecs] = [
         "M1": AppleSiliconSpecs(name: "M1", gpuCores: 8, fp32TFLOPS: 2.6, fp16TFLOPS: 5.2, memoryBandwidthGBps: 68.25),
         "M1 Pro": AppleSiliconSpecs(name: "M1 Pro", gpuCores: 16, fp32TFLOPS: 5.2, fp16TFLOPS: 10.4, memoryBandwidthGBps: 200),
@@ -38,25 +41,29 @@ public struct AppleSiliconSpecs: Sendable {
         "M4": AppleSiliconSpecs(name: "M4", gpuCores: 10, fp32TFLOPS: 4.3, fp16TFLOPS: 8.6, memoryBandwidthGBps: 120),
         "M4 Pro": AppleSiliconSpecs(name: "M4 Pro", gpuCores: 20, fp32TFLOPS: 8.6, fp16TFLOPS: 17.2, memoryBandwidthGBps: 273),
         "M4 Max": AppleSiliconSpecs(name: "M4 Max", gpuCores: 40, fp32TFLOPS: 17.2, fp16TFLOPS: 34.4, memoryBandwidthGBps: 546),
+        "M5": AppleSiliconSpecs(name: "M5", gpuCores: 10, fp32TFLOPS: 4.6, fp16TFLOPS: 9.2, memoryBandwidthGBps: 153),
+        "M5 Pro": AppleSiliconSpecs(name: "M5 Pro", gpuCores: 16, fp32TFLOPS: 9.5, fp16TFLOPS: 19.0, memoryBandwidthGBps: 300),
+        "M5 Max": AppleSiliconSpecs(name: "M5 Max", gpuCores: 40, fp32TFLOPS: 18.4, fp16TFLOPS: 36.8, memoryBandwidthGBps: 600),
     ]
 
     /// Detect current hardware specs based on Metal device name.
+    /// Matches longest chip name first so "M1 Pro" wins over "M1" on a Pro device.
     public static func detect() -> AppleSiliconSpecs? {
         guard let device = MTLCreateSystemDefaultDevice() else { return nil }
         let name = device.name
 
-        // Try to match known chip
-        for (chipName, specs) in knownChips {
+        let sorted = knownChips.sorted { $0.key.count > $1.key.count }
+        for (chipName, specs) in sorted {
             if name.contains(chipName) {
                 return specs
             }
         }
 
-        // Fallback: estimate based on device properties
-        // This is approximate for unknown chips
+        // Fallback: unknown chip — calibration still yields correct timing,
+        // only utilization-% reporting is approximate.
         return AppleSiliconSpecs(
             name: name,
-            gpuCores: 10,  // Conservative estimate
+            gpuCores: 10,
             fp32TFLOPS: 4.0,
             fp16TFLOPS: 8.0,
             memoryBandwidthGBps: 100

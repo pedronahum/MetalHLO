@@ -139,7 +139,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "DepthAttentionBenchmark",
-            dependencies: ["MetalHLOCore"],
+            dependencies: ["MetalHLOCore", "MetalHLOBenchmarks"],
             path: "Sources/DepthAttentionBenchmark",
             swiftSettings: [.unsafeFlags(["-enable-testing"])]
         ),

@@ -119,54 +119,17 @@ extension HardwareProfile {
 
 extension HardwareProfile {
 
-    /// Safe output buffer size — fraction of RAM before thrashing.
+    /// Safe output buffer size — derived from Metal's per-device working-set ceiling.
+    ///
+    /// Matches MLX's allocator gate (`block_limit ≈ 0.95 × recommendedMaxWorkingSetSize`),
+    /// divided by 3 to account for concurrent 3-unit fused execution tripling the working
+    /// set. The previous probe-based approach allocated multi-GB matmuls in a fraction
+    /// sweep of physicalMemory and froze high-RAM machines (48 GB M5 Pro hung at fraction
+    /// 0.40 = 19 GB per buffer). Apple already publishes the safe resident ceiling per
+    /// device; we trust it instead of re-measuring.
     fileprivate static func measureMaxOutputBytes(ctx: CalibrationContext) -> Int {
-        let physicalRAM = ProcessInfo.processInfo.physicalMemory
-
-        // Step through fractions of RAM. If per-element time spikes 3x, cliff found.
-        let testN = 4096
-        let testK = 4096
-        let fractions: [Double] = [0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40]
-        var lastSafeBytes = Int(Double(physicalRAM) * 0.10)
-        var baselineTimePerElement: Double? = nil
-
-        for fraction in fractions {
-            let testBytes = Int(Double(physicalRAM) * fraction)
-            let M = testBytes / (testN * MemoryLayout<Float>.size)
-            guard M >= 64 else { continue }
-
-            let aBytes = M * testK * MemoryLayout<Float>.size
-            let bBytes = testK * testN * MemoryLayout<Float>.size
-            let cBytes = M * testN * MemoryLayout<Float>.size
-
-            guard let bufA = ctx.device.makeBuffer(length: aBytes, options: .storageModeShared),
-                  let bufB = ctx.device.makeBuffer(length: bBytes, options: .storageModeShared),
-                  let bufC = ctx.device.makeBuffer(length: cBytes, options: .storageModeShared) else {
-                break
-            }
-
-            fillRandom(bufA, count: M * testK)
-            fillRandom(bufB, count: testK * testN)
-
-            _ = executeMPSOnly(ctx: ctx, A: bufA, B: bufB, C: bufC, M: M, K: testK, N: testN)
-            var times = [Double]()
-            for _ in 0..<3 {
-                times.append(executeMPSOnly(ctx: ctx, A: bufA, B: bufB, C: bufC,
-                                            M: M, K: testK, N: testN))
-            }
-            let meanTime = times.reduce(0, +) / Double(times.count)
-            let timePerElement = meanTime / Double(M * testN)
-
-            if let baseline = baselineTimePerElement {
-                if timePerElement > baseline * 3.0 { break }
-            } else {
-                baselineTimePerElement = timePerElement
-            }
-
-            lastSafeBytes = testBytes
-        }
-
-        return Int(Double(lastSafeBytes) * 0.80)
+        let rec = ctx.device.recommendedMaxWorkingSetSize
+        return Int(Double(rec) * 0.95) / 3
     }
 }
 
