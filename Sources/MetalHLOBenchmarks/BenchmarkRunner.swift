@@ -71,9 +71,13 @@ public final class BenchmarkRunner: @unchecked Sendable {
             print("Running benchmark: \(benchmark.id)")
         }
 
-        // Compile the program
+        // Compile the program. METALHLO_FORCE_MPSGRAPH=1 routes through the
+        // MPSGraph-only codepath (Client.compile no-config form) which bypasses
+        // the Metal-kernel codegen — useful for validating MPSGraph-side
+        // changes (e.g. the TF32 fp16 downcast) end-to-end.
+        let envForceMPSGraph = ProcessInfo.processInfo.environment["METALHLO_FORCE_MPSGRAPH"] == "1"
         let executable: Executable
-        if useMPSGraph {
+        if useMPSGraph || envForceMPSGraph {
             executable = try client.compile(benchmark.mlirProgram)
         } else {
             let compileConfig = CompilationConfig(optimizationLevel: optimizationLevel, devicePolicy: devicePolicy)

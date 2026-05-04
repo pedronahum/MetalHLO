@@ -1033,7 +1033,85 @@ public enum ModelBenchmarks {
             }
         ))
 
+        // ATTN-001..004: "Attention core" — softmax(Q @ K^T / sqrt(d_k)) @ V on
+        // pre-computed Q, K, V. Matches MLX's AttentionBenchmark exactly so the
+        // mlx-comparison runner can pair them by ID. The XFMR-INF-001..003 above
+        // remain a different (more realistic) workload that includes Wq/Wk/Wv/Wo
+        // projections — useful, but not directly comparable to MLX.
+        let attnShapes: [(id: String, B: Int, H: Int, S: Int, D: Int)] = [
+            ("ATTN-001", 1, 12, 128, 64),
+            ("ATTN-002", 8, 12, 128, 64),
+            ("ATTN-003", 1, 12, 512, 64),
+            ("ATTN-004", 32, 8, 128, 64),
+        ]
+        for shape in attnShapes {
+            let (b, h, s, d) = (shape.B, shape.H, shape.S, shape.D)
+            benchmarks.append(SimpleBenchmark(
+                id: shape.id,
+                name: "Attention Core \(b)x\(h)x\(s)x\(d)",
+                category: "model_transformer",
+                operation: "attention",
+                configuration: [
+                    "batch_size": "\(b)",
+                    "heads": "\(h)",
+                    "seq_len": "\(s)",
+                    "head_dim": "\(d)"
+                ],
+                mlirProgram: attentionCoreMLIR(B: b, H: h, S: s, D: d),
+                inputGenerator: { client in
+                    let gen = TestDataGenerator(seed: 42)
+                    let q = try gen.createNormalFloat32Buffer(client: client, shape: [b, h, s, d], mean: 0, stdDev: 1)
+                    let k = try gen.createNormalFloat32Buffer(client: client, shape: [b, h, s, d], mean: 0, stdDev: 1)
+                    let v = try gen.createNormalFloat32Buffer(client: client, shape: [b, h, s, d], mean: 0, stdDev: 1)
+                    return [q, k, v]
+                },
+                throughputCalculator: { timing in
+                    // 2 batched matmuls (Q@K^T and attn@V), softmax cost negligible at FLOP level
+                    let flops = 2 * 2 * b * h * s * s * d
+                    let gflops = FLOPSCalculator.gflops(flops: Double(flops), timeSeconds: timing.gpuTime)
+                    return ThroughputMetrics(
+                        opsPerSecond: 1.0 / timing.gpuTime,
+                        flops: gflops * 1e9,
+                        elementsPerSecond: Double(b * h * s * d) / timing.gpuTime
+                    )
+                }
+            ))
+        }
+
         return benchmarks
+    }
+
+    /// MLIR for "attention core": softmax(Q @ K^T * scale) @ V on pre-computed
+    /// Q, K, V tensors of shape [B, H, S, D]. Uses numerically-stable softmax
+    /// (subtract max) to match MLX's `MLX.softmax` behavior.
+    private static func attentionCoreMLIR(B: Int, H: Int, S: Int, D: Int) -> String {
+        let scale = 1.0 / Double(D).squareRoot()
+        let qkv = "tensor<\(B)x\(H)x\(S)x\(D)xf32>"
+        let qkT = "tensor<\(B)x\(H)x\(D)x\(S)xf32>"
+        let scores = "tensor<\(B)x\(H)x\(S)x\(S)xf32>"
+        let reduced = "tensor<\(B)x\(H)x\(S)xf32>"
+        return """
+        module @attn_core_b\(B)_h\(H)_s\(S)_d\(D) {
+          func.func @main(%q: \(qkv), %k: \(qkv), %v: \(qkv)) -> \(qkv) {
+            %scale = stablehlo.constant dense<\(scale)> : tensor<f32>
+            %kt = stablehlo.transpose %k, dims = [0, 1, 3, 2] : (\(qkv)) -> \(qkT)
+            %scores = stablehlo.dot_general %q, %kt, #stablehlo.dot<lhs_batching_dimensions = [0, 1], rhs_batching_dimensions = [0, 1], lhs_contracting_dimensions = [3], rhs_contracting_dimensions = [2]> : (\(qkv), \(qkT)) -> \(scores)
+            %scale_bc = stablehlo.broadcast_in_dim %scale, dims = [] : (tensor<f32>) -> \(scores)
+            %scaled = stablehlo.multiply %scores, %scale_bc : \(scores)
+            %neg_inf = stablehlo.constant dense<0xFF800000> : tensor<f32>
+            %max = stablehlo.reduce %scaled, %neg_inf applies stablehlo.maximum across dimensions = [3] : (\(scores), tensor<f32>) -> \(reduced)
+            %max_bc = stablehlo.broadcast_in_dim %max, dims = [0, 1, 2] : (\(reduced)) -> \(scores)
+            %shifted = stablehlo.subtract %scaled, %max_bc : \(scores)
+            %exp = stablehlo.exponential %shifted : \(scores)
+            %zero = stablehlo.constant dense<0.0> : tensor<f32>
+            %sum = stablehlo.reduce %exp, %zero applies stablehlo.add across dimensions = [3] : (\(scores), tensor<f32>) -> \(reduced)
+            %sum_bc = stablehlo.broadcast_in_dim %sum, dims = [0, 1, 2] : (\(reduced)) -> \(scores)
+            %attn_weights = stablehlo.divide %exp, %sum_bc : \(scores)
+            %out = stablehlo.dot_general %attn_weights, %v, #stablehlo.dot<lhs_batching_dimensions = [0, 1], rhs_batching_dimensions = [0, 1], lhs_contracting_dimensions = [3], rhs_contracting_dimensions = [2]> : (\(scores), \(qkv)) -> \(qkv)
+            return %out : \(qkv)
+          }
+        }
+        """
     }
 
     // MARK: - End-to-End Pipeline Benchmarks

@@ -244,7 +244,7 @@ public final class FusedScaledDotProductAttentionHandler: CustomCallHandler {
         let kT = graph.transposeTensor(k, dimension: 2, withDimension: 3, name: nil)
 
         // Q @ K^T -> [batch, heads, seq_q, seq_k]
-        var scores = graph.matrixMultiplication(
+        var scores = graph.matrixMultiplicationMaybeTF32(
             primary: q,
             secondary: kT,
             name: "attention_scores"
@@ -265,7 +265,7 @@ public final class FusedScaledDotProductAttentionHandler: CustomCallHandler {
         let weights = graph.softMax(with: scores, axis: -1, name: "attention_weights")
 
         // Weights @ V -> [batch, heads, seq_q, head_dim]
-        let output = graph.matrixMultiplication(
+        let output = graph.matrixMultiplicationMaybeTF32(
             primary: weights,
             secondary: v,
             name: "attention_output"
@@ -435,7 +435,7 @@ public final class FusedMatMulBiasActivationHandler: CustomCallHandler {
         }
 
         // MatMul
-        var result = graph.matrixMultiplication(primary: lhs, secondary: rhs, name: "fused_matmul")
+        var result = graph.matrixMultiplicationMaybeTF32(primary: lhs, secondary: rhs, name: "fused_matmul")
 
         // Add bias
         result = graph.addition(result, bias, name: "fused_bias")
@@ -735,13 +735,13 @@ public final class FusedFFNHandler: CustomCallHandler {
         let _ = BackendConfigParser.getBool(config, key: "is_gated", default: false)  // Reserved for gated FFN
 
         // Up projection: x @ up_weight
-        var hidden = graph.matrixMultiplication(primary: x, secondary: upWeight, name: "ffn_up_proj")
+        var hidden = graph.matrixMultiplicationMaybeTF32(primary: x, secondary: upWeight, name: "ffn_up_proj")
 
         // Apply activation
         hidden = applyActivation(hidden, activation: activation, graph: graph)
 
         // Down projection: hidden @ down_weight
-        let output = graph.matrixMultiplication(primary: hidden, secondary: downWeight, name: "ffn_down_proj")
+        let output = graph.matrixMultiplicationMaybeTF32(primary: hidden, secondary: downWeight, name: "ffn_down_proj")
 
         return [output]
     }
@@ -977,7 +977,7 @@ public final class FusedDepthAttentionHandler: CustomCallHandler {
         )
 
         // Scores: query @ keys^T -> [batch, 1, depth] or [batch, depth]
-        var scores = graph.matrixMultiplication(
+        var scores = graph.matrixMultiplicationMaybeTF32(
             primary: query,
             secondary: keysT,
             name: "depth_attn_scores"
@@ -993,7 +993,7 @@ public final class FusedDepthAttentionHandler: CustomCallHandler {
         let weights = graph.softMax(with: scores, axis: -1, name: "depth_attn_weights")
 
         // Weighted sum: weights @ values -> [batch, 1, hidden] or [batch, hidden]
-        let output = graph.matrixMultiplication(
+        let output = graph.matrixMultiplicationMaybeTF32(
             primary: weights,
             secondary: values,
             name: "depth_attn_output"

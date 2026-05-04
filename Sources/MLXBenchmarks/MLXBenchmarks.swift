@@ -190,15 +190,20 @@ public struct TransposeBenchmark: MLXBenchmark {
             }
         }
 
+        // a.T in MLX is a lazy strided view — eval(c) on it is a no-op, so
+        // without forcing materialization we'd be timing only Swift overhead +
+        // GPU sync. Adding `+ 0.0` chains an elementwise op that forces MLX to
+        // actually compute the transposed memory layout, matching what
+        // MetalHLO does for stablehlo.transpose.
         for _ in 0..<warmup {
-            let c = doTranspose()
+            let c = doTranspose() + 0.0
             eval(c)
         }
 
         var times: [Double] = []
         for _ in 0..<iterations {
             let start = CFAbsoluteTimeGetCurrent()
-            let c = doTranspose()
+            let c = doTranspose() + 0.0
             eval(c)
             Stream.gpu.synchronize()
             let end = CFAbsoluteTimeGetCurrent()
@@ -229,15 +234,18 @@ public struct ReshapeBenchmark: MLXBenchmark {
         let a = MLXRandom.normal(inputShape)
         eval(a)
 
+        // a.reshaped(...) in MLX is metadata-only when strides allow — eval is
+        // then a no-op. `+ 0.0` forces a real elementwise pass so we measure
+        // comparable work to MetalHLO's stablehlo.reshape.
         for _ in 0..<warmup {
-            let c = a.reshaped(outputShape)
+            let c = a.reshaped(outputShape) + 0.0
             eval(c)
         }
 
         var times: [Double] = []
         for _ in 0..<iterations {
             let start = CFAbsoluteTimeGetCurrent()
-            let c = a.reshaped(outputShape)
+            let c = a.reshaped(outputShape) + 0.0
             eval(c)
             Stream.gpu.synchronize()
             let end = CFAbsoluteTimeGetCurrent()
@@ -787,15 +795,18 @@ public struct SliceBenchmark: MLXBenchmark {
             return a[sliceStart[0]..<sliceEnd[0], sliceStart[1]..<sliceEnd[1]]
         }
 
+        // a[start..<end, ...] in MLX returns a strided view — eval is a no-op
+        // without forced materialization. `+ 0.0` ensures we time the actual
+        // slice copy, matching MetalHLO's stablehlo.slice semantics.
         for _ in 0..<warmup {
-            let c = doSlice()
+            let c = doSlice() + 0.0
             eval(c)
         }
 
         var times: [Double] = []
         for _ in 0..<iterations {
             let start = CFAbsoluteTimeGetCurrent()
-            let c = doSlice()
+            let c = doSlice() + 0.0
             eval(c)
             Stream.gpu.synchronize()
             let end = CFAbsoluteTimeGetCurrent()

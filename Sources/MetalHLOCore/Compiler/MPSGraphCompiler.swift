@@ -804,8 +804,9 @@ public final class MPSGraphCompiler {
             rhs = graph.transpose(rhs, permutation: [1, 0].map { NSNumber(value: $0) }, name: nil)
         }
 
-        return graph.matrixMultiplication(primary: lhs, secondary: rhs, name: op.result)
+        return graph.matrixMultiplicationMaybeTF32(primary: lhs, secondary: rhs, name: op.result)
     }
+
 
     private func compileDotGeneral(_ op: HLOOperation) throws -> MPSGraphTensor {
         let lhs = try getOperand(op.operands[0])
@@ -828,7 +829,7 @@ public final class MPSGraphCompiler {
 
         guard let dimNumbers = op.attributes.dotDimensionNumbers else {
             // No dimension numbers provided, fall back to simple matmul
-            return graph.matrixMultiplication(primary: lhs, secondary: rhs, name: op.result)
+            return graph.matrixMultiplicationMaybeTF32(primary: lhs, secondary: rhs, name: op.result)
         }
 
         // Get shapes from type map (or infer from MPSGraphTensor shape)
@@ -964,8 +965,8 @@ public final class MPSGraphCompiler {
             )
         }
 
-        // Perform matmul
-        let matmulResult = graph.matrixMultiplication(
+        // Perform matmul (optionally with fp32→fp16 downcast under METALHLO_MATMUL_TF32=1)
+        let matmulResult = graph.matrixMultiplicationMaybeTF32(
             primary: lhsReshaped,
             secondary: rhsReshaped,
             name: nil
@@ -4415,4 +4416,30 @@ public struct CompiledGraph: @unchecked Sendable {
     /// If non-nil, the function contains an embedded SDPA op and execution is split into
     /// pre-graph → Flash Attention kernel → post-graph stages.
     public let embeddedAttentionSplit: EmbeddedAttentionSplit?
+}
+
+// MARK: - TF32-aware matmul extension
+
+extension MPSGraph {
+    /// TF32-aware matmul. When the env var `METALHLO_MATMUL_TF32=1` is set and
+    /// both inputs are fp32, downcasts to fp16 for the matmul and casts the
+    /// result back to fp32 — matching JAX's `jax_default_matmul_precision='tf32'`
+    /// behavior. Apple Silicon's `simdgroup_matrix` coprocessors run fp16 matmul
+    /// at ~3x fp32 throughput; the precision loss is acceptable for inference
+    /// workloads. Off by default to preserve strict StableHLO semantics.
+    func matrixMultiplicationMaybeTF32(
+        primary: MPSGraphTensor,
+        secondary: MPSGraphTensor,
+        name: String?
+    ) -> MPSGraphTensor {
+        let useTF32 = ProcessInfo.processInfo.environment["METALHLO_MATMUL_TF32"] == "1"
+        let downcast = useTF32 && primary.dataType == .float32 && secondary.dataType == .float32
+        guard downcast else {
+            return self.matrixMultiplication(primary: primary, secondary: secondary, name: name)
+        }
+        let p16 = self.cast(primary, to: .float16, name: nil)
+        let s16 = self.cast(secondary, to: .float16, name: nil)
+        let r16 = self.matrixMultiplication(primary: p16, secondary: s16, name: nil)
+        return self.cast(r16, to: .float32, name: name)
+    }
 }
