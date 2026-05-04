@@ -161,7 +161,16 @@ public final class MetalHLOCompiler: @unchecked Sendable {
         // ═══════════════════════════════════════════════════════════════
         // STAGE 1: PARSE
         // ═══════════════════════════════════════════════════════════════
-        let module = try parseModule(mlir)
+        let parsed = try parseModule(mlir)
+
+        // ═══════════════════════════════════════════════════════════════
+        // STAGE 1.5: TF32 MATMUL TRANSFORM (env-gated, no-op if disabled)
+        // Wraps fp32 dot/dot_general with convert ops so matmul runs at fp16.
+        // Inserted before optimize/analyze so downstream stages see the
+        // transformed graph; the parameterized simdgroup matmul kernel in
+        // CodeGenerator then emits a fp16 (simdgroup_half8x8) variant.
+        // ═══════════════════════════════════════════════════════════════
+        let module = applyTF32MatmulTransformIfEnabled(parsed)
 
         // ═══════════════════════════════════════════════════════════════
         // STAGE 2: ANALYZE

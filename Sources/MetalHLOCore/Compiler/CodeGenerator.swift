@@ -3068,6 +3068,9 @@ public final class CodeGenerator: @unchecked Sendable {
 
     /// Generates an optimized matmul kernel using simdgroup_matrix operations.
     /// This leverages hardware-accelerated matrix multiplication on Apple Silicon (M1+).
+    /// Parameterized by `metalType` so the same template emits a homogeneous-type
+    /// kernel for either float (`\(simdMatType)`) or half (`simdgroup_half8x8`).
+    /// Apple Silicon's matrix coprocessors run fp16 multiply at ~2x fp32 throughput.
     private func generateSimdgroupMatMulSource(batchSize: Int, metalType: String, elementType: ElementType) -> (String, String, TuningConfig?) {
         // Tuning config for simdgroup matmul
         // TILE_M x TILE_N is computed by each threadgroup
@@ -3079,6 +3082,12 @@ public final class CodeGenerator: @unchecked Sendable {
             useSharedMemory: true,
             useSIMDGroups: true
         )
+
+        // Template helpers: parameterize the simdgroup matrix type so the same
+        // kernel template works for both fp32 and fp16. Using `\(metalType)(0)`
+        // for the zero literal avoids the float-suffix-vs-half-suffix split.
+        let simdMatType = "simdgroup_\(metalType)8x8"
+        let zeroFill = "make_filled_simdgroup_matrix<\(metalType), 8, 8>(\(metalType)(0))"
 
         let source: String
         if batchSize > 1 {
@@ -3128,23 +3137,23 @@ public final class CodeGenerator: @unchecked Sendable {
                 uint simdRowOffset = simd_group_id * 8;
 
                 // Initialize 4 accumulator matrices (8x8 each, covering 8x32 output)
-                simdgroup_float8x8 acc0, acc1, acc2, acc3;
-                acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-                acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-                acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-                acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+                \(simdMatType) acc0, acc1, acc2, acc3;
+                acc0 = \(zeroFill);
+                acc1 = \(zeroFill);
+                acc2 = \(zeroFill);
+                acc3 = \(zeroFill);
 
                 // Iterate over K dimension in tiles of 8
                 for (uint k = 0; k < K; k += TILE_K) {
                     // Load 8x8 tile from A (rows from our simd group)
-                    simdgroup_float8x8 a_tile;
+                    \(simdMatType) a_tile;
                     uint aRow = tileRowStart + simdRowOffset;
                     uint aCol = k;
 
                     if (aRow + 8 <= M && aCol + 8 <= K) {
                         simdgroup_load(a_tile, batchA + aRow * K + aCol, K);
                     } else {
-                        a_tile = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+                        a_tile = \(zeroFill);
                         for (uint i = 0; i < 8 && aRow + i < M; i++) {
                             for (uint j = 0; j < 8 && aCol + j < K; j++) {
                                 // Manual load for edge cases
@@ -3166,7 +3175,7 @@ public final class CodeGenerator: @unchecked Sendable {
                     }
 
                     // Load 4 8x8 tiles from B (covers 8 rows, 32 cols)
-                    simdgroup_float8x8 b_tile0, b_tile1, b_tile2, b_tile3;
+                    \(simdMatType) b_tile0, b_tile1, b_tile2, b_tile3;
                     uint bRow = k;
                     uint bCol = tileColStart;
 
@@ -3176,10 +3185,10 @@ public final class CodeGenerator: @unchecked Sendable {
                         simdgroup_load(b_tile2, batchB + bRow * N + bCol + 16, N);
                         simdgroup_load(b_tile3, batchB + bRow * N + bCol + 24, N);
                     } else {
-                        b_tile0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-                        b_tile1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-                        b_tile2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-                        b_tile3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+                        b_tile0 = \(zeroFill);
+                        b_tile1 = \(zeroFill);
+                        b_tile2 = \(zeroFill);
+                        b_tile3 = \(zeroFill);
                         if (bRow < K) {
                             simdgroup_load(b_tile0, batchB + min(bRow, K-8) * N + min(bCol, N > 8 ? N-8 : 0), N);
                             if (bCol + 8 < N) simdgroup_load(b_tile1, batchB + min(bRow, K-8) * N + min(bCol + 8, N-8), N);
@@ -3256,30 +3265,30 @@ public final class CodeGenerator: @unchecked Sendable {
                 uint simdRowOffset = simd_group_id * 8;
 
                 // Initialize 4 accumulator matrices (8x8 each, covering 8x32 output)
-                simdgroup_float8x8 acc0, acc1, acc2, acc3;
-                acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-                acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-                acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-                acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+                \(simdMatType) acc0, acc1, acc2, acc3;
+                acc0 = \(zeroFill);
+                acc1 = \(zeroFill);
+                acc2 = \(zeroFill);
+                acc3 = \(zeroFill);
 
                 // Iterate over K dimension in tiles of 8
                 for (uint k = 0; k < K; k += TILE_K) {
                     // Load 8x8 tile from A
-                    simdgroup_float8x8 a_tile;
+                    \(simdMatType) a_tile;
                     uint aRow = tileRowStart + simdRowOffset;
                     uint aCol = k;
 
                     if (aRow + 8 <= M && aCol + 8 <= K) {
                         simdgroup_load(a_tile, A + aRow * K + aCol, K);
                     } else {
-                        a_tile = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+                        a_tile = \(zeroFill);
                         if (aRow < M && aCol < K) {
                             simdgroup_load(a_tile, A + min(aRow, M > 8 ? M-8 : 0) * K + min(aCol, K > 8 ? K-8 : 0), K);
                         }
                     }
 
                     // Load 4 8x8 tiles from B (covers 8 rows, 32 cols)
-                    simdgroup_float8x8 b_tile0, b_tile1, b_tile2, b_tile3;
+                    \(simdMatType) b_tile0, b_tile1, b_tile2, b_tile3;
                     uint bRow = k;
                     uint bCol = tileColStart;
 
@@ -3289,10 +3298,10 @@ public final class CodeGenerator: @unchecked Sendable {
                         simdgroup_load(b_tile2, B + bRow * N + bCol + 16, N);
                         simdgroup_load(b_tile3, B + bRow * N + bCol + 24, N);
                     } else {
-                        b_tile0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-                        b_tile1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-                        b_tile2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-                        b_tile3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+                        b_tile0 = \(zeroFill);
+                        b_tile1 = \(zeroFill);
+                        b_tile2 = \(zeroFill);
+                        b_tile3 = \(zeroFill);
                         if (bRow < K) {
                             uint safeRow = min(bRow, K > 8 ? K-8 : 0);
                             simdgroup_load(b_tile0, B + safeRow * N + min(bCol, N > 8 ? N-8 : 0), N);
