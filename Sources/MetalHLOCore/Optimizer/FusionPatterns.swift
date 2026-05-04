@@ -292,12 +292,10 @@ public struct LayerNormPattern: HLOPattern {
 
         // Look for rsqrt or sqrt in the chain (variance normalization)
         var foundRsqrt = false
-        var foundVarianceReduce = false
         var foundMeanReduce = false
         var visited: Set<String> = []
         var matchedOps: [HLOOperation] = []
         var matchedIndices: [Int] = []
-        var inputOperand: String?
         var axis: Int = -1
 
         var queue: [HLOOperation] = [op]
@@ -319,19 +317,13 @@ public struct LayerNormPattern: HLOPattern {
                 // Check if this could be mean or variance reduce
                 if let dims = curr.attributes.dimensions {
                     axis = dims.first ?? -1
-                    if foundMeanReduce {
-                        foundVarianceReduce = true
-                    } else {
-                        foundMeanReduce = true
-                    }
+                    foundMeanReduce = true
                 }
             }
 
             for operand in curr.operands {
                 if let def = definingOps[operand]?.op {
                     queue.append(def)
-                } else if inputOperand == nil && !operand.starts(with: "%arg") == false {
-                    inputOperand = operand
                 }
             }
         }
@@ -339,17 +331,78 @@ public struct LayerNormPattern: HLOPattern {
         // Require rsqrt and at least one reduce for LayerNorm
         guard foundRsqrt && foundMeanReduce else { return nil }
 
-        // Find the actual input (first external operand that looks like data)
-        if inputOperand == nil {
-            for op in matchedOps {
-                for operand in op.operands {
-                    if definingOps[operand] == nil {
-                        inputOperand = operand
-                        break
-                    }
-                }
-                if inputOperand != nil { break }
+        // Build a set of internally-defined SSA values (results of matched ops).
+        // An "external" operand is one whose def is NOT in this set.
+        let internalResults = Set(matchedOps.map { $0.result })
+        // For tensors that come through a matched broadcast_in_dim, the real
+        // external source is the broadcast's operand. Build a result→source map.
+        var sourceOfBroadcast: [String: String] = [:]
+        for mop in matchedOps where mop.kind == .broadcastInDim && !mop.operands.isEmpty {
+            sourceOfBroadcast[mop.result] = mop.operands[0]
+        }
+        func externalSource(_ name: String) -> String? {
+            // Unwrap broadcast_in_dim to find the underlying external operand.
+            let resolved = sourceOfBroadcast[name] ?? name
+            if internalResults.contains(resolved) {
+                return nil
             }
+            return resolved
+        }
+        // Filter out scalar constants used for eps / hidden_size / zero / one.
+        func isScalarConst(_ name: String) -> Bool {
+            guard let def = definingOps[name]?.op else { return false }
+            if def.kind != .constant { return false }
+            return (def.resultType.shape.count) == 0
+        }
+
+        // x (input) — operand of a reduce op (the mean reduce). reduce.operands[0]
+        // is the tensor being reduced; operand[1] is the init scalar.
+        var xOperand: String?
+        for mop in matchedOps where mop.kind == .reduce && !mop.operands.isEmpty {
+            if let ext = externalSource(mop.operands[0]), !isScalarConst(ext) {
+                xOperand = ext
+                break
+            }
+        }
+
+        // beta — external (or broadcast-from-external) operand of the root op
+        // (final add). Its other operand should be internal (the scaled tensor).
+        var betaOperand: String?
+        if op.kind == .add {
+            for operand in op.operands {
+                if let ext = externalSource(operand), !isScalarConst(ext), ext != xOperand {
+                    betaOperand = ext
+                    break
+                }
+            }
+        }
+
+        // gamma — external operand of a multiply where exactly one operand is
+        // external (excludes the squared-centered multiply, which has both
+        // operands internal — and excludes any multiply by scalar constants).
+        var gammaOperand: String?
+        for mop in matchedOps where mop.kind == .multiply {
+            var externalCount = 0
+            var candidate: String?
+            for operand in mop.operands {
+                if let ext = externalSource(operand), !isScalarConst(ext) {
+                    externalCount += 1
+                    candidate = ext
+                }
+            }
+            if externalCount == 1, let c = candidate, c != xOperand, c != betaOperand {
+                gammaOperand = c
+                break
+            }
+        }
+
+        // Require all three for fusion. If any is missing, refuse the match —
+        // the underlying ops will run as raw stablehlo via MPSGraph (correct,
+        // just not fused). Previously, the pattern fired with only the input
+        // operand and triggered "Invalid input count: expected 3, got 1" at
+        // dispatch time.
+        guard let x = xOperand, let gamma = gammaOperand, let beta = betaOperand else {
+            return nil
         }
 
         return PatternMatch(
@@ -357,7 +410,7 @@ public struct LayerNormPattern: HLOPattern {
             indices: matchedIndices.sorted(),
             rootOperation: op,
             metadata: ["axis": .int(axis), "pattern": .string("layer_norm")],
-            inputs: inputOperand.map { [$0] } ?? []
+            inputs: [x, gamma, beta]
         )
     }
 
@@ -368,17 +421,17 @@ public struct LayerNormPattern: HLOPattern {
         } else {
             axis = -1
         }
-        let input = match.inputs.first ?? match.operations.first!.operands[0]
 
         var attributes = HLOAttributes()
         attributes.callTargetName = "fused_layer_norm"
-        attributes.backendConfig = "{\"axis\": \(axis), \"epsilon\": 1e-5}"
+        // Handler reads keys "axes" (int array) and "eps" (float); see
+        // FusedLayerNormHandler.emit. Match those names exactly.
+        attributes.backendConfig = "{\"axes\": [\(axis)], \"eps\": 1e-5}"
 
-        // For now, emit without gamma/beta (they can be added later)
         return [HLOOperation(
             result: match.rootOperation.result,
             kind: .customCall,
-            operands: [input],
+            operands: match.inputs,  // [x, gamma, beta]
             resultType: match.rootOperation.resultType,
             attributes: attributes
         )]
