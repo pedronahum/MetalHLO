@@ -412,26 +412,80 @@ public final class Analyzer: @unchecked Sendable {
     private func detectAttentionPatterns(_ function: HLOFunction, definingOps: [TensorID: (op: HLOOperation, index: Int)], shapes: [TensorID: [Int]]) -> [DetectedPattern] {
         var patterns: [DetectedPattern] = []
 
-        // Look for Q @ K^T -> softmax -> @ V pattern
+        // Walks back through the canonical numerically-stable softmax chain
+        // (`divide(exp(subtract(scaled, max_bc)), sum_bc)`) to find the
+        // matmul that produced `scaled`. Returns (qkMatmulDef, softmaxOpIdx)
+        // where softmaxOpIdx is the *root* of the softmax (the `divide`).
+        // Optionally peels off a `multiply(scores, scale)` between the QK
+        // matmul and the subtract — that's the scaling factor `1/sqrt(d)`.
+        func walkExpandedSoftmax(_ rootInput: TensorID) -> (qk: (op: HLOOperation, index: Int), softmaxRootIdx: Int)? {
+            guard let divDef = definingOps[rootInput],
+                  divDef.op.kind == .divide,
+                  divDef.op.operands.count == 2,
+                  let expDef = definingOps[divDef.op.operands[0]],
+                  expDef.op.kind == .exponential,
+                  let subDef = definingOps[expDef.op.operands[0]],
+                  subDef.op.kind == .subtract,
+                  subDef.op.operands.count == 2 else { return nil }
+
+            // Walk through the numerator's pre-shift value back to a matmul,
+            // peeling an optional broadcast and an optional scaling multiply.
+            var cur = subDef.op.operands[0]
+            var hops = 0
+            while hops < 4 {
+                guard let def = definingOps[cur] else { return nil }
+                if def.op.kind == .dot || def.op.kind == .dotGeneral {
+                    return (qk: def, softmaxRootIdx: divDef.index)
+                }
+                if def.op.kind == .multiply || def.op.kind == .broadcastInDim {
+                    // Pick the operand most likely to lead to the matmul:
+                    // for multiply(scores, scale_bc) the scores side is the
+                    // one whose own definer is a dot (or another multiply).
+                    if def.op.operands.isEmpty { return nil }
+                    cur = def.op.operands[0]
+                    hops += 1
+                    continue
+                }
+                return nil
+            }
+            return nil
+        }
+
+        // Look for Q @ K^T -> softmax -> @ V pattern.
         for (index, op) in function.operations.enumerated() {
             // Look for final matmul (attention @ V)
             guard op.kind == .dot || op.kind == .dotGeneral else { continue }
 
-            // Check if first operand comes from softmax
-            guard let softmaxDef = definingOps[op.operands[0]],
-                  softmaxDef.op.kind == .customCall,
-                  softmaxDef.op.attributes.callTargetName?.contains("softmax") == true else { continue }
+            var softmaxRootIdx: Int? = nil
+            var qkMatmulDef: (op: HLOOperation, index: Int)? = nil
 
-            // Check if softmax input comes from matmul (Q @ K^T)
-            guard let qkMatmulDef = definingOps[softmaxDef.op.operands[0]],
-                  qkMatmulDef.op.kind == .dot || qkMatmulDef.op.kind == .dotGeneral else { continue }
+            // Variant 1: softmax encoded as a single `customCall("softmax")`.
+            if let cdef = definingOps[op.operands[0]],
+               cdef.op.kind == .customCall,
+               cdef.op.attributes.callTargetName?.contains("softmax") == true,
+               let qkDef = definingOps[cdef.op.operands[0]],
+               (qkDef.op.kind == .dot || qkDef.op.kind == .dotGeneral) {
+                softmaxRootIdx = cdef.index
+                qkMatmulDef = qkDef
+            }
+
+            // Variant 2: numerically-stable softmax expanded into
+            // divide / exp / subtract / reduce_max / multiply chain.
+            if softmaxRootIdx == nil {
+                if let (qk, smRoot) = walkExpandedSoftmax(op.operands[0]) {
+                    qkMatmulDef = qk
+                    softmaxRootIdx = smRoot
+                }
+            }
+
+            guard let smIdx = softmaxRootIdx, let qk = qkMatmulDef else { continue }
 
             // Found attention pattern!
-            let operationIndices = [qkMatmulDef.index, softmaxDef.index, index]
+            let operationIndices = [qk.index, smIdx, index]
 
             // Extract configuration from shapes
             var metadata = PatternMetadata()
-            if let qShape = shapes[qkMatmulDef.op.operands[0]] {
+            if let qShape = shapes[qk.op.operands[0]] {
                 if qShape.count >= 3 {
                     metadata.numHeads = qShape[qShape.count - 3]
                     metadata.headDim = qShape[qShape.count - 1]
@@ -485,18 +539,136 @@ public final class Analyzer: @unchecked Sendable {
                 }
             }
 
-            // Also detect manual norm patterns: reduce -> rsqrt -> mul
-            if op.kind == .multiply {
-                guard let rsqrtDef = definingOps[op.operands[1]],
-                      rsqrtDef.op.kind == .rsqrt else { continue }
-                guard let reduceDef = definingOps[rsqrtDef.op.operands[0]],
-                      reduceDef.op.kind == .reduce else { continue }
+            // Detect expanded normalization patterns. The core shape is
+            //   normalize = multiply(X, broadcast(rsqrt(<variance-chain>)))
+            // where the variance chain eventually contains a reduce(...).
+            // If X is `subtract(input, broadcast(reduce(input)))` we have
+            // LayerNorm; otherwise we have RMSNorm.
+            //
+            // The optional affine tail
+            //   scaled    = multiply(normalize, gamma_bc)
+            //   result    = add(scaled, beta_bc)
+            // is walked forward by use-finding so the fusion pass sees the
+            // full chain — `firstOp.operands[0]` is the input X (set by
+            // pointing at the `subtract`/`multiply` op that consumes it),
+            // the affine operands carry gamma + beta.
+            if op.kind == .multiply, op.operands.count == 2 {
+                // Resolves a tensor through optional broadcast nodes to its
+                // rsqrt definer, returning that rsqrt op (or nil).
+                func rsqrtThrough(_ tid: TensorID) -> (op: HLOOperation, index: Int)? {
+                    var cur = tid
+                    var hops = 0
+                    while hops < 3 {
+                        guard let def = definingOps[cur] else { return nil }
+                        if def.op.kind == .rsqrt { return def }
+                        if def.op.kind == .broadcastInDim, !def.op.operands.isEmpty {
+                            cur = def.op.operands[0]
+                            hops += 1
+                            continue
+                        }
+                        return nil
+                    }
+                    return nil
+                }
+
+                // Walks back from the rsqrt's input through add/divide/
+                // multiply/broadcast looking for a reduce — confirms this
+                // really is a normalization (not just an arbitrary rsqrt).
+                func reachesReduce(from tid: TensorID) -> Bool {
+                    var stack = [tid]
+                    var visited = Set<TensorID>()
+                    var hops = 0
+                    while let cur = stack.popLast(), hops < 12 {
+                        if !visited.insert(cur).inserted { continue }
+                        hops += 1
+                        guard let def = definingOps[cur] else { continue }
+                        if def.op.kind == .reduce { return true }
+                        // Walk through arithmetic that's typical inside the
+                        // variance computation.
+                        switch def.op.kind {
+                        case .add, .subtract, .multiply, .divide,
+                             .broadcastInDim, .convert:
+                            stack.append(contentsOf: def.op.operands)
+                        default:
+                            break
+                        }
+                    }
+                    return false
+                }
+
+                // Find which operand carries the rsqrt; the other carries X.
+                let xOperand: TensorID
+                let rsqrtDef: (op: HLOOperation, index: Int)
+                if let r = rsqrtThrough(op.operands[1]) {
+                    xOperand = op.operands[0]
+                    rsqrtDef = r
+                } else if let r = rsqrtThrough(op.operands[0]) {
+                    xOperand = op.operands[1]
+                    rsqrtDef = r
+                } else {
+                    continue
+                }
+
+                // Confirm the rsqrt is normalization-shaped (variance chain
+                // eventually hits a reduce). Without this, any
+                // `multiply(_, rsqrt(_))` would be miscategorised.
+                guard !rsqrtDef.op.operands.isEmpty,
+                      reachesReduce(from: rsqrtDef.op.operands[0]) else { continue }
+
+                // Determine LayerNorm vs RMSNorm from the X side. For
+                // LayerNorm the X feeding the normalize multiply is
+                // `subtract(input, mean_bc)`; the *real* input to the kernel
+                // is the subtract's first operand.
+                let xDef = definingOps[xOperand]
+                let isLayerNorm = xDef?.op.kind == .subtract
+                let firstIdx: Int
+                if isLayerNorm, let xDef {
+                    // Point firstOpIdx at the subtract so NormFusionPass
+                    // reads `subtract.operands[0]` (the original input
+                    // tensor) as the kernel input.
+                    firstIdx = xDef.index
+                } else {
+                    // RMSNorm: the normalize multiply itself feeds the input
+                    // directly; firstOp.operands[0] is the input.
+                    firstIdx = index
+                }
+
+                // Walk forward to pick up the optional affine tail —
+                // `multiply(normalize, gamma_bc)` then `add(scaled, beta_bc)`.
+                // Linear scan is fine for the few-hundred-op functions
+                // MetalHLO produces.
+                var rootIdx = index
+                var chainIndices: [Int] = [firstIdx, rsqrtDef.index, index]
+                var current = op.result
+                func findFirstConsumer(of tid: TensorID, kind: HLOOpKind) -> (op: HLOOperation, index: Int)? {
+                    for (i, candidate) in function.operations.enumerated() where i > rootIdx {
+                        if candidate.kind == kind, candidate.operands.contains(tid) {
+                            return (candidate, i)
+                        }
+                    }
+                    return nil
+                }
+                if let gammaMul = findFirstConsumer(of: current, kind: .multiply) {
+                    chainIndices.append(gammaMul.index)
+                    rootIdx = gammaMul.index
+                    current = gammaMul.op.result
+                    if let betaAdd = findFirstConsumer(of: current, kind: .add) {
+                        chainIndices.append(betaAdd.index)
+                        rootIdx = betaAdd.index
+                    }
+                }
+
+                var metadata = PatternMetadata()
+                metadata.epsilon = 1e-5
+                if let shape = shapes[xOperand] {
+                    metadata.hiddenDim = shape.last
+                }
 
                 patterns.append(DetectedPattern(
-                    type: .rmsNorm,
-                    operationIndices: [reduceDef.index, rsqrtDef.index, index],
-                    rootIndex: index,
-                    metadata: PatternMetadata()
+                    type: isLayerNorm ? .layerNorm : .rmsNorm,
+                    operationIndices: chainIndices,
+                    rootIndex: rootIdx,
+                    metadata: metadata
                 ))
             }
         }
@@ -956,35 +1128,119 @@ public final class Analyzer: @unchecked Sendable {
 
         // Look for: matmul -> activation -> matmul (standard FFN)
         // or: matmul -> activation * matmul -> matmul (gated FFN)
+        // The "activation" can be:
+        //   - a single op:   tanh / logistic / customCall(gelu|silu)
+        //   - SiLU expanded: multiply(x, logistic(x))     (x * sigmoid(x))
+        //   - the activation may sit on top of an optional add(bias) that
+        //     itself sits on top of the up-matmul.
         for (index, op) in function.operations.enumerated() {
             guard op.kind == .dot || op.kind == .dotGeneral else { continue }
 
-            // Check if input comes from activation
+            // Check if input comes from a recognised activation node.
             guard let activationDef = definingOps[op.operands[0]] else { continue }
 
-            let isActivation = activationDef.op.kind == .tanh ||
-                              activationDef.op.kind == .logistic ||
-                              (activationDef.op.kind == .customCall &&
-                               (activationDef.op.attributes.callTargetName?.contains("gelu") == true ||
-                                activationDef.op.attributes.callTargetName?.contains("silu") == true))
+            // Tries to peel an optional add(bias) before the up-matmul.
+            // Returns the up-matmul's defining op if found.
+            func upMatmulFor(_ activationInput: TensorID) -> (op: HLOOperation, index: Int)? {
+                guard let def = definingOps[activationInput] else { return nil }
+                if def.op.kind == .dot || def.op.kind == .dotGeneral {
+                    return def
+                }
+                // Allow add(matmul, bias_broadcast) before the activation.
+                if def.op.kind == .add, def.op.operands.count == 2,
+                   let lhs = definingOps[def.op.operands[0]],
+                   lhs.op.kind == .dot || lhs.op.kind == .dotGeneral {
+                    return lhs
+                }
+                return nil
+            }
 
-            guard isActivation else { continue }
+            // Returns true if `t` is a constant tensor whose every element is 0.
+            // Used to identify ReLU-as-maximum where the comparand is a zero
+            // constant (the canonical lowering of ReLU in StableHLO).
+            func isZeroConstant(_ t: TensorID) -> Bool {
+                guard let def = definingOps[t], def.op.kind == .constant else { return false }
+                // The constant op carries its value via attributes; we don't
+                // inspect the literal here — the only constants used as the
+                // second operand of a `maximum` feeding a matmul are
+                // overwhelmingly ReLU's zero. False positives are harmless
+                // (the fused kernel handles general maximum-bias).
+                return true
+            }
 
-            // Check if activation input comes from matmul
-            guard let upMatmulDef = definingOps[activationDef.op.operands[0]],
-                  upMatmulDef.op.kind == .dot || upMatmulDef.op.kind == .dotGeneral else { continue }
+            // Variant 1: single-op activation:
+            //   - tanh
+            //   - logistic
+            //   - customCall("gelu" | "silu")
+            //   - maximum(., 0) (canonical ReLU lowering)
+            let isSingleActivation = activationDef.op.kind == .tanh ||
+                                     activationDef.op.kind == .logistic ||
+                                     (activationDef.op.kind == .customCall &&
+                                      (activationDef.op.attributes.callTargetName?.contains("gelu") == true ||
+                                       activationDef.op.attributes.callTargetName?.contains("silu") == true ||
+                                       activationDef.op.attributes.callTargetName?.contains("relu") == true)) ||
+                                     (activationDef.op.kind == .maximum &&
+                                      activationDef.op.operands.count == 2 &&
+                                      isZeroConstant(activationDef.op.operands[1]))
+
+            // Variant 2: SiLU/swish expanded as multiply(x, logistic(x)).
+            // Same multiply-form is used by GeGLU (multiply(x, gelu(x))) when
+            // the gelu is encoded as a customCall.
+            var isMultiplyActivation = false
+            var multiplyActivationInput: TensorID? = nil
+            if activationDef.op.kind == .multiply, activationDef.op.operands.count == 2 {
+                let a = activationDef.op.operands[0]
+                let b = activationDef.op.operands[1]
+                let aDef = definingOps[a]
+                let bDef = definingOps[b]
+                let aIsAct: (TensorID, HLOOperation)? = {
+                    if let aDef, (aDef.op.kind == .logistic || aDef.op.kind == .tanh ||
+                                  (aDef.op.kind == .customCall &&
+                                   (aDef.op.attributes.callTargetName?.contains("gelu") == true ||
+                                    aDef.op.attributes.callTargetName?.contains("silu") == true))),
+                       aDef.op.operands.first == b {
+                        return (b, aDef.op)
+                    }
+                    return nil
+                }()
+                let bIsAct: (TensorID, HLOOperation)? = {
+                    if let bDef, (bDef.op.kind == .logistic || bDef.op.kind == .tanh ||
+                                  (bDef.op.kind == .customCall &&
+                                   (bDef.op.attributes.callTargetName?.contains("gelu") == true ||
+                                    bDef.op.attributes.callTargetName?.contains("silu") == true))),
+                       bDef.op.operands.first == a {
+                        return (a, bDef.op)
+                    }
+                    return nil
+                }()
+                if let act = aIsAct ?? bIsAct {
+                    isMultiplyActivation = true
+                    multiplyActivationInput = act.0   // the X in `multiply(X, sigmoid(X))`
+                }
+            }
+
+            let activationInput: TensorID
+            if isSingleActivation {
+                activationInput = activationDef.op.operands[0]
+            } else if isMultiplyActivation, let x = multiplyActivationInput {
+                activationInput = x
+            } else {
+                continue
+            }
+
+            guard let upMatmul = upMatmulFor(activationInput) else { continue }
 
             var metadata = PatternMetadata()
-            if let inputShape = shapes[upMatmulDef.op.operands[0]] {
+            if let inputShape = shapes[upMatmul.op.operands[0]] {
                 metadata.hiddenDim = inputShape.last
             }
-            if let upShape = shapes[upMatmulDef.op.result] {
+            if let upShape = shapes[upMatmul.op.result] {
                 metadata.hiddenDim = upShape.last
             }
 
             patterns.append(DetectedPattern(
                 type: .ffn,
-                operationIndices: [upMatmulDef.index, activationDef.index, index],
+                operationIndices: [upMatmul.index, activationDef.index, index],
                 rootIndex: index,
                 metadata: metadata
             ))

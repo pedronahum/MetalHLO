@@ -237,6 +237,12 @@ public final class PassManager: @unchecked Sendable {
         var currentAnalysis = analysis
 
         // Run passes in order
+        // Set METALHLO_DEBUG_PASSES=1 to print one line per pass:
+        //   `[*] pass-name ops: N -> M`  (asterisk = pass reported a change)
+        // Used for diagnosing why O3 doesn't seem to do anything: empty marker
+        // means the pattern detectors didn't match the input IR.
+        let debugPasses = ProcessInfo.processInfo.environment["METALHLO_DEBUG_PASSES"] == "1"
+
         for registration in registeredPasses {
             guard isPassEnabled(registration.name) else { continue }
 
@@ -246,8 +252,15 @@ public final class PassManager: @unchecked Sendable {
             let pass = passInstances[registration.name] ?? registration.factory()
             passInstances[registration.name] = pass
 
+            let opsBefore = currentFunction.operations.count
             // Run the pass
             let result = pass.run(on: currentFunction, analysis: currentAnalysis)
+            if debugPasses {
+                let opsAfter = result.changed ? result.function.operations.count : opsBefore
+                let mark = result.changed ? "*" : " "
+                FileHandle.standardError.write(Data(
+                    "[\(mark)] \(registration.name) ops: \(opsBefore) -> \(opsAfter)\n".utf8))
+            }
 
             // Update statistics
             statistics.passesRun += 1
