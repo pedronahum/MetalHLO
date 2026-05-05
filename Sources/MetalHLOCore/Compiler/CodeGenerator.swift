@@ -275,6 +275,21 @@ public final class CodeGenerator: @unchecked Sendable {
         }
     }
 
+    /// Returns `dims` with any reference to position `rank-2` swapped with `rank-1`.
+    /// Used to "apply" a `lhsTranspose`/`rhsTranspose` attribute to dot-op contracting
+    /// or batching dim lists so that they index into the actual operand's shape rather
+    /// than the pre-fold post-transpose shape.
+    private func swapLastTwoDimPositions(_ dims: [Int], rank: Int) -> [Int] {
+        guard rank >= 2 else { return dims }
+        let a = rank - 2
+        let b = rank - 1
+        return dims.map { d in
+            if d == a { return b }
+            if d == b { return a }
+            return d
+        }
+    }
+
     /// Generates a single kernel specification.
     private func generateKernel(
         op: FusedOp,
@@ -3040,10 +3055,25 @@ public final class CodeGenerator: @unchecked Sendable {
 
         // Get contracting dimensions from dot_general attributes
         let dotDimNums = attributes.dotDimensionNumbers
-        let lhsContractDims = dotDimNums?.lhsContractingDimensions ?? [lhsShape.count - 1]
-        let rhsContractDims = dotDimNums?.rhsContractingDimensions ?? (rhsShape.count >= 2 ? [rhsShape.count - 2] : [0])
-        let lhsBatchDims = dotDimNums?.lhsBatchingDimensions ?? []
-        let rhsBatchDims = dotDimNums?.rhsBatchingDimensions ?? []
+        var lhsContractDims = dotDimNums?.lhsContractingDimensions ?? [lhsShape.count - 1]
+        var rhsContractDims = dotDimNums?.rhsContractingDimensions ?? (rhsShape.count >= 2 ? [rhsShape.count - 2] : [0])
+        var lhsBatchDims = dotDimNums?.lhsBatchingDimensions ?? []
+        var rhsBatchDims = dotDimNums?.rhsBatchingDimensions ?? []
+
+        // Apply lhsTranspose/rhsTranspose attributes from the transpose-folding optimizer.
+        // The fold pass replaces `dot(transpose(X), Y)` with `dot(X, Y, lhsTranspose=true)`
+        // but copies the original dot's dim numbers verbatim — those still index into the
+        // pre-fold (post-transpose) tensor's shape. Swap the last-two-dim positions so the
+        // dim numbers index into the actual operand X's shape, matching how the existing
+        // M/K/N extraction and transA/transB synthesis below interpret them.
+        if attributes.lhsTranspose == true, lhsShape.count >= 2 {
+            lhsContractDims = swapLastTwoDimPositions(lhsContractDims, rank: lhsShape.count)
+            lhsBatchDims = swapLastTwoDimPositions(lhsBatchDims, rank: lhsShape.count)
+        }
+        if attributes.rhsTranspose == true, rhsShape.count >= 2 {
+            rhsContractDims = swapLastTwoDimPositions(rhsContractDims, rank: rhsShape.count)
+            rhsBatchDims = swapLastTwoDimPositions(rhsBatchDims, rank: rhsShape.count)
+        }
 
         // Calculate batch size from batch dimensions
         let batchSize = lhsBatchDims.isEmpty ? (lhsShape.count > 2 ? lhsShape.dropLast(2).reduce(1, *) : 1) :
@@ -3076,9 +3106,22 @@ public final class CodeGenerator: @unchecked Sendable {
         let transB = !rhsNonBatchDims.isEmpty && lhsContractDims.count == 1 &&
                      rhsContractDims.contains(rhsNonBatchDims.last!)
 
+        // GEMV path: M=1 (vector-matrix multiply — e.g. LLM logit projection,
+        // single-token decode). The simdgroup_matrix kernel needs M ≥ 8 to
+        // fill its 8×8 tiles and wastes (8-M)/8 of every tile when M < 8.
+        // The dedicated kernel uses 32-thread TGs, each thread owns 4 output
+        // columns, giving 128 outputs/TG with cacheline-coalesced W reads.
+        if isFloat && M == 1 && batchSize == 1 && !transA && !transB
+           && N >= 64 && N % 2 == 0 && K % 8 == 0 {
+            return generateGEMVSource(K: K, N: N, metalType: metalType)
+        }
+
         // Use optimized simdgroup kernel only for float types with dims that are
-        // multiples of 8 AND no transposition needed.
-        if isFloat && !transA && !transB && M % 8 == 0 && K % 8 == 0 && N % 8 == 0 && M >= 8 && K >= 8 && N >= 8 {
+        // multiples of 8. The MPP path additionally handles transA/transB via
+        // matmul2d_descriptor's transpose_left/transpose_right; the
+        // simdgroup_matrix kernel does not yet, so it stays gated on
+        // !transA && !transB.
+        if isFloat && M % 8 == 0 && K % 8 == 0 && N % 8 == 0 && M >= 8 && K >= 8 && N >= 8 {
             // Apple Matrix Coprocessor path via MetalPerformancePrimitives.
             // Requires Metal language 4.0 and Apple9 GPU family (M3+); MPSGraph
             // and MLX both use this primitive to hit ~97% of fp16 peak on M3+.
@@ -3103,10 +3146,23 @@ public final class CodeGenerator: @unchecked Sendable {
                 return generateMatMul2dMPPSource(
                     batchSize: batchSize,
                     inputElementType: inputElementType,
-                    outputElementType: elementType
+                    outputElementType: elementType,
+                    transA: transA,
+                    transB: transB
                 )
             }
-            return generateSimdgroupMatMulSource(batchSize: batchSize, metalType: metalType, elementType: elementType)
+            if !transA && !transB {
+                return generateSimdgroupMatMulSource(batchSize: batchSize, metalType: metalType, elementType: elementType)
+            }
+            // Fall through to the basic kernel when MPP isn't available and
+            // a transpose is requested — the simdgroup_matrix kernel doesn't
+            // yet honour transA/transB.
+            let zeroValue = isFloat ? "0.0" : "0"
+            let aRead = transA ? "batchA[k * \(M) + row]" : "batchA[row * K + k]"
+            let bRead = transB ? "batchB[col * K + k]" : "batchB[k * N + col]"
+            return generateBasicMatMulSourceWithTranspose(
+                batchSize: batchSize, metalType: metalType, zeroValue: zeroValue, M: M, N: N, K: K,
+                aRead: aRead, bRead: bRead)
         } else {
             let zeroValue = isFloat ? "0.0" : "0"
             // Generate read expressions that handle transposition
@@ -3146,6 +3202,109 @@ public final class CodeGenerator: @unchecked Sendable {
     /// Tile: BM=64, BN=32 per threadgroup, 4 cooperating simdgroups (128
     /// threads). The kernel constructs `tensor_inline` views of the raw device
     /// pointers in-kernel so the host-side binding stays as ordinary
+    /// Generates a dedicated GEMV (matrix-vector) kernel for `M=1` matmul.
+    /// y = x @ W where x is [1, K] and W is [K, N].
+    ///
+    /// One TG of 32 threads handles `outputsPerTG = 32 * tn` output columns.
+    /// Each K iteration: every thread independently reads its `tn` columns of
+    /// W from the same row (contiguous coalesced read across the simdgroup),
+    /// then multiplies in `tn` private accumulators against the (broadcast) x[k].
+    /// No simd_sum needed — each thread owns its own outputs.
+    ///
+    /// To hide K-direction memory latency, the inner loop unrolls by `tk=4`:
+    /// each iteration reads 4 contiguous x values (one float4) and `tk * tn`
+    /// W values, then issues `tk * tn = 16` independent multiply-accumulates.
+    /// The compiler can pipeline the 4 + 16 = 20 independent loads ahead of
+    /// the multiplies.
+    ///
+    /// Caller guarantees K % 4 == 0 (we use float4 reads for x) and
+    /// N % 4 == 0, N ≥ outputsPerTG.
+    private func generateGEMVSource(K: Int, N: Int, metalType: String) -> (String, String, TuningConfig?) {
+        // tn × tk balance: tn small → more TGs (better GPU saturation) but
+        // less per-thread ILP. tk small → less ILP per K iteration. Empirically
+        // on M5 Pro for K=N=4096, tn=2 with tk=8 outperforms tn=4 with tk=4
+        // because the GPU is severely under-occupied by the latter (only 32
+        // TGs of 32 threads = 1024 threads vs ~16K concurrent capacity).
+        let tn = 2   // outputs per thread
+        let tk = 8   // K-iteration unroll — give compiler tn*tk=16 independent FMAs/iter
+        let outputsPerTG = 32 * tn
+
+        var accDecls = ""
+        var accStores = ""
+        for c in 0..<tn {
+            accDecls += "            float acc\(c) = 0.0f;\n"
+            accStores += "            if (my_col + \(c)u < N_DIM) y[my_col + \(c)u] = acc\(c);\n"
+        }
+        // Inner-iteration body: load tk x values and tk*tn W values into named
+        // locals, then multiply. Lay out the loads first so the compiler issues
+        // them all before the dependent FMAs.
+        var multiplies = ""
+        let xField = ["x", "y", "z", "w"]
+        for r in 0..<tk {
+            let lane = xField[r % 4]
+            let chunk = r / 4
+            let xRef = "xs\(chunk).\(lane)"
+            for c in 0..<tn {
+                multiplies += "                acc\(c) += \(xRef) * W[(k + \(r)u) * N_DIM + my_col + \(c)u];\n"
+            }
+        }
+        // Number of float4 chunks per K iteration.
+        let xChunks = (tk + 3) / 4
+        var xLoads = ""
+        for i in 0..<xChunks {
+            xLoads += "                float4 xs\(i) = *reinterpret_cast<const device float4*>(x + k + \(i * 4)u);\n"
+        }
+
+        let header = """
+        #include <metal_stdlib>
+        using namespace metal;
+
+        constant uint K_DIM = \(K);
+        constant uint N_DIM = \(N);
+
+        // GEMV: y = x @ W. 32-thread TG, \(tn) outputs per thread → \(outputsPerTG) outputs/TG.
+        // Inner loop processes \(tk) K rows per iteration with `tk * tn = \(tk * tn)`
+        // independent multiplies for ILP.
+        kernel void kernel_gemv(
+            device const float* x [[buffer(0)]],
+            device const float* W [[buffer(1)]],
+            device float* y [[buffer(2)]],
+            uint tgid [[threadgroup_position_in_grid]],
+            uint simd_lane [[thread_index_in_simdgroup]])
+        {
+            constexpr uint TN = \(tn);
+            constexpr uint TK = \(tk);
+            uint my_col = tgid * 32u * TN + simd_lane * TN;
+            if (my_col >= N_DIM) return;
+
+        """
+        let body = """
+
+            for (uint k = 0u; k < K_DIM; k += TK) {
+        \(xLoads)
+        """
+        let footer = """
+            }
+
+
+        """
+
+        let source = header
+            + accDecls
+            + body
+            + multiplies
+            + footer
+            + accStores
+            + "}\n"
+
+        return (source, "kernel_gemv", TuningConfig(
+            blockSize: 32,
+            useSIMDGroups: true,
+            useGEMV: true,
+            gemvNWrites: outputsPerTG
+        ))
+    }
+
     /// MTLBuffers — no MTLTensor / MTL4 host APIs required.
     ///
     /// The emitted source contains
@@ -3156,7 +3315,9 @@ public final class CodeGenerator: @unchecked Sendable {
     private func generateMatMul2dMPPSource(
         batchSize: Int,
         inputElementType: ElementType,
-        outputElementType: ElementType
+        outputElementType: ElementType,
+        transA: Bool = false,
+        transB: Bool = false
     ) -> (String, String, TuningConfig?) {
         let tuning = TuningConfig(
             tileM: 128,
@@ -3177,11 +3338,38 @@ public final class CodeGenerator: @unchecked Sendable {
             : ""
         let batchOffsetSetup = isBatched ? """
                 // Skip out-of-range batches in case the dispatch grid was rounded up.
+                // A and B per-batch byte counts are M*K and K*N regardless of transpose
+                // (the buffer is the same size; only the interpretation changes).
                 if (tgid.z >= batchCount) return;
                 A_ptr += uint(tgid.z) * M * K;
                 B_ptr += uint(tgid.z) * K * N;
                 C_ptr += uint(tgid.z) * M * N;
         """ : ""
+
+        // dextents follow the (cols, rows) convention — cols is the
+        // faster-varying / inner-stride dim of the row-major buffer.
+        //
+        //   transA=false → A in [M, K]  → dextents{cols=K, rows=M}
+        //   transA=true  → A in [K, M]  → dextents{cols=M, rows=K}
+        //   transB=false → B in [K, N]  → dextents{cols=N, rows=K}
+        //   transB=true  → B in [N, K]  → dextents{cols=K, rows=N}
+        //
+        // Slices use (col_origin, row_origin). For each operand, the M/N tile
+        // origin lives on whichever dim is the *non-contracting* one. K is
+        // not sliced (full reduction).
+        let aDExtents = transA
+            ? "dextents<int32_t, 2>{int32_t(M), int32_t(K)}"
+            : "dextents<int32_t, 2>{int32_t(K), int32_t(M)}"
+        let bDExtents = transB
+            ? "dextents<int32_t, 2>{int32_t(K), int32_t(N)}"
+            : "dextents<int32_t, 2>{int32_t(N), int32_t(K)}"
+        let aSlice = transA
+            ? "A.slice(tgid.y * BM, 0)"
+            : "A.slice(0, tgid.y * BM)"
+        let bSlice = transB
+            ? "B.slice(0, tgid.x * BN)"
+            : "B.slice(tgid.x * BN, 0)"
+        let descTransposeFlags = "\(transA ? "true" : "false"), \(transB ? "true" : "false")"
 
         let source = """
         #include <metal_stdlib>
@@ -3198,12 +3386,12 @@ public final class CodeGenerator: @unchecked Sendable {
 
         // MetalPerformancePrimitives matmul2d on Apple Matrix Coprocessor.
         // 4 simdgroups (128 threads) per threadgroup. dextents convention is
-        // (cols, rows), so:
-        //   A : M x K row-major -> dextents{ cols=K, rows=M }
-        //   B : K x N row-major -> dextents{ cols=N, rows=K }
-        //   C : M x N row-major -> dextents{ cols=N, rows=M }
-        // Slice (col_origin, row_origin) per the framework's slice() signature.
+        // (cols, rows). transA/transB switch the buffer interpretation and
+        // the matmul2d_descriptor's transpose_left/transpose_right flags so
+        // the matrix coprocessor reads the operand transposed in-place
+        // instead of needing a separate physical-transpose kernel.
         // Input element type: \(inputMetalType)  Output: \(outputMetalType)
+        // transA=\(transA), transB=\(transB)
         //
         // When input != output (e.g., half × half → float), we're in the
         // mixed-precision path that fuses TF32's trailing fp16→fp32 convert.
@@ -3230,10 +3418,10 @@ public final class CodeGenerator: @unchecked Sendable {
             \(batchOffsetSetup)
             tensor<device \(inputMetalType), dextents<int32_t, 2>, tensor_inline> A(
                 A_ptr,
-                dextents<int32_t, 2>{int32_t(K), int32_t(M)});
+                \(aDExtents));
             tensor<device \(inputMetalType), dextents<int32_t, 2>, tensor_inline> B(
                 B_ptr,
-                dextents<int32_t, 2>{int32_t(N), int32_t(K)});
+                \(bDExtents));
             tensor<device \(outputMetalType), dextents<int32_t, 2>, tensor_inline> C(
                 C_ptr,
                 dextents<int32_t, 2>{int32_t(N), int32_t(M)});
@@ -3242,7 +3430,7 @@ public final class CodeGenerator: @unchecked Sendable {
                 BM,                                  // m outer dim
                 BN,                                  // n outer dim
                 static_cast<int>(dynamic_extent),    // k = pulled from operands
-                false, false,                        // no transpose A or B
+                \(descTransposeFlags),                        // transpose_left, transpose_right
                 false);                              // exact precision: fp16
                                                      // inputs already minimize
                                                      // MAC width; relaxed has
@@ -3252,8 +3440,8 @@ public final class CodeGenerator: @unchecked Sendable {
 
             // Grid is dispatched as gridSize.width = N_tiles, gridSize.height = M_tiles
             // (matches the 32x32 simdgroup kernel's dispatch convention).
-            auto a = A.slice(0,           tgid.y * BM);
-            auto b = B.slice(tgid.x * BN, 0);
+            auto a = \(aSlice);
+            auto b = \(bSlice);
             auto c = C.slice(tgid.x * BN, tgid.y * BM);
 
             op.run(a, b, c);
@@ -3768,21 +3956,74 @@ public final class CodeGenerator: @unchecked Sendable {
         // Analyze the reduction pattern and try to use specialized kernels
         let pattern = ReductionKernelGenerator.analyzePattern(inputShape: inputShape, reduceDims: reduceDims)
 
+        // Compute the reduction-axis size so we can pick between the per-thread
+        // specialised kernels (good for short rows/columns) and the cooperative
+        // tree-reduction general kernel (one TG per output, 1024 threads doing
+        // SIMD-tree reduction — far faster on long axes).
+        let reduceAxisSize: Int
+        if let firstReduceDim = reduceDims.first, firstReduceDim < inputShape.count {
+            reduceAxisSize = inputShape[firstReduceDim]
+        } else {
+            reduceAxisSize = 1
+        }
+        // 64 is the break-even point on M5 Pro: below it the per-thread kernel
+        // wins because 1024-thread cooperative tree-reduction has ~5µs of
+        // SIMD-shuffle + threadgroup-barrier overhead per output. Above it the
+        // sequential per-thread loop is the bottleneck (e.g. RED-004's 4096-wide
+        // row max takes 4096 sequential reads per thread; with the general
+        // kernel each of 1024 threads does 4 reads then tree-reduces in registers).
+        let useGeneralForLongAxis = reduceAxisSize >= 64
+
         // For row and column reductions, use optimized specialized kernels
         switch pattern {
         case .row:
-            let source = ReductionKernelGenerator.generateRowReductionKernel(
-                op: reductionOp,
-                entryPoint: "kernel_reduce"
-            )
-            return (source, "kernel_reduce", TuningConfig(blockSize: 1024, useRowReduction: true))
+            if !useGeneralForLongAxis {
+                let source = ReductionKernelGenerator.generateRowReductionKernel(
+                    op: reductionOp,
+                    entryPoint: "kernel_reduce"
+                )
+                return (source, "kernel_reduce", TuningConfig(blockSize: 1024, useRowReduction: true))
+            }
+            // For long-axis row reductions, decide between two cooperative kernels
+            // based on outputCount (= product of non-reduced dims):
+            // - Huge outputCount (≥ 2048): SIMD-per-output kernel — 32 outputs/TG
+            //   so we get few enough TGs to keep dispatch cost low while still
+            //   saturating the GPU. Best for softmax-style cases (RED-006).
+            // - Smaller outputCount: general kernel (1 TG per output, full TG
+            //   cooperatively reducing) — gives more in-flight TGs which is the
+            //   limit on smaller workloads (RED-002 / RED-004).
+            let outputCount = inputShape.enumerated()
+                .filter { !reduceDims.contains($0.offset) }
+                .map { $0.element }
+                .reduce(1, *)
+            if outputCount >= 2048 {
+                // The MLX-style interleaved kernel requires the reduce axis to
+                // be a multiple of (32 * N_READS) = 128 so we can drop the tail
+                // path. Most ML shapes (powers of 2, common channel counts)
+                // satisfy this. Otherwise fall back to the scalar SIMD-per-output
+                // kernel which handles arbitrary axis sizes.
+                if reduceAxisSize % 128 == 0 {
+                    return generateRowReductionSIMDPerOutputFloat4Source(
+                        reductionKind: reductionKind,
+                        metalType: metalType
+                    )
+                }
+                return generateRowReductionSIMDPerOutputSource(
+                    reductionKind: reductionKind,
+                    metalType: metalType
+                )
+            }
+            // Otherwise fall through to the general tree-reduction kernel.
 
         case .column:
-            let source = ReductionKernelGenerator.generateColumnReductionKernel(
-                op: reductionOp,
-                entryPoint: "kernel_reduce"
-            )
-            return (source, "kernel_reduce", TuningConfig(blockSize: 1024, useColumnReduction: true))
+            if !useGeneralForLongAxis {
+                let source = ReductionKernelGenerator.generateColumnReductionKernel(
+                    op: reductionOp,
+                    entryPoint: "kernel_reduce"
+                )
+                return (source, "kernel_reduce", TuningConfig(blockSize: 1024, useColumnReduction: true))
+            }
+            // Long-axis column reductions also fall through to the general kernel.
 
         case .global, .general:
             break
@@ -3896,6 +4137,207 @@ public final class CodeGenerator: @unchecked Sendable {
         """
 
         return (source, "kernel_reduce", TuningConfig(blockSize: blockSize))
+    }
+
+    /// Float4-unrolled SIMD-per-output reduction kernel with N_WRITES outputs
+    /// packed per simdgroup. Each simdgroup of 32 threads sequentially reduces
+    /// `nWrites` outputs; with 32 simdgroups per TG we get `32 * nWrites`
+    /// outputs/TG. nWrites=4 cuts the TG count by another 4× over the
+    /// 1-output-per-simdgroup variant — important because RED-006's bottleneck
+    /// is per-TG dispatch overhead (196k outputs / 32-per-TG = 6144 TGs).
+    /// Caller must verify `reduceSize % 4 == 0`.
+    private func generateRowReductionSIMDPerOutputFloat4Source(
+        reductionKind: ReductionKind,
+        metalType: String,
+        nWrites: Int = 4
+    ) -> (String, String, TuningConfig?) {
+        let initValue: String
+        let reduceOp: String
+        let scalarReduceExpr: (String, String) -> String
+        switch reductionKind {
+        case .sum, .mean:
+            initValue = "0.0f"
+            reduceOp = "a + b"
+            scalarReduceExpr = { acc, val in "\(acc) + \(val)" }
+        case .max:
+            initValue = "-INFINITY"
+            reduceOp = "max(a, b)"
+            scalarReduceExpr = { acc, val in "max(\(acc), \(val))" }
+        case .min:
+            initValue = "INFINITY"
+            reduceOp = "min(a, b)"
+            scalarReduceExpr = { acc, val in "min(\(acc), \(val))" }
+        case .product:
+            initValue = "1.0f"
+            reduceOp = "a * b"
+            scalarReduceExpr = { acc, val in "(\(acc)) * (\(val))" }
+        case .and:
+            initValue = "1.0f"
+            reduceOp = "float(int(a) & int(b))"
+            scalarReduceExpr = { acc, val in "float(int(\(acc)) & int(\(val)))" }
+        case .or:
+            initValue = "0.0f"
+            reduceOp = "float(int(a) | int(b))"
+            scalarReduceExpr = { acc, val in "float(int(\(acc)) | int(\(val)))" }
+        }
+
+        // Build the MLX-style interleaved inner loop. The Metal compiler issues
+        // N_WRITES * N_READS independent reads per iteration before any
+        // accumulator dependency, giving the GPU plenty of in-flight loads to
+        // hide memory latency.
+        let nReads = 4
+        var perThreadReduceLines = ""
+        for w in 0..<nWrites {
+            for r in 0..<nReads {
+                perThreadReduceLines += "                total\(w) = \(scalarReduceExpr("total\(w)", "ptr\(w)[\(r)]"));\n"
+            }
+        }
+        var advancePtrLines = ""
+        for w in 0..<nWrites {
+            advancePtrLines += "                ptr\(w) += 32u * N_READS;\n"
+        }
+        var declareTotals = ""
+        var simdReduceTotals = ""
+        var storeOutputs = ""
+        for w in 0..<nWrites {
+            declareTotals += "            float total\(w) = \(initValue);\n"
+            simdReduceTotals += "            \(simdReduceCode(reductionKind: reductionKind, varName: "total\(w)"))\n"
+            storeOutputs += "                if (outputBase + \(w)u < outputCount) { float a = total\(w); float b = initB; output[outputBase + \(w)u] = \(reduceOp); }\n"
+        }
+        var declarePtrs = ""
+        for w in 0..<nWrites {
+            declarePtrs += "            device const float* ptr\(w) = input + (outputBase + \(w)u) * reduceSize + simd_lane * N_READS;\n"
+        }
+
+        let prelude = """
+        #include <metal_stdlib>
+        using namespace metal;
+
+        // 1 simdgroup (32 threads) per TG, handling N_WRITES=\(nWrites) outputs
+        // simultaneously with N_READS=\(nReads) elements/output/iteration.
+        // Inner loop interleaves all N_WRITES outputs before any reduce —
+        // gives the compiler N_WRITES*N_READS = \(nWrites * nReads) independent
+        // loads per iteration to pipeline. Mirrors MLX's `row_reduce_simple`.
+        // Caller verifies reduceSize % (32 * N_READS) == 0.
+        kernel void kernel_reduce(
+            device const \(metalType)* input [[buffer(0)]],
+            device const \(metalType)* initValue [[buffer(1)]],
+            device \(metalType)* output [[buffer(2)]],
+            constant uint& outputCount [[buffer(3)]],
+            constant uint& reduceSize [[buffer(4)]],
+            constant uint& innerSize [[buffer(5)]],
+            uint tgid [[threadgroup_position_in_grid]],
+            uint simd_lane [[thread_index_in_simdgroup]])
+        {
+            constexpr uint N_WRITES = \(nWrites);
+            constexpr uint N_READS = \(nReads);
+            uint outputBase = tgid * N_WRITES;
+            if (outputBase >= outputCount) return;
+
+            float initB = initValue[0];
+
+        """
+        let postlude = """
+
+            uint blocks = reduceSize / (32u * N_READS);
+
+            for (uint b = 0u; b < blocks; ++b) {
+
+        """
+        let postlude2 = """
+            }
+
+
+        """
+        let storeBlock = """
+            if (simd_lane == 0u) {
+
+        """
+        let endStore = """
+            }
+        }
+        """
+
+        let source = prelude
+            + declareTotals
+            + declarePtrs
+            + postlude
+            + perThreadReduceLines
+            + advancePtrLines
+            + postlude2
+            + simdReduceTotals
+            + storeBlock
+            + storeOutputs
+            + endStore
+
+        return (source, "kernel_reduce", TuningConfig(
+            blockSize: 32,
+            useSIMDPerOutputReduction: true,
+            simdPerOutputNWrites: nWrites
+        ))
+    }
+
+    /// Generates a row-reduction kernel where each simdgroup of 32 threads
+    /// cooperatively reduces one output. With one threadgroup containing 32
+    /// simdgroups (1024 threads total) we handle 32 outputs per TG, cutting
+    /// per-TG dispatch overhead by 32× compared to "one TG per output".
+    /// Used only when innerSize == 1 (pure last-axis reduction) — the most
+    /// common case for softmax / attention reductions.
+    private func generateRowReductionSIMDPerOutputSource(
+        reductionKind: ReductionKind,
+        metalType: String
+    ) -> (String, String, TuningConfig?) {
+        let initValue: String
+        let reduceOp: String
+        let accumOp: String
+        switch reductionKind {
+        case .sum, .mean: initValue = "0.0f"; reduceOp = "a + b";   accumOp = "accum += val;"
+        case .max:        initValue = "-INFINITY"; reduceOp = "max(a, b)"; accumOp = "accum = max(accum, val);"
+        case .min:        initValue = "INFINITY";  reduceOp = "min(a, b)"; accumOp = "accum = min(accum, val);"
+        case .product:    initValue = "1.0f"; reduceOp = "a * b";   accumOp = "accum *= val;"
+        case .and:        initValue = "1.0f"; reduceOp = "float(int(a) & int(b))"; accumOp = "accum = float(int(accum) & int(val));"
+        case .or:         initValue = "0.0f"; reduceOp = "float(int(a) | int(b))"; accumOp = "accum = float(int(accum) | int(val));"
+        }
+
+        let source = """
+        #include <metal_stdlib>
+        using namespace metal;
+
+        // SIMD-per-output row reduction. innerSize is implicitly 1 (caller
+        // verifies). Each TG = 32 simdgroups × 32 lanes = 1024 threads, each
+        // simdgroup independently reduces one output row → 32 outputs/TG.
+        kernel void kernel_reduce(
+            device const \(metalType)* input [[buffer(0)]],
+            device const \(metalType)* initValue [[buffer(1)]],
+            device \(metalType)* output [[buffer(2)]],
+            constant uint& outputCount [[buffer(3)]],
+            constant uint& reduceSize [[buffer(4)]],
+            constant uint& innerSize [[buffer(5)]],
+            uint tgid [[threadgroup_position_in_grid]],
+            uint simd_lane [[thread_index_in_simdgroup]],
+            uint simd_group [[simdgroup_index_in_threadgroup]])
+        {
+            uint myOutput = tgid * 32u + simd_group;
+            if (myOutput >= outputCount) return;
+
+            uint base = myOutput * reduceSize;
+            float accum = \(initValue);
+            for (uint r = simd_lane; r < reduceSize; r += 32u) {
+                float val = input[base + r];
+                \(accumOp)
+            }
+
+            \(simdReduceCode(reductionKind: reductionKind, varName: "accum"))
+
+            if (simd_lane == 0u) {
+                float a = accum;
+                float b = initValue[0];
+                output[myOutput] = \(reduceOp);
+            }
+        }
+        """
+
+        return (source, "kernel_reduce", TuningConfig(blockSize: 1024, useSIMDPerOutputReduction: true))
     }
 
     /// Generates SIMD reduction code for a given reduction kind.
@@ -4104,36 +4546,47 @@ public final class CodeGenerator: @unchecked Sendable {
 
         let source: String
         if resolvedAxis == rank - 1 {
-            // Common case: softmax over last axis. Each threadgroup row handles one batch element.
+            // Common case: softmax over last axis. Use 1 simdgroup (32 threads)
+            // per output row. Threads cooperatively reduce across the row using
+            // SIMD intrinsics (no shared memory or threadgroup_barrier needed
+            // when the cooperating set fits in a single simdgroup). Mirrors the
+            // SIMD-per-output reduction kernel — proper parallelism across the
+            // reduction dimension.
             source = """
             #include <metal_stdlib>
             using namespace metal;
 
             constant uint REDUCTION_SIZE = \(reductionSize);
+            constant uint BATCH_COUNT = \(batchSize);
 
             kernel void kernel_softmax(
                 device const float* input [[buffer(0)]],
                 device float* output [[buffer(1)]],
-                uint2 gid [[thread_position_in_grid]])
+                uint tgid [[threadgroup_position_in_grid]],
+                uint simd_lane [[thread_index_in_simdgroup]])
             {
-                uint batch = gid.y;
+                uint batch = tgid;
+                if (batch >= BATCH_COUNT) return;
                 uint offset = batch * REDUCTION_SIZE;
 
-                // Pass 1: find max for numerical stability
+                // Pass 1: find max for numerical stability.
                 float maxVal = -INFINITY;
-                for (uint i = 0; i < REDUCTION_SIZE; i++) {
+                for (uint i = simd_lane; i < REDUCTION_SIZE; i += 32u) {
                     maxVal = max(maxVal, input[offset + i]);
                 }
+                maxVal = simd_max(maxVal);
 
-                // Pass 2: compute exp(x - max) and accumulate sum
+                // Pass 2: compute exp(x - max) and accumulate sum.
                 float sumExp = 0.0f;
-                for (uint i = 0; i < REDUCTION_SIZE; i++) {
+                for (uint i = simd_lane; i < REDUCTION_SIZE; i += 32u) {
                     sumExp += exp(input[offset + i] - maxVal);
                 }
+                sumExp = simd_sum(sumExp);
 
-                // Pass 3: normalize
+                // Pass 3: normalize. Re-read input + recompute exp to avoid
+                // a write-then-read round trip through device memory.
                 float invSum = 1.0f / sumExp;
-                for (uint i = gid.x; i < REDUCTION_SIZE; i += \(256)) {
+                for (uint i = simd_lane; i < REDUCTION_SIZE; i += 32u) {
                     output[offset + i] = exp(input[offset + i] - maxVal) * invSum;
                 }
             }
@@ -4812,6 +5265,18 @@ public final class CodeGenerator: @unchecked Sendable {
                     return DispatchConfig.dispatch1D(elements: M * N * batchSize, threadgroupSize: 256)
                 }
 
+                // GEMV path: 1 simdgroup (32 threads) per TG, each TG handles
+                // gemvNWrites consecutive output columns. Dispatch
+                // ceildiv(N, gemvNWrites) threadgroups.
+                if let t = tuning, t.useGEMV {
+                    let nw = max(1, t.gemvNWrites)
+                    let numThreadgroups = (N + nw - 1) / nw
+                    return DispatchConfig(
+                        gridSize: MTLSize(width: numThreadgroups, height: 1, depth: 1),
+                        threadgroupSize: MTLSize(width: 32, height: 1, depth: 1)
+                    )
+                }
+
                 // Threads per threadgroup. Default 128 (4 simdgroups). The MPP
                 // kernel signals an alternate count (e.g. 256 for 8 simdgroups)
                 // via tuning.blockSize.
@@ -4853,6 +5318,25 @@ public final class CodeGenerator: @unchecked Sendable {
                     // Uses 1D dispatch with threads processing entire rows/columns independently
                     let blockSize = tuning.blockSize ?? 1024
                     return DispatchConfig.dispatch1D(elements: totalElements, threadgroupSize: blockSize)
+                }
+
+                // SIMD-per-output reduction. `tuning.blockSize` controls the TG
+                // size; the float4 variant uses 32 (one simdgroup per TG, each
+                // TG handling `simdPerOutputNWrites` consecutive outputs), the
+                // scalar variant uses 1024 (32 simdgroups, each on a distinct
+                // output → 32 outputs per TG).
+                if let tuning = tuning, tuning.useSIMDPerOutputReduction {
+                    let nWrites = max(1, tuning.simdPerOutputNWrites)
+                    let tgSize = tuning.blockSize ?? 1024
+                    // Outputs per TG: with a 32-thread TG it's `nWrites`, with a
+                    // 1024-thread TG it's `32 * nWrites`.
+                    let simdgroupsPerTG = max(1, tgSize / 32)
+                    let outputsPerTG = simdgroupsPerTG * nWrites
+                    let numThreadgroups = (totalElements + outputsPerTG - 1) / outputsPerTG
+                    return DispatchConfig(
+                        gridSize: MTLSize(width: numThreadgroups, height: 1, depth: 1),
+                        threadgroupSize: MTLSize(width: tgSize, height: 1, depth: 1)
+                    )
                 }
 
                 // General reduction: one threadgroup per output element
@@ -5003,14 +5487,17 @@ public final class CodeGenerator: @unchecked Sendable {
             return DispatchConfig.dispatch1D(elements: totalElements, threadgroupSize: 256)
 
         case .fusedSoftmax(let axis):
-            // Softmax over last axis: dispatch as 2D (threads across reduction dim, rows across batch)
+            // Last-axis softmax: 1 simdgroup (32 threads) per output row.
+            // batch TGs each cooperatively reduce one row using simd_max /
+            // simd_sum — much faster than the previous "threads do redundant
+            // sequential scans" form which the 256-thread TG implied.
             let rank = outputShape.count
             let resolvedAxis = axis < 0 ? rank + axis : axis
             if resolvedAxis == rank - 1 && outputShape.count >= 2 {
                 let batch = outputShape.dropLast().reduce(1, *)
                 return DispatchConfig(
-                    gridSize: MTLSize(width: (256 + 255) / 256, height: batch, depth: 1),
-                    threadgroupSize: MTLSize(width: 256, height: 1, depth: 1)
+                    gridSize: MTLSize(width: batch, height: 1, depth: 1),
+                    threadgroupSize: MTLSize(width: 32, height: 1, depth: 1)
                 )
             } else {
                 // General axis: 1D dispatch over batch elements
@@ -5289,9 +5776,20 @@ public final class CodeGenerator: @unchecked Sendable {
     /// Computes M, K, N, batchSize for dot_general from dimension numbers.
     private func dotGeneralDims(lhsShape: [Int], rhsShape: [Int], attributes: HLOAttributes) -> (M: UInt32, K: UInt32, N: UInt32, batchSize: UInt32) {
         let dotDimNums = attributes.dotDimensionNumbers
-        let lhsContractDims = dotDimNums?.lhsContractingDimensions ?? [lhsShape.count - 1]
-        let rhsContractDims = dotDimNums?.rhsContractingDimensions ?? (rhsShape.count >= 2 ? [rhsShape.count - 2] : [0])
-        let lhsBatchDims = dotDimNums?.lhsBatchingDimensions ?? []
+        var lhsContractDims = dotDimNums?.lhsContractingDimensions ?? [lhsShape.count - 1]
+        var rhsContractDims = dotDimNums?.rhsContractingDimensions ?? (rhsShape.count >= 2 ? [rhsShape.count - 2] : [0])
+        var lhsBatchDims = dotDimNums?.lhsBatchingDimensions ?? []
+        var rhsBatchDims = dotDimNums?.rhsBatchingDimensions ?? []
+
+        // Apply transpose-folding attributes (see generateMatMulSource for the rationale).
+        if attributes.lhsTranspose == true, lhsShape.count >= 2 {
+            lhsContractDims = swapLastTwoDimPositions(lhsContractDims, rank: lhsShape.count)
+            lhsBatchDims = swapLastTwoDimPositions(lhsBatchDims, rank: lhsShape.count)
+        }
+        if attributes.rhsTranspose == true, rhsShape.count >= 2 {
+            rhsContractDims = swapLastTwoDimPositions(rhsContractDims, rank: rhsShape.count)
+            rhsBatchDims = swapLastTwoDimPositions(rhsBatchDims, rank: rhsShape.count)
+        }
 
         var mVal = 1
         for (i, s) in lhsShape.enumerated() {
@@ -5301,7 +5799,7 @@ public final class CodeGenerator: @unchecked Sendable {
         for d in lhsContractDims { kVal *= lhsShape[d] }
         var nVal = 1
         for (i, s) in rhsShape.enumerated() {
-            if !rhsContractDims.contains(i) && !(dotDimNums?.rhsBatchingDimensions ?? []).contains(i) { nVal *= s }
+            if !rhsContractDims.contains(i) && !rhsBatchDims.contains(i) { nVal *= s }
         }
         let batchVal = lhsBatchDims.isEmpty
             ? (lhsShape.count > 2 ? lhsShape.dropLast(2).reduce(1, *) : 1)

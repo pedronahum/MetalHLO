@@ -258,6 +258,61 @@ module @matmul_basic {
   }
 }
 """),
+        // Exercises the -O3 transpose-folding pass: `transpose(A) @ B` should fold
+        // into `dot(A, B, lhsTranspose=true)` and produce identical results.
+        ("transpose_lhs_matmul", """
+module @transpose_lhs_matmul {
+  func.func @main(%arg0: tensor<3x2xf32>, %arg1: tensor<3x4xf32>) -> (tensor<2x4xf32>) {
+    %0 = stablehlo.transpose %arg0, dims = [1, 0] : (tensor<3x2xf32>) -> tensor<2x3xf32>
+    %1 = stablehlo.dot_general %0, %arg1, batching_dims = [] x [], contracting_dims = [1] x [0] : (tensor<2x3xf32>, tensor<3x4xf32>) -> tensor<2x4xf32>
+    return %1 : tensor<2x4xf32>
+  }
+}
+"""),
+        // Exercises the -O3 transpose-folding pass for the RHS — the attention `Q @ K^T` shape.
+        ("matmul_transpose_rhs", """
+module @matmul_transpose_rhs {
+  func.func @main(%arg0: tensor<2x3xf32>, %arg1: tensor<4x3xf32>) -> (tensor<2x4xf32>) {
+    %0 = stablehlo.transpose %arg1, dims = [1, 0] : (tensor<4x3xf32>) -> tensor<3x4xf32>
+    %1 = stablehlo.dot_general %arg0, %0, batching_dims = [] x [], contracting_dims = [1] x [0] : (tensor<2x3xf32>, tensor<3x4xf32>) -> tensor<2x4xf32>
+    return %1 : tensor<2x4xf32>
+  }
+}
+"""),
+        // MPP-sized variant — 512x512 with `transpose(A) @ B` on the LHS. This
+        // exercises the matmul2d_descriptor's `transpose_left=true` path (the
+        // gate at CodeGenerator.swift line ~3111 routes shapes that satisfy
+        // M%128==0, N%128==0 and mppTgCount >= 16 through the MPP kernel).
+        ("transpose_lhs_matmul_mpp", """
+module @transpose_lhs_matmul_mpp {
+  func.func @main(%arg0: tensor<512x512xf32>, %arg1: tensor<512x512xf32>) -> (tensor<512x512xf32>) {
+    %0 = stablehlo.transpose %arg0, dims = [1, 0] : (tensor<512x512xf32>) -> tensor<512x512xf32>
+    %1 = stablehlo.dot_general %0, %arg1, batching_dims = [] x [], contracting_dims = [1] x [0] : (tensor<512x512xf32>, tensor<512x512xf32>) -> tensor<512x512xf32>
+    return %1 : tensor<512x512xf32>
+  }
+}
+"""),
+        // MPP-sized variant — 512x512 with `A @ transpose(B)` on the RHS, the
+        // attention `Q @ K^T` shape at scale. Exercises `transpose_right=true`.
+        ("matmul_transpose_rhs_mpp", """
+module @matmul_transpose_rhs_mpp {
+  func.func @main(%arg0: tensor<512x512xf32>, %arg1: tensor<512x512xf32>) -> (tensor<512x512xf32>) {
+    %0 = stablehlo.transpose %arg1, dims = [1, 0] : (tensor<512x512xf32>) -> tensor<512x512xf32>
+    %1 = stablehlo.dot_general %arg0, %0, batching_dims = [] x [], contracting_dims = [1] x [0] : (tensor<512x512xf32>, tensor<512x512xf32>) -> tensor<512x512xf32>
+    return %1 : tensor<512x512xf32>
+  }
+}
+"""),
+        // GEMV: 1×K @ K×N (M=1) — exercises the dedicated GEMV codegen path
+        // (one simdgroup per N_WRITES output columns, simd_sum reduction).
+        ("gemv_1xK_x_KxN", """
+module @gemv_1xK_x_KxN {
+  func.func @main(%arg0: tensor<1x256xf32>, %arg1: tensor<256x256xf32>) -> (tensor<1x256xf32>) {
+    %0 = stablehlo.dot_general %arg0, %arg1, batching_dims = [] x [], contracting_dims = [1] x [0] : (tensor<1x256xf32>, tensor<256x256xf32>) -> tensor<1x256xf32>
+    return %0 : tensor<1x256xf32>
+  }
+}
+"""),
     ]
 
     @Test("Simple add produces identical results across optimization levels")
@@ -315,6 +370,78 @@ module @matmul_basic {
                 ([1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0], [3, 4])
             ],
             tolerance: 1e-4  // Relaxed for matmul numerical variance
+        )
+    }
+
+    @Test("transpose(A) @ B produces identical results across optimization levels")
+    func testTransposeLhsMatmulAcrossLevels() async throws {
+        // arg0 is the [K=3, M=2] LHS (pre-transpose); arg1 is [K=3, N=4].
+        // Expected output: transpose(arg0) @ arg1 = [M=2, N=4].
+        try await compareAcrossOptimizationLevels(
+            programIndex: 5,
+            inputs: [
+                ([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], [3, 2]),
+                ([1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0], [3, 4])
+            ],
+            tolerance: 1e-4
+        )
+    }
+
+    @Test("A @ transpose(B) produces identical results across optimization levels")
+    func testMatmulTransposeRhsAcrossLevels() async throws {
+        // arg0 is [M=2, K=3]; arg1 is [N=4, K=3] (pre-transpose).
+        // Expected output: arg0 @ transpose(arg1) = [M=2, N=4].
+        try await compareAcrossOptimizationLevels(
+            programIndex: 6,
+            inputs: [
+                ([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], [2, 3]),
+                ([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0], [4, 3])
+            ],
+            tolerance: 1e-4
+        )
+    }
+
+    @Test("transpose(A) @ B at MPP-eligible 512x512 size matches across optimization levels")
+    func testTransposeLhsMatmulMPPAcrossLevels() async throws {
+        // 512x512 fp32 — exercises matmul2d_descriptor with transpose_left=true.
+        // Use a small, deterministic value range so we don't lose precision over
+        // the K=512 reduction. tolerance is relaxed because reduction order can
+        // vary across kernels (basic vs MPP).
+        let n = 512
+        let lhs = (0..<(n * n)).map { Float($0 % 7) * 0.01 - 0.03 }
+        let rhs = (0..<(n * n)).map { Float($0 % 11) * 0.01 - 0.05 }
+        try await compareAcrossOptimizationLevels(
+            programIndex: 7,
+            inputs: [(lhs, [n, n]), (rhs, [n, n])],
+            tolerance: 5e-3
+        )
+    }
+
+    @Test("A @ transpose(B) at MPP-eligible 512x512 size matches across optimization levels")
+    func testMatmulTransposeRhsMPPAcrossLevels() async throws {
+        // 512x512 fp32 — exercises matmul2d_descriptor with transpose_right=true.
+        let n = 512
+        let lhs = (0..<(n * n)).map { Float($0 % 7) * 0.01 - 0.03 }
+        let rhs = (0..<(n * n)).map { Float($0 % 11) * 0.01 - 0.05 }
+        try await compareAcrossOptimizationLevels(
+            programIndex: 8,
+            inputs: [(lhs, [n, n]), (rhs, [n, n])],
+            tolerance: 5e-3
+        )
+    }
+
+    @Test("GEMV (1×K @ K×N, M=1) matches across optimization levels")
+    func testGEMVAcrossLevels() async throws {
+        // M=1, K=256, N=256 fp32 — exercises generateGEMVSource. K=256 is a
+        // multiple of 4 and N=256 ≥ 32 so the GEMV gate fires at -O3.
+        let k = 256
+        let n = 256
+        let lhs = (0..<k).map { Float($0 % 7) * 0.01 - 0.03 }
+        let rhs = (0..<(k * n)).map { Float($0 % 11) * 0.01 - 0.05 }
+        try await compareAcrossOptimizationLevels(
+            programIndex: 9,
+            inputs: [(lhs, [1, k]), (rhs, [k, n])],
+            tolerance: 5e-3
         )
     }
 

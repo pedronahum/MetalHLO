@@ -197,6 +197,7 @@ public enum OptimizationPass: String, CaseIterable, Sendable {
     case ffnFusion = "ffn-fusion"
     case normFusion = "norm-fusion"
     case geluFusion = "gelu-fusion"
+    case softmaxFusion = "softmax-fusion"
     case matmulBiasActFusion = "matmul-bias-act-fusion"
 
     // Generic fusion phase

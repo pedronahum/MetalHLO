@@ -200,13 +200,18 @@ public struct PatternMetadata: Sendable {
     /// Epsilon for normalization.
     public var epsilon: Float?
 
+    /// Reduction axis (for softmax patterns). Negative values are interpreted
+    /// relative to the input rank.
+    public var axis: Int?
+
     public init(
         numHeads: Int? = nil,
         headDim: Int? = nil,
         hiddenDim: Int? = nil,
         causalMask: Bool? = nil,
         activation: String? = nil,
-        epsilon: Float? = nil
+        epsilon: Float? = nil,
+        axis: Int? = nil
     ) {
         self.numHeads = numHeads
         self.headDim = headDim
@@ -214,6 +219,7 @@ public struct PatternMetadata: Sendable {
         self.causalMask = causalMask
         self.activation = activation
         self.epsilon = epsilon
+        self.axis = axis
     }
 }
 

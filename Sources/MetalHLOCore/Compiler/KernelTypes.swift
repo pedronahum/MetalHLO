@@ -176,6 +176,24 @@ public struct TuningConfig: Sendable, Hashable {
     /// Use column reduction kernel (one thread per column, no threadgroup cooperation).
     public var useColumnReduction: Bool
 
+    /// Use SIMD-per-output reduction kernel: each simdgroup of 32 threads
+    /// cooperatively reduces one or more outputs, with 32 simdgroups per
+    /// threadgroup. Each TG handles `32 * simdPerOutputNWrites` outputs.
+    public var useSIMDPerOutputReduction: Bool
+
+    /// Number of outputs each simdgroup handles sequentially when
+    /// `useSIMDPerOutputReduction` is set. Increases TG output count
+    /// (and decreases TG count) to reduce per-TG dispatch overhead.
+    public var simdPerOutputNWrites: Int
+
+    /// Use the dedicated GEMV (matrix-vector) kernel. The kernel uses one
+    /// simdgroup per `gemvNWrites` output columns; dispatch is
+    /// `ceildiv(N, gemvNWrites)` 32-thread TGs.
+    public var useGEMV: Bool
+
+    /// Outputs per simdgroup when `useGEMV` is set (e.g. 4).
+    public var gemvNWrites: Int
+
     public init(
         tileM: Int? = nil,
         tileN: Int? = nil,
@@ -186,7 +204,11 @@ public struct TuningConfig: Sendable, Hashable {
         unrollFactor: Int? = nil,
         elementsPerThread: Int? = nil,
         useRowReduction: Bool = false,
-        useColumnReduction: Bool = false
+        useColumnReduction: Bool = false,
+        useSIMDPerOutputReduction: Bool = false,
+        simdPerOutputNWrites: Int = 1,
+        useGEMV: Bool = false,
+        gemvNWrites: Int = 1
     ) {
         self.tileM = tileM
         self.tileN = tileN
@@ -198,6 +220,10 @@ public struct TuningConfig: Sendable, Hashable {
         self.elementsPerThread = elementsPerThread
         self.useRowReduction = useRowReduction
         self.useColumnReduction = useColumnReduction
+        self.useSIMDPerOutputReduction = useSIMDPerOutputReduction
+        self.simdPerOutputNWrites = simdPerOutputNWrites
+        self.useGEMV = useGEMV
+        self.gemvNWrites = gemvNWrites
     }
 
     /// Default tuning for small operations.

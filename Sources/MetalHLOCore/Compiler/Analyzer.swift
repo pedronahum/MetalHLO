@@ -389,12 +389,136 @@ public final class Analyzer: @unchecked Sendable {
         // Build maps for efficient lookup
         let definingOps = buildDefiningOpsMap(function)
 
-        // Detect patterns from most specific to least specific
+        // Detect patterns from most specific to least specific. Attention runs
+        // before softmax so attention-style softmaxes are absorbed into the
+        // larger pattern; the standalone softmax detector then catches any
+        // softmax not already inside an attention block.
         patterns.append(contentsOf: detectAttentionPatterns(function, definingOps: definingOps, shapes: shapes))
         patterns.append(contentsOf: detectNormPatterns(function, definingOps: definingOps, shapes: shapes))
         patterns.append(contentsOf: detectActivationPatterns(function, definingOps: definingOps))
         patterns.append(contentsOf: detectFFNPatterns(function, definingOps: definingOps, shapes: shapes))
         patterns.append(contentsOf: detectMatMulBiasActPatterns(function, definingOps: definingOps))
+        patterns.append(contentsOf: detectSoftmaxPatterns(function, definingOps: definingOps, shapes: shapes, existing: patterns))
+
+        return patterns
+    }
+
+    /// Detects standalone numerically-stable softmax patterns:
+    ///
+    ///     max     = reduce_max(x, axis)
+    ///     max_bc  = broadcast_in_dim(max)        // optional
+    ///     shifted = subtract(x, max_or_max_bc)
+    ///     e       = exp(shifted)
+    ///     sum     = reduce_sum(e, axis)
+    ///     sum_bc  = broadcast_in_dim(sum)        // optional
+    ///     out     = divide(e, sum_or_sum_bc)
+    ///
+    /// Skips matches whose root divide is already part of a previously-detected
+    /// pattern (e.g. inside an attention block) so we don't double-fuse.
+    private func detectSoftmaxPatterns(
+        _ function: HLOFunction,
+        definingOps: [TensorID: (op: HLOOperation, index: Int)],
+        shapes: [TensorID: [Int]],
+        existing: [DetectedPattern]
+    ) -> [DetectedPattern] {
+        // Indices already covered by a higher-priority pattern.
+        var claimed = Set<Int>()
+        for p in existing {
+            for idx in p.operationIndices {
+                claimed.insert(idx)
+            }
+        }
+
+        var patterns: [DetectedPattern] = []
+
+        for (rootIdx, op) in function.operations.enumerated() {
+            guard op.kind == .divide, op.operands.count == 2 else { continue }
+            if claimed.contains(rootIdx) { continue }
+
+            // Numerator: exp.
+            guard let expDef = definingOps[op.operands[0]],
+                  expDef.op.kind == .exponential else { continue }
+
+            // Denominator: reduce_sum, optionally wrapped in broadcast_in_dim.
+            var sumDef: (op: HLOOperation, index: Int)? = nil
+            var sumBroadcastDef: (op: HLOOperation, index: Int)? = nil
+            if let denomDef = definingOps[op.operands[1]] {
+                if denomDef.op.kind == .reduce {
+                    sumDef = denomDef
+                } else if denomDef.op.kind == .broadcastInDim,
+                          let inner = definingOps[denomDef.op.operands[0]],
+                          inner.op.kind == .reduce {
+                    sumBroadcastDef = denomDef
+                    sumDef = inner
+                }
+            }
+            guard let sum = sumDef,
+                  (sum.op.attributes.reductionKind ?? .sum) == .sum,
+                  sum.op.operands.first == expDef.op.result else { continue }
+
+            // exp's input: subtract(x, max_or_max_bc).
+            guard let subDef = definingOps[expDef.op.operands[0]],
+                  subDef.op.kind == .subtract,
+                  subDef.op.operands.count == 2 else { continue }
+
+            // Subtract's second operand: reduce_max, optionally wrapped in
+            // broadcast_in_dim.
+            var maxDef: (op: HLOOperation, index: Int)? = nil
+            var maxBroadcastDef: (op: HLOOperation, index: Int)? = nil
+            if let shifterDef = definingOps[subDef.op.operands[1]] {
+                if shifterDef.op.kind == .reduce {
+                    maxDef = shifterDef
+                } else if shifterDef.op.kind == .broadcastInDim,
+                          let inner = definingOps[shifterDef.op.operands[0]],
+                          inner.op.kind == .reduce {
+                    maxBroadcastDef = shifterDef
+                    maxDef = inner
+                }
+            }
+            guard let mx = maxDef,
+                  (mx.op.attributes.reductionKind ?? .max) == .max,
+                  mx.op.operands.first == subDef.op.operands[0] else { continue }
+
+            // Both reduces should agree on the axis.
+            let maxAxis = mx.op.attributes.dimensions?.first
+            let sumAxis = sum.op.attributes.dimensions?.first
+            guard let axis = maxAxis, axis == sumAxis else { continue }
+
+            var indices = [mx.index]
+            if let mbc = maxBroadcastDef { indices.append(mbc.index) }
+            indices.append(subDef.index)
+            indices.append(expDef.index)
+            indices.append(sum.index)
+            if let sbc = sumBroadcastDef { indices.append(sbc.index) }
+            indices.append(rootIdx)
+
+            // Skip if any of the intermediate ops we'd consume is also used
+            // elsewhere (an external use means we can't fold them away). The
+            // root divide always belongs to the pattern; only check the rest.
+            let consumed = Set(indices.dropLast())
+            var hasExternalUse = false
+            for idx in consumed {
+                let result = function.operations[idx].result
+                for (otherIdx, otherOp) in function.operations.enumerated() {
+                    if consumed.contains(otherIdx) || otherIdx == rootIdx { continue }
+                    if otherOp.operands.contains(result) {
+                        hasExternalUse = true
+                        break
+                    }
+                }
+                if function.returnValues.contains(result) { hasExternalUse = true }
+                if hasExternalUse { break }
+            }
+            if hasExternalUse { continue }
+
+            patterns.append(DetectedPattern(
+                type: .softmax,
+                operationIndices: indices.sorted(),
+                rootIndex: rootIdx,
+                metadata: PatternMetadata(axis: axis)
+            ))
+            for idx in indices { claimed.insert(idx) }
+        }
 
         return patterns
     }

@@ -166,6 +166,9 @@ public final class PassManager: @unchecked Sendable {
         register(name: "gelu-fusion", phase: .patternFusion) {
             GELUFusionPass()
         }
+        register(name: "softmax-fusion", phase: .patternFusion) {
+            SoftmaxFusionPass()
+        }
         register(name: "matmul-bias-act-fusion", phase: .patternFusion) {
             MatMulBiasActFusionPass()
         }
@@ -1091,6 +1094,101 @@ final class GELUFusionPass: OptimizationPass, @unchecked Sendable {
     }
 }
 
+/// Softmax fusion pass.
+///
+/// Detects standalone numerically-stable softmax patterns
+/// (`divide(exp(subtract(x, max_bc)), sum_bc)`) and replaces them with a
+/// `fused_softmax` custom_call. Attention-fusion runs first and absorbs
+/// softmaxes inside attention blocks; this pass picks up the rest.
+final class SoftmaxFusionPass: OptimizationPass, @unchecked Sendable {
+    let name = "softmax-fusion"
+    let invalidates: Set<AnalysisType> = [.lifetimes, .patterns]
+
+    func run(on function: HLOFunction, analysis: AnalysisResults) -> PassResult {
+        let softmaxPatterns = analysis.patterns.filter { $0.type == .softmax }
+        if softmaxPatterns.isEmpty {
+            return .unchanged(function)
+        }
+
+        var newOperations = function.operations
+        var opsToRemove = Set<Int>()
+        var changed = false
+
+        for pattern in softmaxPatterns {
+            let rootIdx = pattern.rootIndex
+            guard rootIdx < function.operations.count else { continue }
+            let rootOp = function.operations[rootIdx]
+
+            // The softmax input is the first operand of the subtract — find
+            // the subtract op in the pattern and pull its operand[0].
+            var inputSource: TensorID? = nil
+            for idx in pattern.operationIndices {
+                guard idx < function.operations.count else { continue }
+                let op = function.operations[idx]
+                if op.kind == .subtract, op.operands.count == 2 {
+                    inputSource = op.operands[0]
+                    break
+                }
+            }
+            guard let input = inputSource else { continue }
+
+            let axis = pattern.metadata.axis ?? -1
+            var attrs = HLOAttributes()
+            attrs.callTargetName = FusedSoftmaxHandler.targetName
+            attrs.backendConfig = "{\"axis\": \(axis)}"
+
+            let fusedOp = HLOOperation(
+                result: rootOp.result,
+                kind: .customCall,
+                operands: [input],
+                resultType: rootOp.resultType,
+                attributes: attrs
+            )
+
+            newOperations[rootIdx] = fusedOp
+
+            // Mark intermediate ops for removal if they have no external uses.
+            let patternIndexSet = Set(pattern.operationIndices)
+            for idx in pattern.operationIndices where idx != rootIdx {
+                let result = function.operations[idx].result
+                let hasExternalUse = function.operations.enumerated().contains { (i, otherOp) in
+                    !patternIndexSet.contains(i) && otherOp.operands.contains(result)
+                }
+                let isReturnValue = function.returnValues.contains(result)
+                if !hasExternalUse && !isReturnValue {
+                    opsToRemove.insert(idx)
+                }
+            }
+            changed = true
+        }
+
+        if !changed {
+            return .unchanged(function)
+        }
+
+        let filteredOps = newOperations.enumerated()
+            .filter { !opsToRemove.contains($0.offset) }
+            .map { $0.element }
+
+        let newFunction = HLOFunction(
+            name: function.name,
+            inputs: function.inputs,
+            outputTypes: function.outputTypes,
+            operations: filteredOps,
+            returnValues: function.returnValues
+        )
+
+        return PassResult(
+            function: newFunction,
+            changed: true,
+            stats: [
+                "operationsRemoved": opsToRemove.count,
+                "operationsFused": softmaxPatterns.count
+            ]
+        )
+    }
+}
+
 /// MatMul + Bias + Activation fusion pass.
 ///
 /// Detects patterns of matmul followed by bias add and optional activation,
@@ -1274,22 +1372,20 @@ final class ResidualChainFusionPass: OptimizationPass, @unchecked Sendable {
 /// Transpose folding pass.
 ///
 /// Folds `transpose(A) @ B` → `dot(A, B, lhsTranspose: true)` and
-/// `A @ transpose(B)` → `dot(A, B, rhsTranspose: true)`.
-///
-/// NOTE: Intentionally a no-op. `TransposeMatmulFoldingPass` in Canonicalizers.swift
-/// correctly folds transposes into `lhsTranspose`/`rhsTranspose` attributes on dot ops,
-/// but the Metal code generator (`CodeGenerator.swift`) does not read those attributes.
-/// Enabling this pass removes the explicit transpose operations that the code generator
-/// *does* handle, leaving the matmul to compute on un-transposed data — producing either
-/// wrong results or a 3x slowdown from shape mismatches hitting fallback paths.
-/// Enable this pass only after CodeGenerator.generateMatMulSource() honours the
-/// lhsTranspose/rhsTranspose attributes.
+/// `A @ transpose(B)` → `dot(A, B, rhsTranspose: true)`. Delegates to
+/// `TransposeMatmulFoldingPass` in Canonicalizers.swift, which is the canonical
+/// fold logic shared with the eager-execution optimizer pipeline. The Metal
+/// code generator honours `lhsTranspose`/`rhsTranspose` (see `swapLastTwoDimPositions`
+/// in CodeGenerator.swift::generateMatMulSource), and MPSGraphCompiler.compileDot
+/// re-applies an explicit transpose for the MPSGraph backend.
 final class TransposeFoldingPass: OptimizationPass, @unchecked Sendable {
     let name = "transpose-folding"
-    let invalidates: Set<AnalysisType> = []  // no-op
+    let invalidates: Set<AnalysisType> = [.shapes, .lifetimes, .dependencies]
+
+    private let inner = TransposeMatmulFoldingPass()
 
     func run(on function: HLOFunction, analysis: AnalysisResults) -> PassResult {
-        return .unchanged(function)
+        return inner.run(on: function, analysis: analysis)
     }
 }
 
