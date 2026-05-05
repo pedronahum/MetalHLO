@@ -313,6 +313,16 @@ module @gemv_1xK_x_KxN {
   }
 }
 """),
+        // 2D NHWC convolution — exercises the simdgroup-cooperative conv kernel.
+        // Input [1, 10, 10, 4] × weights [3, 3, 4, 8] stride 1 → output [1, 8, 8, 8].
+        ("conv2d_nhwc_3x3", """
+module @conv2d_nhwc_3x3 {
+  func.func @main(%arg0: tensor<1x10x10x4xf32>, %arg1: tensor<3x3x4x8xf32>) -> (tensor<1x8x8x8xf32>) {
+    %0 = stablehlo.convolution %arg0, %arg1 window_strides = [1, 1], feature_group_count = 1 : (tensor<1x10x10x4xf32>, tensor<3x3x4x8xf32>) -> tensor<1x8x8x8xf32>
+    return %0 : tensor<1x8x8x8xf32>
+  }
+}
+"""),
     ]
 
     @Test("Simple add produces identical results across optimization levels")
@@ -441,6 +451,24 @@ module @gemv_1xK_x_KxN {
         try await compareAcrossOptimizationLevels(
             programIndex: 9,
             inputs: [(lhs, [1, k]), (rhs, [k, n])],
+            tolerance: 5e-3
+        )
+    }
+
+    @Test("Conv2D NHWC 3×3 matches across optimization levels")
+    func testConv2dNHWCAcrossLevels() async throws {
+        // Exercises the new simdgroup-per-output convolution kernel. Shapes
+        // chosen to cover the kernel-spatial × icPerGroup decomposition logic:
+        // 3×3 spatial × 4 input channels = 36 reduction iterations per output,
+        // simd_lane stride 32 — exercises the partial-iteration path where one
+        // thread does an extra step.
+        let inputCount = 1 * 10 * 10 * 4
+        let weightsCount = 3 * 3 * 4 * 8
+        let input: [Float] = (0..<inputCount).map { i in Float(i % 13) * 0.05 - 0.3 }
+        let weights: [Float] = (0..<weightsCount).map { i in Float(i % 7) * 0.07 - 0.2 }
+        try await compareAcrossOptimizationLevels(
+            programIndex: 10,
+            inputs: [(input, [1, 10, 10, 4]), (weights, [3, 3, 4, 8])],
             tolerance: 5e-3
         )
     }
