@@ -1125,12 +1125,22 @@ public final class Analyzer: @unchecked Sendable {
     /// Detects FFN patterns.
     private func detectFFNPatterns(_ function: HLOFunction, definingOps: [TensorID: (op: HLOOperation, index: Int)], shapes: [TensorID: [Int]]) -> [DetectedPattern] {
         var patterns: [DetectedPattern] = []
+        // Tracks the indices of ops that are part of an already-emitted FFN
+        // pattern. In multi-layer MLPs (dot→relu→dot→relu→dot…) the same dot
+        // is the *root* of one pattern and the *up-matmul* of the next; if we
+        // emit both, the fusion pass would replace the dot with a fused_ffn
+        // for the first pattern and the second pattern would point at a
+        // stale operand. Greedy first-wins assignment avoids that — once a
+        // dot is committed as either an up-matmul or a root, it can't be
+        // reused.
+        var consumedIndices = Set<Int>()
 
         // Look for: matmul -> activation -> matmul (standard FFN)
         // or: matmul -> activation * matmul -> matmul (gated FFN)
         // The "activation" can be:
         //   - a single op:   tanh / logistic / customCall(gelu|silu)
         //   - SiLU expanded: multiply(x, logistic(x))     (x * sigmoid(x))
+        //   - ReLU expanded: maximum(x, zero_constant)
         //   - the activation may sit on top of an optional add(bias) that
         //     itself sits on top of the up-matmul.
         for (index, op) in function.operations.enumerated() {
@@ -1230,6 +1240,12 @@ public final class Analyzer: @unchecked Sendable {
 
             guard let upMatmul = upMatmulFor(activationInput) else { continue }
 
+            // Skip if either the up-matmul or this root is already committed
+            // to an earlier pattern. See `consumedIndices` comment above.
+            if consumedIndices.contains(upMatmul.index) || consumedIndices.contains(index) {
+                continue
+            }
+
             var metadata = PatternMetadata()
             if let inputShape = shapes[upMatmul.op.operands[0]] {
                 metadata.hiddenDim = inputShape.last
@@ -1244,6 +1260,9 @@ public final class Analyzer: @unchecked Sendable {
                 rootIndex: index,
                 metadata: metadata
             ))
+            consumedIndices.insert(upMatmul.index)
+            consumedIndices.insert(activationDef.index)
+            consumedIndices.insert(index)
         }
 
         return patterns
