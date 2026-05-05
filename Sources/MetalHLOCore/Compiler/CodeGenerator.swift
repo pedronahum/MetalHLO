@@ -310,12 +310,14 @@ public final class CodeGenerator: @unchecked Sendable {
             elementType: elementType
         )
 
-        // Calculate dispatch configuration
+        // Calculate dispatch configuration. Pass modifiedAttributes so the
+        // dispatch sees inputElementTypes (used to gate the vectorized
+        // convert dispatch on whether the input is a >=2-byte float type).
         let dispatch = calculateDispatch(
             type: op.type,
             shapes: outputShapes,
             inputShapes: inputShapes,
-            attributes: op.attributes,
+            attributes: modifiedAttributes,
             tuning: tuning,
             elementType: elementType
         )
@@ -973,17 +975,40 @@ public final class CodeGenerator: @unchecked Sendable {
         let inputMetal = metalTypeName(for: inputType)
         let outputMetal = metalTypeName(for: outputType)
 
-        // Special handling for integer to float or vice versa
-        let conversion: String
-        if isFloatType(inputType) && !isFloatType(outputType) {
-            // Float to int - truncate
-            conversion = "\(outputMetal)(x)"
-        } else if !isFloatType(inputType) && isFloatType(outputType) {
-            // Int to float - direct cast
-            conversion = "\(outputMetal)(x)"
-        } else {
-            // Same category - direct cast
-            conversion = "\(outputMetal)(x)"
+        // Same cast for every category (`<outputMetal>(x)`); Metal handles
+        // float<->int truncation, narrowing/widening, and same-category casts
+        // identically through static_cast semantics.
+
+        // Vectorize for byte-aligned float/half/bfloat conversions: process 4
+        // elements per thread via vec<T,4> reads + writes, with a scalar tail
+        // for the trailing <4 elements. This is the hot path for the TF32
+        // matmul wrapper (fp32->fp16 input, fp16->fp32 output) where each
+        // convert touches tens of MB; the 1-thread-per-element form here was
+        // costing ~1ms per convert kernel on 4096^2 inputs.
+        let vectorizable = isFloatType(inputType) && isFloatType(outputType)
+            && elementByteSize(for: inputType) >= 2
+            && elementByteSize(for: outputType) >= 2
+
+        if vectorizable {
+            return """
+            kernel void \(entryPoint)(
+                device const \(inputMetal)* input [[buffer(0)]],
+                device \(outputMetal)* output [[buffer(1)]],
+                constant uint& count [[buffer(2)]],
+                uint tid [[thread_position_in_grid]])
+            {
+                uint base = tid * 4;
+                if (base + 4 <= count) {
+                    \(inputMetal)4 v = ((const device \(inputMetal)4*)input)[tid];
+                    ((device \(outputMetal)4*)output)[tid] =
+                        \(outputMetal)4(v.x, v.y, v.z, v.w);
+                } else {
+                    for (uint i = base; i < count; ++i) {
+                        output[i] = \(outputMetal)(input[i]);
+                    }
+                }
+            }
+            """
         }
 
         return """
@@ -995,7 +1020,7 @@ public final class CodeGenerator: @unchecked Sendable {
         {
             if (tid >= count) return;
             \(inputMetal) x = input[tid];
-            output[tid] = \(conversion);
+            output[tid] = \(outputMetal)(x);
         }
         """
     }
@@ -3054,6 +3079,33 @@ public final class CodeGenerator: @unchecked Sendable {
         // Use optimized simdgroup kernel only for float types with dims that are
         // multiples of 8 AND no transposition needed.
         if isFloat && !transA && !transB && M % 8 == 0 && K % 8 == 0 && N % 8 == 0 && M >= 8 && K >= 8 && N >= 8 {
+            // Apple Matrix Coprocessor path via MetalPerformancePrimitives.
+            // Requires Metal language 4.0 and Apple9 GPU family (M3+); MPSGraph
+            // and MLX both use this primitive to hit ~97% of fp16 peak on M3+.
+            // Tile is 128x128, dispatched as 8 simdgroups (256 threads).
+            // Batched and non-batched share one kernel emitter — the kernel
+            // reads tgid.z for batch index and offsets the device pointers.
+            //
+            // Gate on total threadgroup count (M/128 * N/128 * batchSize) so
+            // small per-matrix shapes still benefit when there are many
+            // batches feeding the GPU. M5 Pro has 16 cores × ~4 concurrent
+            // threadgroups; we want at least ~16 to keep occupancy.
+            //
+            // Mixed precision: when input element type is fp16 but output is
+            // fp32, we use the MPP `half × half → float` overload, which
+            // fuses the output cast in-register. This is what the TF32
+            // transform's output-convert fusion produces. The same gate that
+            // TF32Transform uses (in MetalHLOCompiler) must mirror this.
+            let mppTgCount = (M / 128) * (N / 128) * batchSize
+            let inputElementType = attributes.inputElementTypes?.first ?? elementType
+            if supportsMetalPerformancePrimitives()
+                && M % 128 == 0 && N % 128 == 0 && mppTgCount >= 16 {
+                return generateMatMul2dMPPSource(
+                    batchSize: batchSize,
+                    inputElementType: inputElementType,
+                    outputElementType: elementType
+                )
+            }
             return generateSimdgroupMatMulSource(batchSize: batchSize, metalType: metalType, elementType: elementType)
         } else {
             let zeroValue = isFloat ? "0.0" : "0"
@@ -3064,6 +3116,150 @@ public final class CodeGenerator: @unchecked Sendable {
                 batchSize: batchSize, metalType: metalType, zeroValue: zeroValue, M: M, N: N, K: K,
                 aRead: aRead, bRead: bRead)
         }
+    }
+
+    /// Returns true if the device supports Apple's MetalPerformancePrimitives
+    /// matmul2d primitive — requires Apple9 GPU family (M3+) and Metal 4.
+    ///
+    /// The runtime kill switch `METALHLO_DISABLE_MPP=1` forces this to false
+    /// on capable hardware so users can fall back to the simdgroup_matrix
+    /// kernel — useful for diagnosing kernel-compile failures or working
+    /// around any future regressions in the framework.
+    private func supportsMetalPerformancePrimitives() -> Bool {
+        if ProcessInfo.processInfo.environment["METALHLO_DISABLE_MPP"] == "1" {
+            return false
+        }
+        // Apple9 is the M3+ GPU family. The MPP matmul2d primitive ships in
+        // macOS 26 / Xcode 26 and requires Metal language version 4.0 at
+        // kernel-compile time. On older OS or pre-M3 GPUs we fall back to the
+        // simdgroup_matrix kernel automatically — callers don't need to gate.
+        if #available(macOS 26.0, iOS 26.0, *) {
+            return device.supportsFamily(.apple9)
+        }
+        return false
+    }
+
+    /// Generates a matmul kernel that uses Apple's MetalPerformancePrimitives
+    /// `mpp::tensor_ops::matmul2d` — the matrix-coprocessor primitive used by
+    /// MPSGraph and MLX's `steel_gemm_*_nax` to reach ~97% of fp16 peak on M3+.
+    ///
+    /// Tile: BM=64, BN=32 per threadgroup, 4 cooperating simdgroups (128
+    /// threads). The kernel constructs `tensor_inline` views of the raw device
+    /// pointers in-kernel so the host-side binding stays as ordinary
+    /// MTLBuffers — no MTLTensor / MTL4 host APIs required.
+    ///
+    /// The emitted source contains
+    /// `#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>`,
+    /// which `MetalHLOCompiler.compileKernel` uses as a sentinel to switch the
+    /// runtime compile to `MTLLanguageVersion.version4_0`. Other kernels keep
+    /// the default Metal version.
+    private func generateMatMul2dMPPSource(
+        batchSize: Int,
+        inputElementType: ElementType,
+        outputElementType: ElementType
+    ) -> (String, String, TuningConfig?) {
+        let tuning = TuningConfig(
+            tileM: 128,
+            tileN: 128,
+            tileK: nil,
+            blockSize: 256,    // 8 simdgroups × 32 lanes; consumed by calculateDispatch.
+            useSharedMemory: false,
+            useSIMDGroups: true
+        )
+
+        let inputMetalType = metalTypeName(for: inputElementType)
+        let outputMetalType = metalTypeName(for: outputElementType)
+        let isBatched = batchSize > 1
+        // The bindings layer adds buffer(6) = batchCount when batchSize > 1
+        // (see CodeGenerator.swift "Add batchCount for batched matmul").
+        let batchCountParam = isBatched
+            ? "constant uint& batchCount [[buffer(6)]],"
+            : ""
+        let batchOffsetSetup = isBatched ? """
+                // Skip out-of-range batches in case the dispatch grid was rounded up.
+                if (tgid.z >= batchCount) return;
+                A_ptr += uint(tgid.z) * M * K;
+                B_ptr += uint(tgid.z) * K * N;
+                C_ptr += uint(tgid.z) * M * N;
+        """ : ""
+
+        let source = """
+        #include <metal_stdlib>
+        #include <metal_tensor>
+        #include <metal_cooperative_tensor>
+        #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+
+        using namespace metal;
+        using namespace mpp::tensor_ops;
+
+        #define BM 128
+        #define BN 128
+        #define NUM_SIMDGROUPS 8
+
+        // MetalPerformancePrimitives matmul2d on Apple Matrix Coprocessor.
+        // 4 simdgroups (128 threads) per threadgroup. dextents convention is
+        // (cols, rows), so:
+        //   A : M x K row-major -> dextents{ cols=K, rows=M }
+        //   B : K x N row-major -> dextents{ cols=N, rows=K }
+        //   C : M x N row-major -> dextents{ cols=N, rows=M }
+        // Slice (col_origin, row_origin) per the framework's slice() signature.
+        // Input element type: \(inputMetalType)  Output: \(outputMetalType)
+        //
+        // When input != output (e.g., half × half → float), we're in the
+        // mixed-precision path that fuses TF32's trailing fp16→fp32 convert.
+        // MPP's matmul2d supports this directly (`half × half → float` is in
+        // the documented type table); the cast happens in-register inside the
+        // matrix coprocessor, eliminating one device-memory round-trip per
+        // matmul.
+        //
+        // Note: input tensor element types intentionally drop `const` — MPP's
+        // matmul2d dispatches on `__is_same_v<leftValueType, half>`, which
+        // fails for `const half`. The buffers are still bound read-only and
+        // the kernel doesn't write through them, so this is a type-system
+        // workaround, not a correctness issue.
+        kernel void kernel_matmul(
+            device \(inputMetalType)* A_ptr [[buffer(0)]],
+            device \(inputMetalType)* B_ptr [[buffer(1)]],
+            device \(outputMetalType)* C_ptr [[buffer(2)]],
+            constant uint& M [[buffer(3)]],
+            constant uint& N [[buffer(4)]],
+            constant uint& K [[buffer(5)]],
+            \(batchCountParam)
+            uint3 tgid [[threadgroup_position_in_grid]])
+        {
+            \(batchOffsetSetup)
+            tensor<device \(inputMetalType), dextents<int32_t, 2>, tensor_inline> A(
+                A_ptr,
+                dextents<int32_t, 2>{int32_t(K), int32_t(M)});
+            tensor<device \(inputMetalType), dextents<int32_t, 2>, tensor_inline> B(
+                B_ptr,
+                dextents<int32_t, 2>{int32_t(N), int32_t(K)});
+            tensor<device \(outputMetalType), dextents<int32_t, 2>, tensor_inline> C(
+                C_ptr,
+                dextents<int32_t, 2>{int32_t(N), int32_t(M)});
+
+            constexpr auto desc = matmul2d_descriptor(
+                BM,                                  // m outer dim
+                BN,                                  // n outer dim
+                static_cast<int>(dynamic_extent),    // k = pulled from operands
+                false, false,                        // no transpose A or B
+                false);                              // exact precision: fp16
+                                                     // inputs already minimize
+                                                     // MAC width; relaxed has
+                                                     // no upside here and
+                                                     // marginal accuracy cost.
+            matmul2d<desc, execution_simdgroups<NUM_SIMDGROUPS>> op;
+
+            // Grid is dispatched as gridSize.width = N_tiles, gridSize.height = M_tiles
+            // (matches the 32x32 simdgroup kernel's dispatch convention).
+            auto a = A.slice(0,           tgid.y * BM);
+            auto b = B.slice(tgid.x * BN, 0);
+            auto c = C.slice(tgid.x * BN, tgid.y * BM);
+
+            op.run(a, b, c);
+        }
+        """
+        return (source, "kernel_matmul", tuning)
     }
 
     /// Generates an optimized matmul kernel using simdgroup_matrix operations.
@@ -4601,10 +4797,14 @@ public final class CodeGenerator: @unchecked Sendable {
                 let K = Int(dims.K)
                 let batchSize = Int(dims.batchSize)
 
-                // Tile size for output: 32x32 per threadgroup
-                let tileSize = 32
-                let gridWidth = (N + tileSize - 1) / tileSize
-                let gridHeight = (M + tileSize - 1) / tileSize
+                // Output tile size per threadgroup. Default 32x32 for the
+                // simdgroup_matrix kernel; the MetalPerformancePrimitives
+                // kernel signals its (BM=64, BN=32) tile via tuning.tileM/tileN.
+                let tileM = tuning?.tileM ?? 32
+                let tileN = tuning?.tileN ?? 32
+                let gridWidth = (N + tileN - 1) / tileN
+                let gridHeight = (M + tileM - 1) / tileM
+                let basicTileSize = 32
                 let useSimdgroup = isFloatType(elementType) && M % 8 == 0 && K % 8 == 0 && N % 8 == 0 && M >= 8 && K >= 8 && N >= 8
 
                 // Non-tiled kernel (1 thread per output): for transposed matmul
@@ -4612,25 +4812,29 @@ public final class CodeGenerator: @unchecked Sendable {
                     return DispatchConfig.dispatch1D(elements: M * N * batchSize, threadgroupSize: 256)
                 }
 
+                // Threads per threadgroup. Default 128 (4 simdgroups). The MPP
+                // kernel signals an alternate count (e.g. 256 for 8 simdgroups)
+                // via tuning.blockSize.
+                let simdgroupThreads = tuning?.blockSize ?? 128
+
                 if batchSize > 1 {
                     // 3D dispatch for batched matmul
                     if useSimdgroup {
-                        // Simdgroup kernel: 4 simdgroups of 32 threads = 128 threads
                         return DispatchConfig(
                             gridSize: MTLSize(width: gridWidth, height: gridHeight, depth: batchSize),
-                            threadgroupSize: MTLSize(width: 128, height: 1, depth: 1)
+                            threadgroupSize: MTLSize(width: simdgroupThreads, height: 1, depth: 1)
                         )
                     } else {
                         return DispatchConfig(
                             gridSize: MTLSize(width: gridWidth, height: gridHeight, depth: batchSize),
-                            threadgroupSize: MTLSize(width: tileSize, height: tileSize, depth: 1)
+                            threadgroupSize: MTLSize(width: basicTileSize, height: basicTileSize, depth: 1)
                         )
                     }
                 } else {
                     if useSimdgroup {
                         return DispatchConfig(
                             gridSize: MTLSize(width: gridWidth, height: gridHeight, depth: 1),
-                            threadgroupSize: MTLSize(width: 128, height: 1, depth: 1)
+                            threadgroupSize: MTLSize(width: simdgroupThreads, height: 1, depth: 1)
                         )
                     } else {
                         // Basic tiled matmul needs the full 32x32 threadgroup to
@@ -4638,7 +4842,7 @@ public final class CodeGenerator: @unchecked Sendable {
                         // would clamp to min(32, matrixDim), leaving tiles uninitialized.
                         return DispatchConfig(
                             gridSize: MTLSize(width: gridWidth, height: gridHeight, depth: 1),
-                            threadgroupSize: MTLSize(width: tileSize, height: tileSize, depth: 1)
+                            threadgroupSize: MTLSize(width: basicTileSize, height: basicTileSize, depth: 1)
                         )
                     }
                 }
@@ -4729,8 +4933,20 @@ public final class CodeGenerator: @unchecked Sendable {
                     threadgroupSize: 256
                 )
             case .convert, .bitcastConvert:
-                // Convert kernel is NOT vectorized - it expects tid to be the element index
-                // Use non-vectorized 1D dispatch to match the kernel
+                // The convert kernel is vectorized (4 elements per thread via
+                // vec<T,4>) for >=2-byte float-to-float conversions — the hot
+                // path the TF32 matmul wrapper hits. Other conversions use the
+                // scalar 1-thread-per-element form. Match the
+                // generateConvertKernel gate exactly.
+                let inputType = attributes.inputElementTypes?.first
+                if opKind == .convert,
+                   let inputType,
+                   isFloatType(inputType), isFloatType(elementType),
+                   elementByteSize(for: inputType) >= 2,
+                   elementByteSize(for: elementType) >= 2 {
+                    let groups = (totalElements + 3) / 4
+                    return DispatchConfig.dispatch1D(elements: groups, threadgroupSize: 256)
+                }
                 return DispatchConfig.dispatch1D(elements: totalElements, threadgroupSize: 256)
             case .compare:
                 // Compare kernel is NOT vectorized - one thread per element

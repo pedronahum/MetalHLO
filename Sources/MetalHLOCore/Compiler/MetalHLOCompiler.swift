@@ -170,7 +170,28 @@ public final class MetalHLOCompiler: @unchecked Sendable {
         // transformed graph; the parameterized simdgroup matmul kernel in
         // CodeGenerator then emits a fp16 (simdgroup_half8x8) variant.
         // ═══════════════════════════════════════════════════════════════
-        let module = applyTF32MatmulTransformIfEnabled(parsed)
+        // On Apple9-class devices (M3+) running macOS 26+, we can fuse the
+        // trailing fp16→fp32 convert into the matmul itself by emitting the
+        // dot directly at fp32 (mixed-precision: fp16 inputs, fp32 output).
+        // The codegen then picks the MPP `half × half → float` kernel which
+        // does the cast in-register, saving one device-memory round-trip per
+        // matmul. The fusion gate must match the codegen's MPP eligibility
+        // gate exactly so that mixed-precision dots only appear when the MPP
+        // kernel is the one that handles them.
+        let supportsFusion: Bool
+        if #available(macOS 26.0, iOS 26.0, *) {
+            supportsFusion = device.supportsFamily(.apple9)
+                && ProcessInfo.processInfo.environment["METALHLO_DISABLE_MPP"] != "1"
+        } else {
+            supportsFusion = false
+        }
+        let mppGate: @Sendable (Int, Int, Int, Int) -> Bool = { M, N, K, batchSize in
+            guard supportsFusion else { return false }
+            let tgCount = (M / 128) * (N / 128) * batchSize
+            return M % 128 == 0 && N % 128 == 0 && tgCount >= 16
+        }
+
+        let module = applyTF32MatmulTransformIfEnabled(parsed, fuseOutputConvert: mppGate)
 
         // ═══════════════════════════════════════════════════════════════
         // STAGE 2: ANALYZE
@@ -310,6 +331,17 @@ public final class MetalHLOCompiler: @unchecked Sendable {
         // Compile Metal source
         let compileOptions = MTLCompileOptions()
         compileOptions.fastMathEnabled = config.codeGeneratorConfig.fastMath
+
+        // Kernels that include MetalPerformancePrimitives need Metal language
+        // 4.0 (the matmul2d / cooperative_tensor APIs are gated on
+        // __HAVE_TENSOR__, which the metalfe driver sets only for -std=metal4+).
+        // Use the include line as a sentinel so other kernels keep the default
+        // language version.
+        if spec.metalSource.contains("<MetalPerformancePrimitives/") {
+            if #available(macOS 26.0, iOS 26.0, *) {
+                compileOptions.languageVersion = .version4_0
+            }
+        }
 
         let library: MTLLibrary
         do {
