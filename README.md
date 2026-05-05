@@ -1121,37 +1121,47 @@ Times are mean in milliseconds. **Bold** indicates the fastest backend for each 
 
 This section compares MetalHLO directly against [MLX](https://github.com/ml-explore/mlx) on a different machine — Apple M5 Pro (48 GB), macOS 26.4.1, Xcode 26.4. MLX is the reference for "what an end-to-end-tuned numerical kernel library can achieve on Apple Silicon," so it's the right yardstick for the codegen path.
 
-Measurements use the standalone `mlx-comparison` runner in **quick mode** (3 warmup, 10 measurements), `-O0`, `METALHLO_MATMUL_TF32=1`. **Speedup > 1.0x means MetalHLO is faster than MLX**; speedup < 1.0x means MLX is faster.
+Measurements use the standalone `mlx-comparison` runner in **quick mode** (3 warmup, 10 measurements), `METALHLO_MATMUL_TF32=1`. **Speedup > 1.0x means MetalHLO is faster than MLX**; speedup < 1.0x means MLX is faster.
 
 #### Per-Category Geomean (60 benchmarks)
 
-| Category | Benchmarks | Geomean vs MLX | MetalHLO wins |
-|---|---|---|---|
-| **model_mlp** | 5 | **1.28x** | 2 / 5 |
-| **matrix** | 16 | 0.76x | 4 / 16 |
-| **normalization** | 4 | 0.60x | 1 / 4 |
-| **arithmetic** | 17 | 0.57x | 4 / 17 |
-| **model_transformer** | 5 | 0.44x | 0 / 5 |
-| **convolution** | 7 | 0.44x | 1 / 7 |
-| **reduction** | 6 | 0.41x | 0 / 6 |
+The two columns show -O0 (no optimizer passes — kernel-level performance only) and -O3 (full pattern fusion: FFN, attention, LayerNorm fold into single Metal kernels). The opt-level deltas are biggest where the optimizer can collapse multi-op patterns into one fused kernel.
+
+| Category | Benchmarks | -O0 | **-O3** | -O3 wins |
+|---|---|---|---|---|
+| **model_mlp** | 5 | 1.28x | **1.81x** | **5 / 5** |
+| **normalization** | 4 | 0.60x | **1.09x** | 3 / 4 |
+| **matrix** | 16 | 0.76x | 0.72x | 4 / 16 |
+| **model_transformer** | 5 | 0.44x | 0.69x | 1 / 5 |
+| **arithmetic** | 17 | 0.57x | 0.58x | 2 / 17 |
+| **convolution** | 7 | 0.44x | 0.43x | 1 / 7 |
+| **reduction** | 6 | 0.41x | 0.35x | 0 / 6 |
+
+Three categories see large -O3 jumps:
+- **model_mlp** sweeps 5/5 against MLX. The FFN detector recognizes the canonical SiLU (`multiply(x, logistic(x))`) and ReLU (`maximum(x, 0)`) lowerings, so each `matmul → activation → matmul` block fuses into one `fused_ffn` Metal kernel. Greedy non-overlapping pattern selection handles deep MLPs (e.g. MLP-INF-004's 4-layer ReLU stack fuses into 2 fused_ffn ops).
+- **normalization** crosses MLX parity. The LayerNorm detector recognizes the expanded form `add(multiply(multiply(subtract(x, mean), rsqrt(...)), gamma), beta)` and folds it into one `fused_layer_norm`.
+- **model_transformer** improves but doesn't yet beat MLX on attention. The detector recognizes the numerically-stable softmax expansion (`divide(exp(subtract(scaled, max_bc)), sum_bc)`) and fuses Q@K + softmax + @V into one `fused_scaled_dot_product_attention`. MLX's `scaled_dot_product_attention` is still ~30% faster on the 4 / 5 sequences we measured.
 
 #### Headline Numbers
 
 | ID | Description | MetalHLO (ms) | MLX (ms) | Speedup | Notes |
 |---|---|---|---|---|---|
-| MAT-DOT-005 | GEMM 4096² | 8.37 | 7.46 | **0.89x** | Matrix coprocessor; gap is ~1ms of TF32 input-convert overhead |
-| MAT-DOT-002 | GEMM 512² | 0.54 | 0.63 | **1.17x** | Beats MLX |
-| MAT-DOT-001 | GEMM 128² | 0.32 | 0.25 | 0.77x | Falls back to simdgroup_matrix kernel (below MPP shape gate) |
-| MAT-DOT-008 | Matvec 1×4096×4096 | 2.05 | 0.48 | 0.23x | M=1 falls back; MLX has a dedicated GEMV path |
-| MAT-BATCH-003 | Attention heads (64×128×128×64) | 0.26 | 0.33 | **1.29x** | MPP path with batch dim |
-| MAT-BATCH-004 | MHA (12×64×512×64) | 0.22 | 0.23 | **1.00x** | Parity |
-| MLP-INF-001 | 784→256→10 BS=1 | 0.43 | 1.00 | **2.31x** | Optimizer wins |
-| MLP-INF-005 | FFN 768→3072→768 BS=32 | 1.35 | 3.93 | **2.90x** | Optimizer wins |
-| ATTN-002 | Self-attention seq=512 | 1.45 | 0.46 | 0.31x | MLX's fused attention dominates |
-| NORM-LN-002 | BERT-base batched LN | 2.45 | 0.66 | 0.27x | MLX has a dedicated LayerNorm kernel |
-| RED-006 | Attention reduction 32×12×512² | 6.13 | 1.58 | 0.26x | Large softmax-style reduction |
+All times in milliseconds, measured at -O3 with `METALHLO_MATMUL_TF32=1` on M5 Pro.
 
-**Takeaway.** On the headline 4096² matmul (MAT-DOT-005), MetalHLO closes to within ~11% of MLX (0.89x) by routing through Apple's `MetalPerformancePrimitives.matmul2d` matrix-coprocessor primitive on M3+ GPUs running macOS 26+. The remaining gap is the fp32→fp16 input-convert overhead that the TF32 transform pays per input tensor; MLX runs fp16 natively. Outside large matmuls and MLP fusion, MLX's hand-tuned kernels (LayerNorm, attention, GEMV, batched reductions) still win — those are where MetalHLO's optimizer pays for itself only when they're embedded in a larger graph that the optimizer can fuse.
+| ID | Description | MetalHLO | MLX | Speedup | Notes |
+|---|---|---|---|---|---|
+| MAT-DOT-005 | GEMM 4096² | 8.24 | 7.47 | **0.91x** | Matrix coprocessor; gap is ~1ms TF32 input-convert overhead |
+| MAT-DOT-002 | GEMM 512² | 0.53 | 0.54 | **1.02x** | Parity |
+| MLP-INF-001 | MLP 784→256→10 BS=1 (3-layer ReLU) | 0.22 | 0.27 | **1.22x** | FFN fusion + chain ReLU detection |
+| MLP-INF-005 | FFN 768→3072→768 BS=32 (SiLU) | 0.86 | 3.97 | **4.63x** | FFN fusion |
+| ATTN-002 | Self-attention BS=8 H=12 S=128 D=64 | 0.65 | 0.45 | 0.69x | Attention fusion fires; MLX's primitive ~30% faster on this shape |
+| NORM-LN-002 | LayerNorm 32×128×768 (BERT-base batched) | 1.42 | 0.66 | 0.46x | LayerNorm fusion fires; MLX still ahead on this exact shape |
+| RED-006 | Softmax reduction 32×12×512² | 6.03 | 1.65 | 0.27x | No reduction-pattern fusion yet |
+
+**Takeaway.** Three classes of speedup are now active in -O3:
+1. **Kernel-level**: MAT-DOT-005 hits 0.91x of MLX via the MetalPerformancePrimitives matrix coprocessor primitive. The remaining ~1ms is the fp32→fp16 input convert overhead the TF32 transform pays.
+2. **Pattern fusion**: FFN, attention, and LayerNorm patterns expressed as expanded primitive ops (the form most graph-emitters produce) now collapse into single fused Metal kernels. MLP-INF-005 hits 4.63x; all 5 model_mlp benchmarks beat MLX. Attention closes the gap from 0.61x to 0.69x — fusion fires but MLX's kernel is still faster on most shapes.
+3. **Reductions and convolution**: still bounded by per-kernel performance — neither has a fused-pattern path yet, so MLX's hand-tuned kernels remain ahead.
 
 #### Reproducing These Numbers
 
@@ -1170,19 +1180,24 @@ BIN=.build/xcode/Build/Products/Release/mlx-comparison
 RESULTS=results/mlx_comparison_m5pro
 mkdir -p "$RESULTS"
 
-# Run all 7 categories, save JSON + Markdown per category.
+# Run all 7 categories at -O3, save JSON + Markdown per category.
 for cat in matrix arithmetic reduction convolution \
            normalization model_mlp model_transformer; do
-  METALHLO_MATMUL_TF32=1 "$BIN" --quick -O0 -c "$cat" \
+  METALHLO_MATMUL_TF32=1 "$BIN" --quick -O3 -c "$cat" \
     -o "$RESULTS/$cat.json"
 done
 
 # Single-benchmark spot check (the headline matmul):
-METALHLO_MATMUL_TF32=1 "$BIN" --quick -O0 -f MAT-DOT-005
+METALHLO_MATMUL_TF32=1 "$BIN" --quick -O3 -f MAT-DOT-005
+
+# Show which optimizer passes fire on a given benchmark (one line per pass,
+# `[*]` if the pass changed the IR). Use this to diagnose patterns the
+# detector doesn't yet match:
+METALHLO_DEBUG_PASSES=1 METALHLO_MATMUL_TF32=1 "$BIN" --quick -O3 -f MLP-INF-005
 
 # Force the simdgroup_matrix fallback path (verifies the M1/M2 / pre-macOS-26
 # code path produces the same correct results, just slower):
-METALHLO_MATMUL_TF32=1 METALHLO_DISABLE_MPP=1 "$BIN" --quick -O0 -f MAT-DOT-005
+METALHLO_MATMUL_TF32=1 METALHLO_DISABLE_MPP=1 "$BIN" --quick -O3 -f MAT-DOT-005
 ```
 
 Per-category JSON and Markdown reports are written to the directory passed via `-o`. Each `.md` file has the header (chip, OS, build), the summary stats (geomean, win count, mean speedup), and the per-benchmark detail table.
@@ -1194,6 +1209,7 @@ Per-category JSON and Markdown reports are written to the directory passed via `
 | `METALHLO_MATMUL_TF32` | `0` | When `1`, wraps fp32 dot/dot_general with `convert(fp32→fp16)` ops so the matmul itself runs at fp16. The MPP kernel uses `half × half → float` natively, fusing the output cast in-register. Required to hit MLX-class throughput on large GEMMs. |
 | `METALHLO_DISABLE_MPP` | `0` | When `1`, disables the MetalPerformancePrimitives matmul path even on capable hardware — MetalHLO falls back to its simdgroup_matrix kernel. Use as a kill switch for diagnosing kernel-compile or correctness regressions on a particular machine. |
 | `METALHLO_FORCE_MPSGRAPH` | `0` | When `1`, routes every op through MPSGraph instead of codegen. Bypasses the optimizer; useful as a sanity check, not for production. |
+| `METALHLO_DEBUG_PASSES` | `0` | When `1`, the optimizer prints one line per pass (`[*] pass-name ops: N -> M`, asterisk = changed) to stderr. Use to diagnose why a benchmark looks unchanged at -O3 — empty marker means the pattern detector didn't match the input IR. |
 
 #### Caveats
 
