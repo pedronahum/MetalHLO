@@ -1117,6 +1117,90 @@ Times are mean in milliseconds. **Bold** indicates the fastest backend for each 
 
 **Takeaway:** MPSGraph leads on training workloads where its backward-pass graph optimization provides an advantage.
 
+### MLX Comparison (Apple M5 Pro)
+
+This section compares MetalHLO directly against [MLX](https://github.com/ml-explore/mlx) on a different machine — Apple M5 Pro (48 GB), macOS 26.4.1, Xcode 26.4. MLX is the reference for "what an end-to-end-tuned numerical kernel library can achieve on Apple Silicon," so it's the right yardstick for the codegen path.
+
+Measurements use the standalone `mlx-comparison` runner in **quick mode** (3 warmup, 10 measurements), `-O0`, `METALHLO_MATMUL_TF32=1`. **Speedup > 1.0x means MetalHLO is faster than MLX**; speedup < 1.0x means MLX is faster.
+
+#### Per-Category Geomean (60 benchmarks)
+
+| Category | Benchmarks | Geomean vs MLX | MetalHLO wins |
+|---|---|---|---|
+| **model_mlp** | 5 | **1.28x** | 2 / 5 |
+| **matrix** | 16 | 0.76x | 4 / 16 |
+| **normalization** | 4 | 0.60x | 1 / 4 |
+| **arithmetic** | 17 | 0.57x | 4 / 17 |
+| **model_transformer** | 5 | 0.44x | 0 / 5 |
+| **convolution** | 7 | 0.44x | 1 / 7 |
+| **reduction** | 6 | 0.41x | 0 / 6 |
+
+#### Headline Numbers
+
+| ID | Description | MetalHLO (ms) | MLX (ms) | Speedup | Notes |
+|---|---|---|---|---|---|
+| MAT-DOT-005 | GEMM 4096² | 8.37 | 7.46 | **0.89x** | Matrix coprocessor; gap is ~1ms of TF32 input-convert overhead |
+| MAT-DOT-002 | GEMM 512² | 0.54 | 0.63 | **1.17x** | Beats MLX |
+| MAT-DOT-001 | GEMM 128² | 0.32 | 0.25 | 0.77x | Falls back to simdgroup_matrix kernel (below MPP shape gate) |
+| MAT-DOT-008 | Matvec 1×4096×4096 | 2.05 | 0.48 | 0.23x | M=1 falls back; MLX has a dedicated GEMV path |
+| MAT-BATCH-003 | Attention heads (64×128×128×64) | 0.26 | 0.33 | **1.29x** | MPP path with batch dim |
+| MAT-BATCH-004 | MHA (12×64×512×64) | 0.22 | 0.23 | **1.00x** | Parity |
+| MLP-INF-001 | 784→256→10 BS=1 | 0.43 | 1.00 | **2.31x** | Optimizer wins |
+| MLP-INF-005 | FFN 768→3072→768 BS=32 | 1.35 | 3.93 | **2.90x** | Optimizer wins |
+| ATTN-002 | Self-attention seq=512 | 1.45 | 0.46 | 0.31x | MLX's fused attention dominates |
+| NORM-LN-002 | BERT-base batched LN | 2.45 | 0.66 | 0.27x | MLX has a dedicated LayerNorm kernel |
+| RED-006 | Attention reduction 32×12×512² | 6.13 | 1.58 | 0.26x | Large softmax-style reduction |
+
+**Takeaway.** On the headline 4096² matmul (MAT-DOT-005), MetalHLO closes to within ~11% of MLX (0.89x) by routing through Apple's `MetalPerformancePrimitives.matmul2d` matrix-coprocessor primitive on M3+ GPUs running macOS 26+. The remaining gap is the fp32→fp16 input-convert overhead that the TF32 transform pays per input tensor; MLX runs fp16 natively. Outside large matmuls and MLP fusion, MLX's hand-tuned kernels (LayerNorm, attention, GEMV, batched reductions) still win — those are where MetalHLO's optimizer pays for itself only when they're embedded in a larger graph that the optimizer can fuse.
+
+#### Reproducing These Numbers
+
+Requires macOS 26+ and an Apple9-class GPU (M3, M3 Pro/Max/Ultra, M4, M5, M5 Pro/Max/Ultra) for the MPP path; on older OS or GPUs the build still works and the runtime falls back to the simdgroup_matrix kernel automatically.
+
+```bash
+# Build the comparison runner. Must be xcodebuild, not `swift build` —
+# MLX bundles a Metal library that swiftpm doesn't compile.
+xcodebuild build \
+  -scheme mlx-comparison \
+  -configuration Release \
+  -destination 'platform=OS X' \
+  -derivedDataPath .build/xcode
+
+BIN=.build/xcode/Build/Products/Release/mlx-comparison
+RESULTS=results/mlx_comparison_m5pro
+mkdir -p "$RESULTS"
+
+# Run all 7 categories, save JSON + Markdown per category.
+for cat in matrix arithmetic reduction convolution \
+           normalization model_mlp model_transformer; do
+  METALHLO_MATMUL_TF32=1 "$BIN" --quick -O0 -c "$cat" \
+    -o "$RESULTS/$cat.json"
+done
+
+# Single-benchmark spot check (the headline matmul):
+METALHLO_MATMUL_TF32=1 "$BIN" --quick -O0 -f MAT-DOT-005
+
+# Force the simdgroup_matrix fallback path (verifies the M1/M2 / pre-macOS-26
+# code path produces the same correct results, just slower):
+METALHLO_MATMUL_TF32=1 METALHLO_DISABLE_MPP=1 "$BIN" --quick -O0 -f MAT-DOT-005
+```
+
+Per-category JSON and Markdown reports are written to the directory passed via `-o`. Each `.md` file has the header (chip, OS, build), the summary stats (geomean, win count, mean speedup), and the per-benchmark detail table.
+
+**Environment variables that affect this comparison:**
+
+| Variable | Default | Effect |
+|---|---|---|
+| `METALHLO_MATMUL_TF32` | `0` | When `1`, wraps fp32 dot/dot_general with `convert(fp32→fp16)` ops so the matmul itself runs at fp16. The MPP kernel uses `half × half → float` natively, fusing the output cast in-register. Required to hit MLX-class throughput on large GEMMs. |
+| `METALHLO_DISABLE_MPP` | `0` | When `1`, disables the MetalPerformancePrimitives matmul path even on capable hardware — MetalHLO falls back to its simdgroup_matrix kernel. Use as a kill switch for diagnosing kernel-compile or correctness regressions on a particular machine. |
+| `METALHLO_FORCE_MPSGRAPH` | `0` | When `1`, routes every op through MPSGraph instead of codegen. Bypasses the optimizer; useful as a sanity check, not for production. |
+
+#### Caveats
+
+- **Hardware-specific.** All numbers are M5 Pro / macOS 26.4.1. The MPP path requires Apple9 GPU family and Metal language 4.0; on M1/M2 or pre-macOS-26 the runtime gate (`device.supportsFamily(.apple9)` plus `#available(macOS 26.0, *)`) silently selects the simdgroup_matrix fallback. The simdgroup_matrix path is what users on those machines will hit, with results similar to the M1 multi-backend tables above.
+- **Run-to-run variance.** Quick mode (3 warmup, 10 measurements) keeps total wall time around 30 seconds across all 7 categories but introduces ±10–15% noise on benchmarks under 1ms. The headline numbers (MAT-DOT-005, MLP-INF-005) are stable across repeated runs; small-shape numbers fluctuate.
+- **MLX is the ceiling, not the universal target.** MLX is a hand-tuned numerical library; matching it on every shape isn't the goal. MetalHLO's reason to exist is the optimizer + heterogeneous fusion that MLX doesn't have. The matmul work documented here is specifically about closing the kernel-throughput gap so the optimizer can compose with kernels that aren't slower than the alternatives users would otherwise reach for.
+
 ### Backend Win Summary
 
 Overall wins across all 67 passing benchmarks:
