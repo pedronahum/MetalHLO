@@ -3111,8 +3111,10 @@ public final class CodeGenerator: @unchecked Sendable {
         // fill its 8×8 tiles and wastes (8-M)/8 of every tile when M < 8.
         // The dedicated kernel uses 32-thread TGs, each thread owns 4 output
         // columns, giving 128 outputs/TG with cacheline-coalesced W reads.
+        // Split-K GEMV: 4 simdgroups per TG cooperate on K, sum partials via
+        // threadgroup memory. Requires K divisible by tk*numSimd = 8*4 = 32.
         if isFloat && M == 1 && batchSize == 1 && !transA && !transB
-           && N >= 64 && N % 2 == 0 && K % 8 == 0 {
+           && N >= 64 && N % 2 == 0 && K % 32 == 0 {
             return generateGEMVSource(K: K, N: N, metalType: metalType)
         }
 
@@ -3205,39 +3207,35 @@ public final class CodeGenerator: @unchecked Sendable {
     /// Generates a dedicated GEMV (matrix-vector) kernel for `M=1` matmul.
     /// y = x @ W where x is [1, K] and W is [K, N].
     ///
-    /// One TG of 32 threads handles `outputsPerTG = 32 * tn` output columns.
-    /// Each K iteration: every thread independently reads its `tn` columns of
-    /// W from the same row (contiguous coalesced read across the simdgroup),
-    /// then multiplies in `tn` private accumulators against the (broadcast) x[k].
-    /// No simd_sum needed — each thread owns its own outputs.
+    /// **Layout (split-K)**: one TG = `numSimd` simdgroups (`numSimd * 32`
+    /// threads). All simdgroups in a TG process the **same** `outputsPerTG = 32 * tn`
+    /// output columns but different K-direction chunks. Each simdgroup
+    /// computes its own partial sums; partials are summed across simdgroups
+    /// via threadgroup memory + a single barrier, and simdgroup 0 writes the
+    /// final result. This gives `numSimd × outputsPerTG_lanes` more in-flight
+    /// threads than a 32-thread-per-TG GEMV would, dramatically improving GPU
+    /// occupancy on the bandwidth-bound M=1 case.
     ///
-    /// To hide K-direction memory latency, the inner loop unrolls by `tk=4`:
-    /// each iteration reads 4 contiguous x values (one float4) and `tk * tn`
-    /// W values, then issues `tk * tn = 16` independent multiply-accumulates.
-    /// The compiler can pipeline the 4 + 16 = 20 independent loads ahead of
-    /// the multiplies.
+    /// Per-thread inner loop: tk=8 K-rows per iteration → `tk * tn = 16`
+    /// independent FMAs to pipeline.
     ///
-    /// Caller guarantees K % 4 == 0 (we use float4 reads for x) and
-    /// N % 4 == 0, N ≥ outputsPerTG.
+    /// Caller guarantees `K % (tk * numSimd) == 0` and `N % tn == 0, N ≥ outputsPerTG`.
     private func generateGEMVSource(K: Int, N: Int, metalType: String) -> (String, String, TuningConfig?) {
-        // tn × tk balance: tn small → more TGs (better GPU saturation) but
-        // less per-thread ILP. tk small → less ILP per K iteration. Empirically
-        // on M5 Pro for K=N=4096, tn=2 with tk=8 outperforms tn=4 with tk=4
-        // because the GPU is severely under-occupied by the latter (only 32
-        // TGs of 32 threads = 1024 threads vs ~16K concurrent capacity).
-        let tn = 2   // outputs per thread
-        let tk = 8   // K-iteration unroll — give compiler tn*tk=16 independent FMAs/iter
-        let outputsPerTG = 32 * tn
+        let tn = 2          // outputs per thread
+        let tk = 8          // K-iteration unroll — 16 independent FMAs/iter
+        let numSimd = 4     // simdgroups per TG → split K into numSimd chunks
+        let outputsPerTG = 32 * tn        // 64 outputs per TG
+        let tgThreads = 32 * numSimd      // 128 threads per TG
 
         var accDecls = ""
         var accStores = ""
         for c in 0..<tn {
             accDecls += "            float acc\(c) = 0.0f;\n"
-            accStores += "            if (my_col + \(c)u < N_DIM) y[my_col + \(c)u] = acc\(c);\n"
+            accStores += "                if (my_col + \(c)u < N_DIM) y[my_col + \(c)u] = sum\(c);\n"
         }
-        // Inner-iteration body: load tk x values and tk*tn W values into named
-        // locals, then multiply. Lay out the loads first so the compiler issues
-        // them all before the dependent FMAs.
+
+        // Inner-iteration multiplies. Each iteration reads tk x values (in
+        // (tk+3)/4 float4 chunks) and tk*tn W values, then `tk*tn` FMAs.
         var multiplies = ""
         let xField = ["x", "y", "z", "w"]
         for r in 0..<tk {
@@ -3248,11 +3246,22 @@ public final class CodeGenerator: @unchecked Sendable {
                 multiplies += "                acc\(c) += \(xRef) * W[(k + \(r)u) * N_DIM + my_col + \(c)u];\n"
             }
         }
-        // Number of float4 chunks per K iteration.
         let xChunks = (tk + 3) / 4
         var xLoads = ""
         for i in 0..<xChunks {
             xLoads += "                float4 xs\(i) = *reinterpret_cast<const device float4*>(x + k + \(i * 4)u);\n"
+        }
+
+        // Cross-simdgroup partial sums. Each (simd_lane, c) has `numSimd`
+        // partials to sum. Generated as a straight-line reduction so the
+        // compiler can issue independent loads.
+        var crossSimdReduce = ""
+        for c in 0..<tn {
+            crossSimdReduce += "                float sum\(c) = "
+            crossSimdReduce += (0..<numSimd).map { sg in
+                "shared[\(sg)u * 32u * TN + simd_lane * TN + \(c)u]"
+            }.joined(separator: " + ")
+            crossSimdReduce += ";\n"
         }
 
         let header = """
@@ -3262,43 +3271,61 @@ public final class CodeGenerator: @unchecked Sendable {
         constant uint K_DIM = \(K);
         constant uint N_DIM = \(N);
 
-        // GEMV: y = x @ W. 32-thread TG, \(tn) outputs per thread → \(outputsPerTG) outputs/TG.
-        // Inner loop processes \(tk) K rows per iteration with `tk * tn = \(tk * tn)`
-        // independent multiplies for ILP.
+        // Split-K GEMV: y = x @ W. \(tgThreads)-thread TG = \(numSimd) simdgroups.
+        // Each TG handles \(outputsPerTG) output columns; the \(numSimd) simdgroups
+        // share the N-tile but split the K dimension into \(numSimd) chunks.
+        // Partials are summed via threadgroup memory + one barrier.
         kernel void kernel_gemv(
             device const float* x [[buffer(0)]],
             device const float* W [[buffer(1)]],
             device float* y [[buffer(2)]],
             uint tgid [[threadgroup_position_in_grid]],
-            uint simd_lane [[thread_index_in_simdgroup]])
+            uint simd_lane [[thread_index_in_simdgroup]],
+            uint simd_group [[simdgroup_index_in_threadgroup]])
         {
             constexpr uint TN = \(tn);
             constexpr uint TK = \(tk);
+            constexpr uint NUM_SIMD = \(numSimd);
+            // Statically-sized threadgroup buffer for cross-simdgroup partial
+            // sums. NUM_SIMD * 32 lanes * TN values per lane = \(numSimd * 32 * tn) floats.
+            threadgroup float shared[\(numSimd * 32 * tn)];
             uint my_col = tgid * 32u * TN + simd_lane * TN;
             if (my_col >= N_DIM) return;
+
+            uint k_chunk = K_DIM / NUM_SIMD;
+            uint k_start = simd_group * k_chunk;
+            uint k_end = k_start + k_chunk;
 
         """
         let body = """
 
-            for (uint k = 0u; k < K_DIM; k += TK) {
+            for (uint k = k_start; k < k_end; k += TK) {
         \(xLoads)
         """
-        let footer = """
+        let storePartial: String = {
+            var s = "            }\n\n"
+            // Each thread writes its tn partial sums to threadgroup memory at
+            // its (simd_group, simd_lane, c) slot.
+            for c in 0..<tn {
+                s += "            shared[simd_group * 32u * TN + simd_lane * TN + \(c)u] = acc\(c);\n"
             }
-
-
-        """
+            s += "            threadgroup_barrier(mem_flags::mem_threadgroup);\n\n"
+            s += "            if (simd_group == 0u) {\n"
+            return s
+        }()
+        let endBlock = "            }\n}\n"
 
         let source = header
             + accDecls
             + body
             + multiplies
-            + footer
+            + storePartial
+            + crossSimdReduce
             + accStores
-            + "}\n"
+            + endBlock
 
         return (source, "kernel_gemv", TuningConfig(
-            blockSize: 32,
+            blockSize: tgThreads,
             useSIMDGroups: true,
             useGEMV: true,
             gemvNWrites: outputsPerTG
