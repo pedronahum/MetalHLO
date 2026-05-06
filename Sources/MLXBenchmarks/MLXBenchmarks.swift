@@ -498,6 +498,68 @@ public struct ReductionBenchmark: MLXBenchmark {
 // manually by running them separately.
 // TODO: Fix conv2d parameter types for MLX-Swift when API is better understood
 
+/// Conv2D + bias + ReLU benchmark — exercises the fused_conv_bias_act path
+/// at -O3. Uses MLX's pure conv2d + add + relu chain on the reference side;
+/// the MetalHLO side emits a `conv → broadcast(bias) → add → maximum`
+/// pattern that the conv-bias-act-fusion pass collapses to one custom call.
+public struct Conv2DBiasReluBenchmark: MLXBenchmark {
+    public let id: String
+    public let name: String
+    public let category: String = "convolution"
+    public let operation: String = "conv2d_bias_relu"
+    public let batchSize: Int
+    public let height: Int
+    public let width: Int
+    public let inChannels: Int
+    public let outChannels: Int
+    public let kernelSize: Int
+    public let stride: Int
+    public let padding: Int
+
+    public init(id: String, name: String, batchSize: Int, height: Int, width: Int,
+                inChannels: Int, outChannels: Int, kernelSize: Int, stride: Int, padding: Int) {
+        self.id = id
+        self.name = name
+        self.batchSize = batchSize
+        self.height = height
+        self.width = width
+        self.inChannels = inChannels
+        self.outChannels = outChannels
+        self.kernelSize = kernelSize
+        self.stride = stride
+        self.padding = padding
+    }
+
+    public func run(iterations: Int, warmup: Int) -> MLXBenchmarkResult {
+        let input = MLXRandom.normal([batchSize, height, width, inChannels])
+        let weight = MLXRandom.normal([outChannels, kernelSize, kernelSize, inChannels]) * 0.01
+        let bias = MLXRandom.normal([outChannels]) * 0.01
+        eval(input, weight, bias)
+
+        func doConvBiasRelu() -> MLXArray {
+            let c = MLX.conv2d(input, weight, stride: IntOrPair(stride), padding: IntOrPair(padding))
+            return MLX.maximum(c + bias, MLXArray(Float(0.0)))
+        }
+
+        for _ in 0..<warmup {
+            let c = doConvBiasRelu()
+            eval(c)
+        }
+
+        var times: [Double] = []
+        for _ in 0..<iterations {
+            let start = CFAbsoluteTimeGetCurrent()
+            let c = doConvBiasRelu()
+            eval(c)
+            Stream.gpu.synchronize()
+            let end = CFAbsoluteTimeGetCurrent()
+            times.append(end - start)
+        }
+
+        return computeResult(id: id, name: name, category: category, operation: operation, times: times, iterations: iterations)
+    }
+}
+
 // MARK: - Normalization Benchmark
 
 /// Layer normalization benchmark.
@@ -1110,6 +1172,7 @@ public enum MLXBenchmarks {
         benchmarks.append(Conv2DBenchmark(id: "CONV-005", name: "MLX Conv2D 32x56x56x64 k3s1", batchSize: 32, height: 56, width: 56, inChannels: 64, outChannels: 64, kernelSize: 3, stride: 1, padding: 1))
         benchmarks.append(Conv2DBenchmark(id: "CONV-006", name: "MLX Conv2D 1x112x112x32 k1s1", batchSize: 1, height: 112, width: 112, inChannels: 32, outChannels: 32, kernelSize: 1, stride: 1, padding: 0))
         benchmarks.append(Conv2DBenchmark(id: "CONV-007", name: "MLX Conv2D 1x56x56x128 k3s1", batchSize: 1, height: 56, width: 56, inChannels: 128, outChannels: 128, kernelSize: 3, stride: 1, padding: 1))
+        benchmarks.append(Conv2DBiasReluBenchmark(id: "CONV-008", name: "MLX Conv2D+Bias+ReLU 1x56x56x64 k3s1", batchSize: 1, height: 56, width: 56, inChannels: 64, outChannels: 64, kernelSize: 3, stride: 1, padding: 0))
 
         // Normalization benchmarks
         benchmarks.append(LayerNormBenchmark(id: "NORM-LN-001", name: "MLX LayerNorm 1x128x768", shape: [1, 128, 768], normalizeAxis: 2))

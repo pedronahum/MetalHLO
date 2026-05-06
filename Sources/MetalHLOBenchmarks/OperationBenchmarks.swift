@@ -539,6 +539,14 @@ public enum OperationBenchmarks {
             ("CONV-007", 1, 56, 56, 128, 128, 3, 1, "Depthwise-like"),
         ]
 
+        // Conv2D + bias + ReLU configurations — exercises the
+        // conv-bias-act-fusion pass. Same shape as CONV-002 so the per-op
+        // timing is comparable; the pattern is `conv → broadcast(bias) →
+        // add → maximum`.
+        let convBiasReluConfigs: [(id: String, batch: Int, h: Int, w: Int, cin: Int, cout: Int, k: Int, stride: Int, notes: String)] = [
+            ("CONV-008", 1, 56, 56, 64, 64, 3, 1, "Conv+Bias+ReLU (ResNet stage2)"),
+        ]
+
         for config in conv2dConfigs {
             // Calculate output dimensions (no padding, so output shrinks)
             let outH = (config.h - config.k) / config.stride + 1
@@ -586,6 +594,71 @@ public enum OperationBenchmarks {
                     let input = try gen.createUniformFloat32Buffer(client: client, shape: [config.batch, config.h, config.w, config.cin])
                     let kernel = try gen.createNormalFloat32Buffer(client: client, shape: [config.k, config.k, config.cin, config.cout], mean: 0, stdDev: 0.1)
                     return [input, kernel]
+                },
+                throughputCalculator: { timing in
+                    let gflops = FLOPSCalculator.gflops(flops: flops, timeSeconds: timing.gpuTime)
+                    return ThroughputMetrics(
+                        opsPerSecond: 1.0 / timing.gpuTime,
+                        flops: gflops * 1e9,
+                        elementsPerSecond: Double(config.batch * outH * outW * config.cout) / timing.gpuTime
+                    )
+                }
+            ))
+        }
+
+        for config in convBiasReluConfigs {
+            let outH = (config.h - config.k) / config.stride + 1
+            let outW = (config.w - config.k) / config.stride + 1
+            let moduleId = config.id.replacingOccurrences(of: "-", with: "_")
+            // Conv -> broadcast(bias) -> add -> maximum(_, broadcast(constant 0))
+            // — the canonical un-fused chain that conv-bias-act-fusion folds
+            // into a single fused_conv_bias_act customCall at -O3.
+            let mlir = """
+            module @conv2d_bias_relu_\(moduleId) {
+              func.func @main(%input: tensor<\(config.batch)x\(config.h)x\(config.w)x\(config.cin)xf32>, %kernel: tensor<\(config.k)x\(config.k)x\(config.cin)x\(config.cout)xf32>, %bias: tensor<\(config.cout)xf32>) -> (tensor<\(config.batch)x\(outH)x\(outW)x\(config.cout)xf32>) {
+                %0 = stablehlo.convolution %input, %kernel window_strides = [\(config.stride), \(config.stride)], feature_group_count = 1 : (tensor<\(config.batch)x\(config.h)x\(config.w)x\(config.cin)xf32>, tensor<\(config.k)x\(config.k)x\(config.cin)x\(config.cout)xf32>) -> tensor<\(config.batch)x\(outH)x\(outW)x\(config.cout)xf32>
+                %bbc = stablehlo.broadcast_in_dim %bias, dims = [3] : (tensor<\(config.cout)xf32>) -> tensor<\(config.batch)x\(outH)x\(outW)x\(config.cout)xf32>
+                %biased = stablehlo.add %0, %bbc : tensor<\(config.batch)x\(outH)x\(outW)x\(config.cout)xf32>
+                %zero = stablehlo.constant dense<0.0> : tensor<f32>
+                %zerobc = stablehlo.broadcast_in_dim %zero, dims = [] : (tensor<f32>) -> tensor<\(config.batch)x\(outH)x\(outW)x\(config.cout)xf32>
+                %out = stablehlo.maximum %biased, %zerobc : tensor<\(config.batch)x\(outH)x\(outW)x\(config.cout)xf32>
+                return %out : tensor<\(config.batch)x\(outH)x\(outW)x\(config.cout)xf32>
+              }
+            }
+            """
+
+            let flops = FLOPSCalculator.conv2d(
+                batchSize: config.batch,
+                inputHeight: config.h,
+                inputWidth: config.w,
+                inputChannels: config.cin,
+                outputChannels: config.cout,
+                kernelHeight: config.k,
+                kernelWidth: config.k,
+                stride: config.stride
+            )
+
+            benchmarks.append(SimpleBenchmark(
+                id: config.id,
+                name: "Conv2D+Bias+ReLU \(config.batch)x\(config.h)x\(config.w)x\(config.cin) k\(config.k)s\(config.stride)",
+                category: "convolution",
+                operation: "conv2d_bias_relu",
+                configuration: [
+                    "batch": "\(config.batch)",
+                    "input_shape": "\(config.h)x\(config.w)x\(config.cin)",
+                    "output_channels": "\(config.cout)",
+                    "kernel": "\(config.k)x\(config.k)",
+                    "stride": "\(config.stride)",
+                    "dtype": "f32",
+                    "notes": config.notes
+                ],
+                mlirProgram: mlir,
+                inputGenerator: { client in
+                    let gen = TestDataGenerator(seed: 42)
+                    let input = try gen.createUniformFloat32Buffer(client: client, shape: [config.batch, config.h, config.w, config.cin])
+                    let kernel = try gen.createNormalFloat32Buffer(client: client, shape: [config.k, config.k, config.cin, config.cout], mean: 0, stdDev: 0.1)
+                    let bias = try gen.createNormalFloat32Buffer(client: client, shape: [config.cout], mean: 0, stdDev: 0.01)
+                    return [input, kernel, bias]
                 },
                 throughputCalculator: { timing in
                     let gflops = FLOPSCalculator.gflops(flops: flops, timeSeconds: timing.gpuTime)
