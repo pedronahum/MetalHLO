@@ -414,6 +414,9 @@ public final class CodeGenerator: @unchecked Sendable {
 
         case .fusedSoftmax(let axis):
             return generateSoftmaxSource(axis: axis, inputShapes: inputShapes)
+
+        case .fusedConvBiasAct(let config):
+            return generateFusedConvBiasActSource(config, inputShapes: inputShapes, outputShapes: outputShapes, attributes: attributes, elementType: elementType)
         }
     }
 
@@ -2188,6 +2191,82 @@ public final class CodeGenerator: @unchecked Sendable {
         """
 
         return code
+    }
+
+    /// Generates a fused conv + bias + activation kernel. The fusion pass
+    /// only fires for the canonical conv → add(broadcast(bias)) → activation
+    /// chain, so this kernel is dispatched with up to 3 input buffers
+    /// (input, weights, bias). Reuses the same per-output structure as the
+    /// generic conv kernel — bias add + activation are appended to the
+    /// final reduction step before the device write.
+    private func generateFusedConvBiasActSource(
+        _ config: ConvBiasActConfig,
+        inputShapes: [[Int]],
+        outputShapes: [[Int]],
+        attributes: HLOAttributes,
+        elementType: ElementType
+    ) -> (source: String, entryPoint: String, tuning: TuningConfig?) {
+        let entryPoint = "kernel_fused_conv_bias_act"
+        let metalType = metalTypeName(for: elementType)
+        let inputShape = inputShapes.first ?? []
+        let weightsShape = inputShapes.count > 1 ? inputShapes[1] : []
+        let outputShape = outputShapes.first ?? []
+
+        // Start from the generic conv kernel, then patch in bias + activation
+        // around the output write. The conv kernel signature uses buffers
+        // (input, weights, output, count); we need to add a bias buffer when
+        // hasBias and modify the final write line.
+        var convCode = generateConvolutionKernel(
+            entryPoint: entryPoint,
+            inputShape: inputShape,
+            weightsShape: weightsShape,
+            outputShape: outputShape,
+            attributes: attributes,
+            metalType: metalType
+        )
+
+        // Bias add + activation epilogue. Bias is per-output-channel, indexed
+        // by the trailing output dim (NHWC convention puts feature last; this
+        // matches the unfused chain we matched in the detector).
+        let outFeatureDim = attributes.convolutionDimensionNumbers?.outputFeatureDimension
+            ?? (outputShape.count - 1)
+        let outFeatureCoord = "o\(outFeatureDim)"
+        let activationExpr: String
+        switch config.activation {
+        case .relu:           activationExpr = "max(sum, \(metalType)(0))"
+        case .sigmoid:        activationExpr = "\(metalType)(1) / (\(metalType)(1) + exp(-sum))"
+        case .tanh:           activationExpr = "tanh(sum)"
+        case .silu:           activationExpr = "sum * (\(metalType)(1) / (\(metalType)(1) + exp(-sum)))"
+        case .gelu, .geluApproximate:
+            activationExpr = "sum * \(metalType)(0.5) * (\(metalType)(1) + tanh(\(metalType)(0.7978845608) * (sum + \(metalType)(0.044715) * sum * sum * sum)))"
+        case .none:
+            activationExpr = "sum"
+        }
+
+        // Splice the bias-add + activation in just before `output[tid] = sum;`,
+        // and add the bias buffer arg + buffer-index bump for `count`.
+        let oldOutputWrite = "output[tid] = sum;"
+        let biasLine = config.hasBias
+            ? "    sum += bias[\(outFeatureCoord)];"
+            : ""
+        let newOutputWrite = """
+        \(biasLine)
+            sum = \(activationExpr);
+            output[tid] = sum;
+        """
+        convCode = convCode.replacingOccurrences(of: oldOutputWrite, with: newOutputWrite)
+
+        // Insert bias buffer at index 2; shift output to 3, count to 4.
+        // The conv kernel's signature uses 4-space indentation (start of
+        // `kernel void` block) — match that exactly so the replacement fires.
+        if config.hasBias {
+            convCode = convCode.replacingOccurrences(
+                of: "    device \(metalType)* output [[buffer(2)]],\n    constant uint& count [[buffer(3)]],",
+                with: "    device const \(metalType)* bias [[buffer(2)]],\n    device \(metalType)* output [[buffer(3)]],\n    constant uint& count [[buffer(4)]],"
+            )
+        }
+
+        return (convCode, entryPoint, nil)
     }
 
     /// Generates a simple scalar reduction kernel for integer/boolean types.
@@ -5504,6 +5583,10 @@ public final class CodeGenerator: @unchecked Sendable {
                 return DispatchConfig.dispatch2D(width: N, height: M)
             }
 
+        case .fusedConvBiasAct:
+            // Same shape as the unfused conv kernel: 1 thread per output.
+            return DispatchConfig.dispatch1D(elements: totalElements, threadgroupSize: 256)
+
         case .fusedElementwise:
             // FusedElementwise kernel is NOT vectorized - it processes 1 element per thread
             // using tid directly as the element index. Do NOT use vectorized dispatch.
@@ -5786,6 +5869,12 @@ public final class CodeGenerator: @unchecked Sendable {
             }
 
         case .fusedElementwise:
+            if let output = op.outputs.first {
+                let count = output.shape.isEmpty ? 1 : output.shape.reduce(1, *)
+                return UInt32(count)
+            }
+
+        case .fusedConvBiasAct:
             if let output = op.outputs.first {
                 let count = output.shape.isEmpty ? 1 : output.shape.reduce(1, *)
                 return UInt32(count)

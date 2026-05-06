@@ -78,6 +78,7 @@ public final class CustomCallRegistry: @unchecked Sendable {
         register(FusedLayerNormHandler())
         register(FusedRMSNormHandler())
         register(FusedMatMulBiasActivationHandler())
+        register(FusedConvBiasActHandler())
         register(FusedSoftmaxHandler())
         register(FusedGeluHandler())
         register(FusedRoPEHandler())
@@ -498,6 +499,85 @@ public final class FusedMatMulBiasActivationHandler: CustomCallHandler {
             // Exact GELU: 0.5 * x * (1 + erf(x / sqrt(2)))
             // MPSGraph doesn't have erf, so use approximate for now
             return applyGelu(tensor, approximate: true, graph: graph)
+        }
+    }
+}
+
+// MARK: - Fused Conv + Bias + Activation Handler
+
+/// Handles fused 2D convolution + bias-add + optional activation
+/// (e.g. activation(conv(x, w) + bias)). The bias is broadcast across
+/// the output spatial dims; activation defaults to none.
+public final class FusedConvBiasActHandler: CustomCallHandler {
+
+    public static let targetName = "fused_conv_bias_act"
+
+    public init() {}
+
+    public func emit(
+        operation: HLOOperation,
+        graph: MPSGraph,
+        inputs: [MPSGraphTensor],
+        config: [String: Any]
+    ) throws -> [MPSGraphTensor] {
+        guard inputs.count >= 2 else {
+            throw CustomCallError.invalidInputCount(expected: 2, got: inputs.count)
+        }
+        let x = inputs[0]
+        let w = inputs[1]
+        let hasBias = BackendConfigParser.getBool(config, key: "has_bias", default: true)
+        let activation = BackendConfigParser.getString(config, key: "activation", default: "none")
+
+        // Build convolution descriptor from operation attributes. We rely on
+        // the original conv op's dim numbers / strides / padding being copied
+        // into the customCall's attributes by the fusion pass.
+        let attrs = operation.attributes
+        let strides = attrs.windowStrides ?? [1, 1]
+        let padding = attrs.convPadding ?? [[0, 0], [0, 0]]
+        let dilation = attrs.rhsDilation ?? [1, 1]
+
+        let descriptor = MPSGraphConvolution2DOpDescriptor(
+            strideInX: strides.count > 1 ? strides[1] : 1,
+            strideInY: strides.count > 0 ? strides[0] : 1,
+            dilationRateInX: dilation.count > 1 ? dilation[1] : 1,
+            dilationRateInY: dilation.count > 0 ? dilation[0] : 1,
+            groups: attrs.featureGroupCount ?? 1,
+            paddingLeft: padding.count > 1 ? padding[1][0] : 0,
+            paddingRight: padding.count > 1 ? padding[1][1] : 0,
+            paddingTop: padding.count > 0 ? padding[0][0] : 0,
+            paddingBottom: padding.count > 0 ? padding[0][1] : 0,
+            paddingStyle: .explicit,
+            dataLayout: .NHWC,
+            weightsLayout: .HWIO
+        )
+
+        guard let descriptor else {
+            throw CustomCallError.invalidConfig("failed to build conv descriptor")
+        }
+
+        var result = graph.convolution2D(x, weights: w, descriptor: descriptor, name: "fused_conv")
+        if hasBias, inputs.count >= 3 {
+            result = graph.addition(result, inputs[2], name: "fused_conv_bias")
+        }
+        result = applyActivation(result, activation: activation, graph: graph)
+        return [result]
+    }
+
+    private func applyActivation(_ tensor: MPSGraphTensor, activation: String, graph: MPSGraph) -> MPSGraphTensor {
+        switch activation {
+        case "relu":
+            return graph.reLU(with: tensor, name: "fused_relu")
+        case "sigmoid":
+            return graph.sigmoid(with: tensor, name: "fused_sigmoid")
+        case "tanh":
+            return graph.tanh(with: tensor, name: "fused_tanh")
+        case "silu":
+            let sig = graph.sigmoid(with: tensor, name: nil)
+            return graph.multiplication(tensor, sig, name: "fused_silu")
+        case "none":
+            return tensor
+        default:
+            return tensor
         }
     }
 }

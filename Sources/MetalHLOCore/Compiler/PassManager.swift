@@ -172,6 +172,9 @@ public final class PassManager: @unchecked Sendable {
         register(name: "matmul-bias-act-fusion", phase: .patternFusion) {
             MatMulBiasActFusionPass()
         }
+        register(name: "conv-bias-act-fusion", phase: .patternFusion) {
+            ConvBiasActFusionPass()
+        }
 
         // ═══════════════════════════════════════════════════════════════
         // PHASE 4: GENERIC FUSION (catch remaining opportunities)
@@ -1184,6 +1187,113 @@ final class SoftmaxFusionPass: OptimizationPass, @unchecked Sendable {
             stats: [
                 "operationsRemoved": opsToRemove.count,
                 "operationsFused": softmaxPatterns.count
+            ]
+        )
+    }
+}
+
+/// Conv + Bias + Activation fusion pass.
+///
+/// Detects `convolution → add(broadcast(bias)) → optional activation` chains
+/// and emits a single `fused_conv_bias_act` custom_call. Inherits the
+/// original convolution's dim numbers / strides / padding / dilation
+/// attributes so the handler / kernel can rebuild the descriptor.
+final class ConvBiasActFusionPass: OptimizationPass, @unchecked Sendable {
+    let name = "conv-bias-act-fusion"
+    let invalidates: Set<AnalysisType> = [.lifetimes, .patterns]
+
+    func run(on function: HLOFunction, analysis: AnalysisResults) -> PassResult {
+        let convPatterns = analysis.patterns.filter { $0.type == .convBiasActivation }
+        if convPatterns.isEmpty {
+            return .unchanged(function)
+        }
+
+        var newOperations = function.operations
+        var opsToRemove = Set<Int>()
+        var changed = false
+
+        for pattern in convPatterns {
+            let rootIdx = pattern.rootIndex
+            guard rootIdx < function.operations.count else { continue }
+            let rootOp = function.operations[rootIdx]
+
+            // Locate the constituent ops by scanning the pattern's index set.
+            var convOp: HLOOperation? = nil
+            var biasBroadcastOp: HLOOperation? = nil
+            for idx in pattern.operationIndices {
+                guard idx < function.operations.count else { continue }
+                let op = function.operations[idx]
+                if op.kind == .convolution { convOp = op }
+                if op.kind == .broadcastInDim, biasBroadcastOp == nil {
+                    biasBroadcastOp = op
+                }
+            }
+            guard let conv = convOp else { continue }
+
+            // Operands: input, weights, [bias]. We feed the unbroadcast bias —
+            // MPSGraph's addition broadcasts per-channel along NHWC's C dim
+            // automatically when shapes match the convention.
+            var operands: [TensorID] = [conv.operands[0], conv.operands[1]]
+            if let bbc = biasBroadcastOp, !bbc.operands.isEmpty {
+                operands.append(bbc.operands[0])
+            }
+
+            let activation = pattern.metadata.activation ?? "none"
+
+            // Inherit conv attributes (dim numbers / strides / padding /
+            // dilation) so the handler / codegen can rebuild the descriptor.
+            var attrs = conv.attributes
+            attrs.callTargetName = FusedConvBiasActHandler.targetName
+            attrs.backendConfig = "{\"activation\": \"\(activation)\", \"has_bias\": \(biasBroadcastOp != nil)}"
+
+            let fusedOp = HLOOperation(
+                result: rootOp.result,
+                kind: .customCall,
+                operands: operands,
+                resultType: rootOp.resultType,
+                attributes: attrs
+            )
+
+            newOperations[rootIdx] = fusedOp
+
+            // Remove the conv, broadcast, add, and (if present) activation ops
+            // — all of which are subsumed by the fused custom call.
+            let patternIndexSet = Set(pattern.operationIndices)
+            for idx in pattern.operationIndices where idx != rootIdx {
+                let result = function.operations[idx].result
+                let hasExternalUse = function.operations.enumerated().contains { (i, otherOp) in
+                    !patternIndexSet.contains(i) && otherOp.operands.contains(result)
+                }
+                let isReturnValue = function.returnValues.contains(result)
+                if !hasExternalUse && !isReturnValue {
+                    opsToRemove.insert(idx)
+                }
+            }
+            changed = true
+        }
+
+        if !changed {
+            return .unchanged(function)
+        }
+
+        let filteredOps = newOperations.enumerated()
+            .filter { !opsToRemove.contains($0.offset) }
+            .map { $0.element }
+
+        let newFunction = HLOFunction(
+            name: function.name,
+            inputs: function.inputs,
+            outputTypes: function.outputTypes,
+            operations: filteredOps,
+            returnValues: function.returnValues
+        )
+
+        return PassResult(
+            function: newFunction,
+            changed: true,
+            stats: [
+                "operationsRemoved": opsToRemove.count,
+                "operationsFused": convPatterns.count
             ]
         )
     }

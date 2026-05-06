@@ -323,6 +323,21 @@ module @conv2d_nhwc_3x3 {
   }
 }
 """),
+        // Conv → bias-add → ReLU chain — exercises the new ConvBiasActFusionPass.
+        // Input [1, 10, 10, 4] × weights [3, 3, 4, 8] + bias[8] → ReLU → [1, 8, 8, 8].
+        ("conv2d_bias_relu", """
+module @conv2d_bias_relu {
+  func.func @main(%arg0: tensor<1x10x10x4xf32>, %arg1: tensor<3x3x4x8xf32>, %bias: tensor<8xf32>) -> (tensor<1x8x8x8xf32>) {
+    %0 = stablehlo.convolution %arg0, %arg1 window_strides = [1, 1], feature_group_count = 1 : (tensor<1x10x10x4xf32>, tensor<3x3x4x8xf32>) -> tensor<1x8x8x8xf32>
+    %bbc = stablehlo.broadcast_in_dim %bias, dims = [3] : (tensor<8xf32>) -> tensor<1x8x8x8xf32>
+    %biased = stablehlo.add %0, %bbc : tensor<1x8x8x8xf32>
+    %zero = stablehlo.constant dense<0.0> : tensor<f32>
+    %zerobc = stablehlo.broadcast_in_dim %zero, dims = [] : (tensor<f32>) -> tensor<1x8x8x8xf32>
+    %out = stablehlo.maximum %biased, %zerobc : tensor<1x8x8x8xf32>
+    return %out : tensor<1x8x8x8xf32>
+  }
+}
+"""),
     ]
 
     @Test("Simple add produces identical results across optimization levels")
@@ -457,11 +472,9 @@ module @conv2d_nhwc_3x3 {
 
     @Test("Conv2D NHWC 3×3 matches across optimization levels")
     func testConv2dNHWCAcrossLevels() async throws {
-        // Exercises the new simdgroup-per-output convolution kernel. Shapes
-        // chosen to cover the kernel-spatial × icPerGroup decomposition logic:
-        // 3×3 spatial × 4 input channels = 36 reduction iterations per output,
-        // simd_lane stride 32 — exercises the partial-iteration path where one
-        // thread does an extra step.
+        // Exercises the conv kernel. Shapes chosen so the kernel-spatial ×
+        // icPerGroup reduction (3 × 3 × 4 = 36 iterations per output) covers
+        // both the divisible-by-32 path and the partial-iteration tail.
         let inputCount = 1 * 10 * 10 * 4
         let weightsCount = 3 * 3 * 4 * 8
         let input: [Float] = (0..<inputCount).map { i in Float(i % 13) * 0.05 - 0.3 }
@@ -469,6 +482,24 @@ module @conv2d_nhwc_3x3 {
         try await compareAcrossOptimizationLevels(
             programIndex: 10,
             inputs: [(input, [1, 10, 10, 4]), (weights, [3, 3, 4, 8])],
+            tolerance: 5e-3
+        )
+    }
+
+    @Test("Conv2D + bias + ReLU fusion matches across optimization levels")
+    func testConv2dBiasReluAcrossLevels() async throws {
+        // -O3 should fold the conv → broadcast(bias) → add → maximum chain
+        // into a single fused_conv_bias_act custom_call. The output must
+        // match the un-fused chain at O0/O1/O2.
+        let inputCount = 1 * 10 * 10 * 4
+        let weightsCount = 3 * 3 * 4 * 8
+        let biasCount = 8
+        let input: [Float] = (0..<inputCount).map { i in Float(i % 13) * 0.05 - 0.3 }
+        let weights: [Float] = (0..<weightsCount).map { i in Float(i % 7) * 0.07 - 0.2 }
+        let bias: [Float] = (0..<biasCount).map { i in Float(i) * 0.01 - 0.04 }
+        try await compareAcrossOptimizationLevels(
+            programIndex: 11,
+            inputs: [(input, [1, 10, 10, 4]), (weights, [3, 3, 4, 8]), (bias, [8])],
             tolerance: 5e-3
         )
     }

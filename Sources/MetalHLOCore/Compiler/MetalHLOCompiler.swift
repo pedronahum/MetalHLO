@@ -666,6 +666,8 @@ public final class MetalHLOCompiler: @unchecked Sendable {
                 kind = .customCall
             case .fusedSoftmax:
                 kind = .customCall
+            case .fusedConvBiasAct:
+                kind = .customCall
             }
 
             return HLOOperation(

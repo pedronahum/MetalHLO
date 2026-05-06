@@ -174,6 +174,7 @@ public enum PatternType: String, Sendable, CaseIterable {
     case gelu
     case silu
     case matmulBiasActivation
+    case convBiasActivation
     case residualAdd
     case embeddingLookup
     case rotaryPositionEmbedding
@@ -244,6 +245,9 @@ public enum FusedOpType: Sendable, Hashable {
 
     /// Fused matmul + bias + activation.
     case fusedMatMulBiasAct(MatMulConfig)
+
+    /// Fused 2D convolution + bias + activation.
+    case fusedConvBiasAct(ConvBiasActConfig)
 
     /// Fused GELU activation.
     case fusedGELU(approximate: Bool)
@@ -344,6 +348,17 @@ public enum ActivationType: String, Sendable, Hashable, CaseIterable {
     case tanh
     case sigmoid
     case none
+}
+
+/// Configuration for fused conv + bias + activation.
+public struct ConvBiasActConfig: Sendable, Hashable {
+    public var hasBias: Bool
+    public var activation: ActivationType
+
+    public init(hasBias: Bool = false, activation: ActivationType = .none) {
+        self.hasBias = hasBias
+        self.activation = activation
+    }
 }
 
 /// Configuration for fused FFN.
@@ -492,6 +507,15 @@ public struct FusedOp: Sendable {
                 transA: transA,
                 transB: transB,
                 hasBias: true,
+                activation: activation
+            ))
+
+        case FusedConvBiasActHandler.targetName:
+            let activationStr = config["activation"] as? String ?? "none"
+            let hasBias = (config["has_bias"] as? Bool) ?? true
+            let activation = ActivationType(rawValue: activationStr) ?? .none
+            return .fusedConvBiasAct(ConvBiasActConfig(
+                hasBias: hasBias,
                 activation: activation
             ))
 

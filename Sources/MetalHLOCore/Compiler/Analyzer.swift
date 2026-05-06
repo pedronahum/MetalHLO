@@ -398,7 +398,101 @@ public final class Analyzer: @unchecked Sendable {
         patterns.append(contentsOf: detectActivationPatterns(function, definingOps: definingOps))
         patterns.append(contentsOf: detectFFNPatterns(function, definingOps: definingOps, shapes: shapes))
         patterns.append(contentsOf: detectMatMulBiasActPatterns(function, definingOps: definingOps))
+        patterns.append(contentsOf: detectConvBiasActPatterns(function, definingOps: definingOps, existing: patterns))
         patterns.append(contentsOf: detectSoftmaxPatterns(function, definingOps: definingOps, shapes: shapes, existing: patterns))
+
+        return patterns
+    }
+
+    /// Detects `convolution → add(broadcast(bias)) → optional activation`
+    /// chains. Returns each match as a single pattern with the activation
+    /// kind in metadata (or "none"). Skips conv ops already covered by a
+    /// higher-priority pattern.
+    private func detectConvBiasActPatterns(
+        _ function: HLOFunction,
+        definingOps: [TensorID: (op: HLOOperation, index: Int)],
+        existing: [DetectedPattern]
+    ) -> [DetectedPattern] {
+        var claimed = Set<Int>()
+        for p in existing {
+            for idx in p.operationIndices { claimed.insert(idx) }
+        }
+
+        // Use map for use-count once (used to confirm the conv result has only
+        // the bias-add as its consumer — fusion would be unsafe otherwise).
+        var useCount: [TensorID: Int] = [:]
+        for op in function.operations {
+            for operand in op.operands {
+                useCount[operand, default: 0] += 1
+            }
+        }
+        for retVal in function.returnValues {
+            useCount[retVal, default: 0] += 1
+        }
+
+        var patterns: [DetectedPattern] = []
+
+        for (convIdx, convOp) in function.operations.enumerated() {
+            guard convOp.kind == .convolution else { continue }
+            if claimed.contains(convIdx) { continue }
+
+            // Look for an `add` whose first operand is the conv result and
+            // whose second operand is `broadcast_in_dim(bias)`. (Some IRs use
+            // (broadcast, conv) ordering — handle both.)
+            guard useCount[convOp.result, default: 0] == 1 else { continue }
+            guard let consumerIdx = function.operations.firstIndex(where: { $0.operands.contains(convOp.result) }),
+                  consumerIdx > convIdx else { continue }
+            let addOp = function.operations[consumerIdx]
+            guard addOp.kind == .add, addOp.operands.count == 2 else { continue }
+
+            // Pick the operand that's NOT the conv result.
+            let biasOperand: TensorID
+            if addOp.operands[0] == convOp.result { biasOperand = addOp.operands[1] }
+            else if addOp.operands[1] == convOp.result { biasOperand = addOp.operands[0] }
+            else { continue }
+
+            // Bias should come from a broadcast_in_dim of a 1-D tensor (per-channel).
+            guard let biasDef = definingOps[biasOperand],
+                  biasDef.op.kind == .broadcastInDim else { continue }
+
+            var matchedIndices = [convIdx, biasDef.index, consumerIdx]
+            var rootIdx = consumerIdx
+            var activation: String = "none"
+
+            // Optional activation immediately after add — relu / sigmoid / tanh.
+            // (silu is decomposed as multiply+sigmoid; skipped for now.)
+            if useCount[addOp.result, default: 0] == 1,
+               let activeIdx = function.operations.firstIndex(where: { $0.operands.contains(addOp.result) }),
+               activeIdx > consumerIdx {
+                let activeOp = function.operations[activeIdx]
+                let act: String?
+                switch activeOp.kind {
+                case .maximum:
+                    // ReLU: maximum(x, 0). Confirm the second operand is a constant zero.
+                    if activeOp.operands.count == 2,
+                       let otherDef = definingOps[activeOp.operands[1]],
+                       otherDef.op.kind == .constant {
+                        act = "relu"
+                    } else { act = nil }
+                case .logistic: act = "sigmoid"
+                case .tanh: act = "tanh"
+                default: act = nil
+                }
+                if let act {
+                    activation = act
+                    matchedIndices.append(activeIdx)
+                    rootIdx = activeIdx
+                }
+            }
+
+            patterns.append(DetectedPattern(
+                type: .convBiasActivation,
+                operationIndices: matchedIndices.sorted(),
+                rootIndex: rootIdx,
+                metadata: PatternMetadata(activation: activation)
+            ))
+            for idx in matchedIndices { claimed.insert(idx) }
+        }
 
         return patterns
     }
