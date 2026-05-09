@@ -620,6 +620,8 @@ swift build -c release --product PJRTMetalHLO
 
 ### Using with JAX
 
+Tested with JAX 0.10.0 (compatible back to JAX 0.4.0).
+
 Install the Python package that registers MetalHLO as a JAX backend:
 
 ```bash

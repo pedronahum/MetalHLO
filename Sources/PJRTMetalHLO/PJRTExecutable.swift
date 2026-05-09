@@ -177,8 +177,11 @@ private func convertBytecodeToText(_ bytecode: Data) -> Result<String, BytecodeE
     let stderrPipe = Pipe()
 
     // Find Python — we're running inside a Python process (JAX called us).
-    // Use the same Python executable that's running the current process.
-    let pythonPath = ProcessInfo.processInfo.arguments[0]
+    // Prefer METALHLO_PYTHON (set by the Python plugin to sys.executable),
+    // since arguments[0] on macOS resolves to the underlying framework binary
+    // (e.g. /opt/homebrew/Cellar/.../Python) and bypasses venv site-packages.
+    let pythonPath = ProcessInfo.processInfo.environment["METALHLO_PYTHON"]
+        ?? ProcessInfo.processInfo.arguments[0]
     process.executableURL = URL(fileURLWithPath: pythonPath)
     process.arguments = ["-c", pythonScript]
     process.standardInput = stdinPipe

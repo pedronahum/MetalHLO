@@ -6,7 +6,7 @@ Python package that registers MetalHLO as a JAX PJRT backend, enabling JAX compu
 
 - macOS with Apple Silicon (M1/M2/M3/M4)
 - Python 3.9+
-- JAX 0.4.0+ (tested with JAX 0.7.0)
+- JAX 0.4.0+ (tested with JAX 0.10.0)
 
 ## Installation
 
