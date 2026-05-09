@@ -115,6 +115,22 @@ private func convertBytecodeToText(_ bytecode: Data) -> Result<String, BytecodeE
                 o.append(l)
             return '\n'.join(o)
         text = _fix_shadows(text)
+        # Rewrite stablehlo.composite to a func.call to its decomposition
+        # function. The composite op groups other ops behind a name (e.g.
+        # "chlo.erf"), and StableHLO emits the actual implementation as a
+        # private func.func @<decomposition>. Our parser doesn't model
+        # composite directly, but the existing func.call inliner downstream
+        # can already absorb the decomposition body once we turn the
+        # composite into a call.
+        # Pattern:
+        #   %r = stablehlo.composite "name" %a, %b {decomposition = @fn, ...} : (...) -> ...
+        # Becomes:
+        #   %r = func.call @fn(%a, %b) : (...) -> ...
+        text = re.sub(
+            r'stablehlo\.composite\s+"[^"]*"\s+([^{]+?)\s*\{[^}]*decomposition\s*=\s*@([\w.]+)[^}]*\}',
+            r'func.call @\2(\1)',
+            text
+        )
         # Convert generic form inherent attributes <{...}> to {...}
         text = text.replace('<{', '{')
         text = text.replace('}>', '}')

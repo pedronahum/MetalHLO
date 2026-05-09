@@ -965,8 +965,29 @@ public final class DotGeneralLayoutCanonicalize: OptimizationPass, @unchecked Se
             let lhsNeedsTranspose = lhsCanonical != Array(0..<lhsShape.count)
             let rhsNeedsTranspose = rhsCanonical != Array(0..<rhsShape.count)
 
+            // Even when the layout is already canonical, transpose-folding may
+            // have stamped lhsTranspose/rhsTranspose on the dot_general from a
+            // matrix-transpose it absorbed earlier. Drop those flags here: from
+            // this point on the dim numbers (post-canonicalization) are the
+            // single source of truth, and the codegen path's M/K/N derivation
+            // will re-derive any needed swap from them.
             if !lhsNeedsTranspose && !rhsNeedsTranspose {
-                newOps.append(op)
+                if op.attributes.lhsTranspose != nil || op.attributes.rhsTranspose != nil {
+                    var newAttrs = op.attributes
+                    newAttrs.lhsTranspose = nil
+                    newAttrs.rhsTranspose = nil
+                    let cleared = HLOOperation(
+                        result: op.result,
+                        kind: .dotGeneral,
+                        operands: op.operands,
+                        resultType: op.resultType,
+                        attributes: newAttrs
+                    )
+                    newOps.append(cleared)
+                    changed = true
+                } else {
+                    newOps.append(op)
+                }
                 continue
             }
 
