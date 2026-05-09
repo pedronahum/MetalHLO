@@ -152,7 +152,8 @@ private func convertBytecodeToText(_ bytecode: Data) -> Result<String, BytecodeE
             r = ''
             s = re.search(r'stride\s*=\s*(\[[^\]]*\])', wb)
             if s: r += ', window_strides = ' + s.group(1)
-            p = re.search(r'pad\s*=\s*(\[\[[^\]]*\]\]|\[[^\]]*\])', wb)
+            # Match padding in any of: [[a,b]], [[a,b],[c,d],...], or [a,b]
+            p = re.search(r'pad\s*=\s*(\[\s*(?:\[[^\]]*\]\s*,?\s*)+\]|\[[^\]]*\])', wb)
             if p: r += ', padding = ' + p.group(1)
             l = re.search(r'lhs_dilate\s*=\s*(\[[^\]]*\])', wb)
             if l: r += ', lhs_dilation = ' + l.group(1)

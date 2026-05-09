@@ -61,7 +61,8 @@ def main():
         if stride_m:
             result += ", window_strides = " + stride_m.group(1)
         # pad = [...] -> padding = [...]
-        pad_m = re.search(r"pad\s*=\s*(\[\[[^\]]*\]\]|\[[^\]]*\])", window_body)
+        # Match padding in any of: [[a,b]], [[a,b],[c,d],...], or [a,b]
+        pad_m = re.search(r"pad\s*=\s*(\[\s*(?:\[[^\]]*\]\s*,?\s*)+\]|\[[^\]]*\])", window_body)
         if pad_m:
             result += ", padding = " + pad_m.group(1)
         # lhs_dilate = [...] -> lhs_dilation = [...]

@@ -373,7 +373,10 @@ public final class Parser {
 
         // Skip scatter/selectAndScatter reducer regions: ({^bb0(...): ...stablehlo.return...})
         // These appear after attributes and before the type signature.
-        if (kind == .scatter || kind == .selectAndScatter) && check(.leftParen) {
+        // Also handles reduce_window in generic form, where the reduction op is
+        // expressed as an inline region (Flax avg_pool / max_pool emit this).
+        if (kind == .scatter || kind == .selectAndScatter || kind == .reduceWindow)
+            && check(.leftParen) {
             // Skip the region: ({...})
             try expect(.leftParen)
             if check(.leftBrace) {
@@ -382,6 +385,21 @@ public final class Parser {
                 while depth > 0 && !check(.eof) {
                     if check(.leftBrace) { depth += 1 }
                     if check(.rightBrace) { depth -= 1 }
+                    // Detect reduction op for reduce_window from body content.
+                    // Body uses dotted identifiers like "stablehlo.add" — match by suffix.
+                    if kind == .reduceWindow && attributes.reductionKind == nil
+                        && currentToken.kind == .identifier {
+                        let t = currentToken.text
+                        if t == "stablehlo.add" || t == "add" {
+                            attributes.reductionKind = .sum
+                        } else if t == "stablehlo.maximum" || t == "maximum" {
+                            attributes.reductionKind = .max
+                        } else if t == "stablehlo.minimum" || t == "minimum" {
+                            attributes.reductionKind = .min
+                        } else if t == "stablehlo.multiply" || t == "multiply" {
+                            attributes.reductionKind = .product
+                        }
+                    }
                     advance()
                 }
             }
@@ -1270,6 +1288,25 @@ public final class Parser {
                     advance()
                 }
             }
+        } else if check(.leftBracket) {
+            // Bare nested-array form, e.g. padding = [[1, 1], [2, 2]]
+            // emitted by StableHLO when convolutions have explicit padding
+            // (Flax SAME-padded convs).
+            try expect(.leftBracket)
+            if check(.rightBracket) {
+                advance()
+                return result
+            }
+            repeat {
+                try expect(.leftBracket)
+                var pair: [Int] = []
+                repeat {
+                    pair.append(try parseInteger())
+                } while match(.comma)
+                try expect(.rightBracket)
+                result.append(pair)
+            } while match(.comma)
+            try expect(.rightBracket)
         }
 
         return result
