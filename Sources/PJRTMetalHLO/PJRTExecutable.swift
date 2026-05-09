@@ -1120,6 +1120,48 @@ private func unrollStaticWhileLoops(_ mlir: String) -> String {
 /// `%foo` without accidentally replacing `%foo_1` or `%foobar`.
 /// For variables with `#N` suffixes (like `%result#1`), we must not match
 /// inside `%result#10` — the character after must not be a digit.
+/// Substitutes multiple SSA variables in a single pass, walking the line
+/// once and matching `%name` tokens against `subst`. This avoids the
+/// order-dependent double-substitution bug that arises when iterating a
+/// `Dictionary` (whose order is randomized across runs in Swift): if one
+/// substitution's value happens to be another substitution's key (e.g.
+/// `%arg2 -> %arg1` and `%arg1 -> %4`), iteration order decides whether
+/// `%arg2` ends up as `%arg1` or `%4` — which made `nn.Embed` flaky.
+private func substituteSSAVariables(in line: String, subst: [String: String]) -> String {
+    if subst.isEmpty { return line }
+    var result = ""
+    var i = line.startIndex
+    while i < line.endIndex {
+        let ch = line[i]
+        if ch == "%" {
+            // Scan the SSA identifier: %name where name is letters/digits/underscores.
+            var j = line.index(after: i)
+            while j < line.endIndex {
+                let c = line[j]
+                if c.isLetter || c.isNumber || c == "_" {
+                    j = line.index(after: j)
+                } else {
+                    break
+                }
+            }
+            let name = String(line[i..<j])
+            // %foo followed by `#` is a multi-result reference (%foo#0) — that's
+            // a different SSA value from %foo, so don't apply single-value subst.
+            let nextIsHash = j < line.endIndex && line[j] == "#"
+            if !nextIsHash, let replacement = subst[name] {
+                result += replacement
+            } else {
+                result += name
+            }
+            i = j
+        } else {
+            result.append(ch)
+            i = line.index(after: i)
+        }
+    }
+    return result
+}
+
 private func replaceSSAVariable(in line: String, variable: String, with replacement: String) -> String {
     var result = ""
     var remaining = line[line.startIndex...]
@@ -1402,7 +1444,6 @@ private func inlineCallsInBody(_ mlir: String, startingCounter: inout Int) -> St
                 // LHS definitions that collide with parameter names (%argN → %_shdN).
                 // No further shadow handling needed — parameter substitution will
                 // replace all remaining %argN references with call arguments.
-                let paramSet = Set(subst.keys)
                 let resolvedBodyLines = funcDef.bodyLines
                 let shadowedParams: Set<String> = []
 
@@ -1451,10 +1492,13 @@ private func inlineCallsInBody(_ mlir: String, startingCounter: inout Int) -> St
                         }
                     }
 
-                    // Substitute parameters with call arguments
-                    for (paramName, argValue) in subst {
-                        line = replaceSSAVariable(in: line, variable: paramName, with: argValue)
-                    }
+                    // Substitute parameters with call arguments. Must be atomic
+                    // (single-pass) because Dictionary iteration order is
+                    // randomized in Swift, and an argValue can collide with
+                    // another paramName (e.g. caller passes %arg1 as the value
+                    // for the callee's %arg2 parameter — sequential replacement
+                    // would then double-substitute).
+                    line = substituteSSAVariables(in: line, subst: subst)
 
                     newLines.append("    " + line)
                 }
@@ -1479,9 +1523,8 @@ private func inlineCallsInBody(_ mlir: String, startingCounter: inout Int) -> St
                                 mappedVal = replaceSSAVariable(in: mappedVal, variable: def.baseName, with: newName)
                             }
                         }
-                        for (paramName, argValue) in subst {
-                            mappedVal = replaceSSAVariable(in: mappedVal, variable: paramName, with: argValue)
-                        }
+                        // Atomic single-pass substitution — see note above.
+                        mappedVal = substituteSSAVariables(in: mappedVal, subst: subst)
 
                         let refStr = resultCount > 1 ? "\(rv)#\(retIdx)" : rv
                         resultMap.append((refStr, mappedVal))

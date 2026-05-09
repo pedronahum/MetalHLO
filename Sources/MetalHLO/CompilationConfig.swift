@@ -219,6 +219,7 @@ public enum OptimizationPass: String, CaseIterable, Sendable {
     case memoryAwareScheduler = "memory-aware-scheduler"
 
     // Cleanup phase
+    case dotGeneralLayoutCanonicalize = "dot-general-layout-canonicalize"
     case finalDCE = "final-dce"
 
     /// All pass names as strings.
@@ -232,6 +233,9 @@ public enum OptimizationPass: String, CaseIterable, Sendable {
             constantFolding.rawValue,
             algebraicSimplifier.rawValue,
             deadCodeElimination.rawValue,
+            // Correctness, not an optimization: matmul kernel assumes
+            // canonical operand layout, so this must run at every level.
+            dotGeneralLayoutCanonicalize.rawValue,
         ])
     }
 

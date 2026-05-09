@@ -222,6 +222,12 @@ public final class PassManager: @unchecked Sendable {
         // ═══════════════════════════════════════════════════════════════
         // PHASE 8: FINAL CLEANUP
         // ═══════════════════════════════════════════════════════════════
+        // Must run before final-dce so newly inserted transposes survive,
+        // and after every pattern/fusion pass that wants to match on the
+        // un-canonicalized dot_general form.
+        register(name: "dot-general-layout-canonicalize", phase: .cleanup) {
+            DotGeneralLayoutCanonicalize()
+        }
         register(name: "final-dce", phase: .cleanup) {
             DeadCodeEliminationPass()
         }

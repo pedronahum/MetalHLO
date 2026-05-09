@@ -879,3 +879,193 @@ public final class TransposeMatmulFoldingPass: OptimizationPass, @unchecked Send
         return perm[rank - 2] == rank - 1 && perm[rank - 1] == rank - 2
     }
 }
+
+// MARK: - Dot General Layout Canonicalize
+
+/// Inserts transposes before `dot_general` operands so the matmul kernel
+/// (which assumes `[batch_flat, M, K]` / `[batch_flat, K, N]` row-major
+/// memory) sees correctly laid-out inputs.
+///
+/// The kernel computes `M`, `K`, `N`, and `batchSize` by reducing over the
+/// batching/contracting/remaining dim sets, but reads the operand memory as
+/// if it were already in `[batch..., remaining..., contracting...]` (LHS) or
+/// `[batch..., contracting..., remaining...]` (RHS) order. When batch dims
+/// are interleaved with remaining/contracting dims (e.g. multi-head
+/// attention's `batching_dims = [0, 2]` for shape `(B, S, H, D)`), the
+/// flatten produces wrong values.
+///
+/// Fix: for any `dot_general` whose operand layout is not already canonical,
+/// insert a `transpose` and rewrite the dim numbers to reference the
+/// transposed shape.
+///
+/// Runs late (cleanup phase) so attention / fusion patterns can match on
+/// the un-canonicalized form first.
+public final class DotGeneralLayoutCanonicalize: OptimizationPass, @unchecked Sendable {
+
+    public let name = "dot-general-layout-canonicalize"
+    public let invalidates: Set<AnalysisType> = [.shapes, .lifetimes, .patterns, .dependencies]
+
+    public init() {}
+
+    public func run(on function: HLOFunction, analysis: AnalysisResults) -> PassResult {
+        var newOps: [HLOOperation] = []
+        newOps.reserveCapacity(function.operations.count)
+        var changed = false
+        var injected = 0
+
+        // Track existing SSA names to avoid collisions with synthesized ones.
+        var usedNames = Set(function.operations.map { $0.result })
+        for input in function.inputs { usedNames.insert(input.name) }
+
+        func freshName(prefix: String) -> String {
+            var i = 0
+            while true {
+                let n = "\(prefix)\(i)"
+                if !usedNames.contains(n) {
+                    usedNames.insert(n)
+                    return n
+                }
+                i += 1
+            }
+        }
+
+        for op in function.operations {
+            guard op.kind == .dotGeneral,
+                  let dims = op.attributes.dotDimensionNumbers else {
+                newOps.append(op)
+                continue
+            }
+
+            let lhsShape = analysis.shapes[op.operands[0]] ?? []
+            let rhsShape = analysis.shapes[op.operands[1]] ?? []
+            guard lhsShape.count >= 2, rhsShape.count >= 2 else {
+                newOps.append(op)
+                continue
+            }
+
+            let lhsBatch = dims.lhsBatchingDimensions
+            let rhsBatch = dims.rhsBatchingDimensions
+            let lhsContract = dims.lhsContractingDimensions
+            let rhsContract = dims.rhsContractingDimensions
+
+            // Compute remaining (non-batch, non-contracting) dims, in original order.
+            let lhsRemaining = (0..<lhsShape.count).filter {
+                !lhsBatch.contains($0) && !lhsContract.contains($0)
+            }
+            let rhsRemaining = (0..<rhsShape.count).filter {
+                !rhsBatch.contains($0) && !rhsContract.contains($0)
+            }
+
+            // Canonical operand layouts:
+            //   LHS: [batch..., remaining..., contracting...]
+            //   RHS: [batch..., contracting..., remaining...]
+            let lhsCanonical = lhsBatch + lhsRemaining + lhsContract
+            let rhsCanonical = rhsBatch + rhsContract + rhsRemaining
+
+            let lhsNeedsTranspose = lhsCanonical != Array(0..<lhsShape.count)
+            let rhsNeedsTranspose = rhsCanonical != Array(0..<rhsShape.count)
+
+            if !lhsNeedsTranspose && !rhsNeedsTranspose {
+                newOps.append(op)
+                continue
+            }
+
+            var newOperands = op.operands
+
+            if lhsNeedsTranspose {
+                let newName = freshName(prefix: "%dotcan_lhs_")
+                let newShape = lhsCanonical.map { lhsShape[$0] }
+                let lhsType = TensorType(
+                    shape: newShape,
+                    elementType: op.resultType.elementType
+                )
+                var attrs = HLOAttributes()
+                attrs.dimensions = lhsCanonical
+                let tOp = HLOOperation(
+                    result: newName,
+                    kind: .transpose,
+                    operands: [op.operands[0]],
+                    resultType: lhsType,
+                    attributes: attrs
+                )
+                newOps.append(tOp)
+                newOperands[0] = newName
+                injected += 1
+            }
+
+            if rhsNeedsTranspose {
+                let newName = freshName(prefix: "%dotcan_rhs_")
+                let newShape = rhsCanonical.map { rhsShape[$0] }
+                let rhsType = TensorType(
+                    shape: newShape,
+                    elementType: op.resultType.elementType
+                )
+                var attrs = HLOAttributes()
+                attrs.dimensions = rhsCanonical
+                let tOp = HLOOperation(
+                    result: newName,
+                    kind: .transpose,
+                    operands: [op.operands[1]],
+                    resultType: rhsType,
+                    attributes: attrs
+                )
+                newOps.append(tOp)
+                newOperands[1] = newName
+                injected += 1
+            }
+
+            // After canonicalization, the dim numbers are positional:
+            //   LHS batching = [0, ..., bC-1]
+            //   LHS contracting = [bC + rC, ..., bC + rC + cC - 1]
+            //   RHS batching = [0, ..., bC-1]
+            //   RHS contracting = [bC, ..., bC + cC - 1]
+            let bC = lhsBatch.count
+            let lhsRemCount = lhsRemaining.count
+            let cC = lhsContract.count
+            let rhsRemCount = rhsRemaining.count
+
+            let newBatchLHS = Array(0..<bC)
+            let newContractLHS = Array((bC + lhsRemCount)..<(bC + lhsRemCount + cC))
+            let newBatchRHS = Array(0..<bC)
+            let newContractRHS = Array(bC..<(bC + cC))
+
+            var newAttrs = op.attributes
+            newAttrs.dotDimensionNumbers = DotDimensionNumbers(
+                lhsBatchingDimensions: newBatchLHS,
+                rhsBatchingDimensions: newBatchRHS,
+                lhsContractingDimensions: newContractLHS,
+                rhsContractingDimensions: newContractRHS
+            )
+            // The transpose-folding pass may have set lhsTranspose/rhsTranspose
+            // based on the original layout — clear those so they don't get
+            // applied a second time on top of our explicit transposes.
+            newAttrs.lhsTranspose = nil
+            newAttrs.rhsTranspose = nil
+
+            let newDot = HLOOperation(
+                result: op.result,
+                kind: .dotGeneral,
+                operands: newOperands,
+                resultType: op.resultType,
+                attributes: newAttrs
+            )
+            newOps.append(newDot)
+            changed = true
+            _ = rhsRemCount  // silence unused warning when no RHS transpose
+        }
+
+        let newFunction = HLOFunction(
+            name: function.name,
+            inputs: function.inputs,
+            outputTypes: function.outputTypes,
+            operations: newOps,
+            returnValues: function.returnValues
+        )
+
+        return PassResult(
+            function: newFunction,
+            changed: changed,
+            stats: ["dot_transposes_inserted": injected]
+        )
+    }
+}

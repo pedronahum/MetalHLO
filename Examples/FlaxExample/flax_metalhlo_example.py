@@ -324,11 +324,6 @@ section("GroupNorm", test_groupnorm)
 def test_embedding():
     print("8. Embed")
     print("-" * 40)
-    # Embed expects integer indices.
-    # Known issue: produces NaN under MetalHLO. The Flax Embed lowering wraps
-    # gather in an out-of-bounds mask (compare + and-reduce + select), and the
-    # resulting select picks the NaN fill branch even for in-range indices —
-    # likely a bug in how the mask reduce / select interacts with the gather.
     np.random.seed(7)
     idx = np.array([[0, 1, 2, 3], [4, 5, 6, 0]], dtype=np.int32)
     got, expected = run_module(nn.Embed(num_embeddings=10, features=8), idx)
@@ -365,10 +360,6 @@ section("Softmax classifier", test_softmax_classifier)
 def test_attention():
     print("10. Multi-head self-attention")
     print("-" * 40)
-    # Known issue: numerical mismatch (~2.5 absolute) under MetalHLO.
-    # MHA lowers to dot_general with multiple batch + contracting dims plus
-    # softmax along sequence axis; one of those paths is producing wrong
-    # values. Likely a bug in dot_general dim handling for high-rank inputs.
     np.random.seed(9)
     x = np.random.randn(2, 6, 16).astype(np.float32)
     mha = nn.MultiHeadDotProductAttention(num_heads=4, qkv_features=16, deterministic=True)
@@ -382,7 +373,6 @@ section("MHA", test_attention)
 def test_transformer_block():
     print("11. Transformer encoder block")
     print("-" * 40)
-    # Known issue: fails by ~2.0 abs because it composes MHA (see test 10).
 
     class EncoderBlock(nn.Module):
         d_model: int
