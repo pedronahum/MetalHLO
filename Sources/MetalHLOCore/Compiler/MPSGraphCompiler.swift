@@ -1198,7 +1198,7 @@ public final class MPSGraphCompiler {
     }
 
     private func compilePad(_ op: HLOOperation) throws -> MPSGraphTensor {
-        let input = try getOperand(op.operands[0])
+        var input = try getOperand(op.operands[0])
         let padValueOperand = op.operands[1]
 
         // Look up the padding value from tracked scalar constants
@@ -1206,6 +1206,36 @@ public final class MPSGraphCompiler {
 
         let low = op.attributes.padLow ?? []
         let high = op.attributes.padHigh ?? []
+        let interior = op.attributes.padInterior ?? []
+
+        // StableHLO pad has three components per dimension: low, high, and
+        // interior. interior[d] = N inserts N zeros between every adjacent
+        // pair of elements along dim d. MPSGraph's padTensor only handles
+        // the edge-padding (low/high) component, so we materialize the
+        // interior padding first by interleaving zeros, then edge-pad.
+        // This path is hit by conv / avg_pool gradients, which emit
+        // pad with interior > 0 to undo the stride.
+        if !interior.isEmpty && interior.contains(where: { $0 > 0 }) {
+            // Use applyBaseDilation for the 4D NHWC case (the common one
+            // for conv/pool grads — interior on the spatial dims).
+            if interior.count == 4 && interior[0] == 0 && interior[3] == 0 {
+                let dY = interior[1] + 1  // dilation factor = interior + 1
+                let dX = interior[2] + 1
+                if dY > 1 || dX > 1 {
+                    input = try applyBaseDilation(
+                        input,
+                        dilationY: dY,
+                        dilationX: dX,
+                        name: "\(op.result)_interior",
+                    )
+                }
+            } else {
+                throw CompilationError.unsupportedOperation(
+                    "stablehlo.pad with interior padding on non-spatial dims "
+                    + "(or non-4D layout) is not yet supported. interior=\(interior)"
+                )
+            }
+        }
 
         // Create padding mode - constant padding
         var leftPadding: [NSNumber] = []
@@ -2794,12 +2824,20 @@ public final class MPSGraphCompiler {
     private func compileReduceWindow(_ op: HLOOperation) throws -> MPSGraphTensor {
         let input = try getOperand(op.operands[0])
 
-        // Get window parameters - assume NHWC layout
+        // Get window parameters - assume NHWC layout. Per the StableHLO spec,
+        // window_strides defaults to all ones when omitted, NOT to
+        // window_dimensions — the avg_pool gradient (a pad + reduce_window
+        // with stride-1) emits exactly that case, and defaulting strides to
+        // [1,2,2,1] makes the output shape (and the value passed downstream)
+        // wrong. Same for the dilations.
         let windowDims = op.attributes.windowDimensions ?? [1, 2, 2, 1]
-        let strides = op.attributes.windowStrides ?? [1, 2, 2, 1]
+        let strides = op.attributes.windowStrides
+            ?? Array(repeating: 1, count: windowDims.count)
         let padding = op.attributes.convPadding ?? []
-        let windowDilations = op.attributes.windowDilations ?? [1, 1, 1, 1]
-        let baseDilations = op.attributes.baseDilations ?? [1, 1, 1, 1]
+        let windowDilations = op.attributes.windowDilations
+            ?? Array(repeating: 1, count: windowDims.count)
+        let baseDilations = op.attributes.baseDilations
+            ?? Array(repeating: 1, count: windowDims.count)
 
         // Extract spatial dimensions (assuming NHWC: indices 1 and 2)
         let kernelHeight = windowDims.count > 1 ? windowDims[1] : windowDims[0]

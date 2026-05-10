@@ -377,9 +377,11 @@ public final class Parser {
         // expressed as an inline region (Flax avg_pool / max_pool emit this).
         if (kind == .scatter || kind == .selectAndScatter || kind == .reduceWindow)
             && check(.leftParen) {
-            // Skip the region: ({...})
+            // Skip one or more inline regions: ({...}) or ({...}, {...}).
+            // select_and_scatter has TWO regions (select predicate + scatter
+            // combiner) separated by `,`; the others have one.
             try expect(.leftParen)
-            if check(.leftBrace) {
+            while check(.leftBrace) {
                 var depth = 1
                 advance() // skip {
                 while depth > 0 && !check(.eof) {
@@ -402,6 +404,9 @@ public final class Parser {
                     }
                     advance()
                 }
+                // After consuming this region, optionally skip a comma to
+                // pick up the next region for select_and_scatter.
+                _ = match(.comma)
             }
             try expect(.rightParen)
         }
