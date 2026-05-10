@@ -294,15 +294,20 @@ section("Mini-ResNet eval", test_miniresnet_eval_forward)
 # ─── 2b. Mini-CNN (LeNet-style, no BatchNorm) ────────────────────────
 
 class MiniCNN(nn.Module):
-    """Conv → ReLU → AvgPool → Dense classifier. Single conv keeps the
-       backward path tractable; deeper conv stacks expose a separate
-       Conv-grad layout bug (dim_numbers [f,0,1,b]x[i,0,1,o]->[0,1,b,f])
-       worth chasing on its own."""
+    """Two-conv classifier: Conv → ReLU → AvgPool → Conv → ReLU →
+       AvgPool → Dense. Compiles end-to-end (the previous shape mismatch
+       in the conv-grad output transpose is fixed). Step-0 loss matches
+       CPU exactly; later-step drift is from a separate conv-grad
+       value-correctness bug under MPSGraph that doesn't reproduce
+       outside the full training-step program — flagged for follow-up."""
     num_classes: int = 4
 
     @nn.compact
     def __call__(self, x):
         x = nn.Conv(8, kernel_size=(3, 3), padding="SAME")(x)
+        x = nn.relu(x)
+        x = nn.avg_pool(x, window_shape=(2, 2), strides=(2, 2))
+        x = nn.Conv(16, kernel_size=(3, 3), padding="SAME")(x)
         x = nn.relu(x)
         x = nn.avg_pool(x, window_shape=(2, 2), strides=(2, 2))
         x = x.reshape((x.shape[0], -1))

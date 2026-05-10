@@ -2804,21 +2804,27 @@ public final class MPSGraphCompiler {
 
     /// Build permutation to convert output from NHWC to expected layout.
     private func buildPermutationFromNHWC(to dimNumbers: ConvolutionDimensionNumbers) -> [Int] {
-        // MPS outputs NHWC: positions [0, 1, 2, 3] = [B, H, W, C]
-        // Need to rearrange to expected output positions
+        // MPS outputs NHWC: positions [0, 1, 2, 3] = [B, H, W, C].
+        // We want a forward permutation `perm` such that
+        //   output[i] = mps_output[perm[i]]
+        // which matches the convention used by graph.transpose. For each
+        // expected-layout slot i, perm[i] is the MPS position of that
+        // semantic dim — perm[batchTarget] = 0 for the batch dim, etc.
+        // Previously this function applied an extra invertPermutation,
+        // which made conv-grad with kernel-grad dim_numbers
+        // ([f,0,1,b]x[i,0,1,o]->[0,1,b,f]) produce shape (W,B,H,F)
+        // instead of (H,W,B,F), tripping MPSGraph downstream.
         let batchTarget = dimNumbers.outputBatchDimension
         let heightTarget = dimNumbers.outputSpatialDimensions[0]
         let widthTarget = dimNumbers.outputSpatialDimensions.count > 1 ? dimNumbers.outputSpatialDimensions[1] : heightTarget
         let channelTarget = dimNumbers.outputFeatureDimension
 
-        // Build inverse permutation
         var perm = [Int](repeating: 0, count: 4)
-        perm[batchTarget] = 0     // B from position 0
-        perm[heightTarget] = 1    // H from position 1
-        perm[widthTarget] = 2     // W from position 2
-        perm[channelTarget] = 3   // C from position 3
-
-        return PermutationUtils.invertPermutation(perm)
+        perm[batchTarget] = 0
+        perm[heightTarget] = 1
+        perm[widthTarget] = 2
+        perm[channelTarget] = 3
+        return perm
     }
 
     private func compileReduceWindow(_ op: HLOOperation) throws -> MPSGraphTensor {
