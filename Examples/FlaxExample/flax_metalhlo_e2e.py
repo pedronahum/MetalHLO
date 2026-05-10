@@ -282,13 +282,70 @@ def test_miniresnet_eval_forward():
         variables_m, jax.device_put(jnp.asarray(x_data), device), train=False
     )
     check_tree("resnet_eval_forward", out_m, out_c, rtol=1e-3, atol=1e-3)
-    # Training-mode BN + grad currently crashes inside MPSGraph with an
-    # mps.select shape mismatch (i1 mask of activation shape vs an op
-    # somehow shaped like a Conv kernel). Skipped here pending a separate
-    # investigation — see flax_metalhlo_layers.py for inference-only BN.
 
 
 section("Mini-ResNet eval", test_miniresnet_eval_forward)
+
+
+def test_miniresnet_train_step():
+    print("2c. Mini-ResNet — train-mode forward + 1 grad/optim step")
+    print("-" * 40)
+    # BN-training + grad path: the conv-grad output-permutation fix
+    # incidentally unblocked this; previously it crashed inside MPSGraph
+    # with an mps.select shape mismatch.
+    np.random.seed(11)
+    batch = 4
+    H = W = 8
+    C = 3
+    num_classes = 4
+    x_data = np.random.randn(batch, H, W, C).astype(np.float32)
+    labels = np.random.randint(0, num_classes, size=(batch,)).astype(np.int32)
+    onehot = np.eye(num_classes, dtype=np.float32)[labels]
+
+    model = MiniResNet(num_classes=num_classes)
+
+    def loss_fn(params, batch_stats, x, y):
+        logits, new_state = model.apply(
+            {"params": params, "batch_stats": batch_stats},
+            x, train=True, mutable=["batch_stats"],
+        )
+        log_probs = jax.nn.log_softmax(logits, axis=-1)
+        return -jnp.mean(jnp.sum(y * log_probs, axis=-1)), new_state["batch_stats"]
+
+    optimizer = optax.adam(learning_rate=1e-2)
+
+    @jax.jit
+    def step(params, batch_stats, opt_state, x, y):
+        (loss, new_bs), grads = jax.value_and_grad(loss_fn, has_aux=True)(
+            params, batch_stats, x, y
+        )
+        updates, opt_state = optimizer.update(grads, opt_state, params)
+        return optax.apply_updates(params, updates), new_bs, opt_state, loss
+
+    with jax.default_device(cpu):
+        variables = model.init(jax.random.PRNGKey(11), jnp.asarray(x_data), train=False)
+        params_c, bs_c = variables["params"], variables["batch_stats"]
+        opt_c = optimizer.init(params_c)
+        params_c, bs_c, opt_c, loss_c = step(
+            params_c, bs_c, opt_c, jnp.asarray(x_data), jnp.asarray(onehot)
+        )
+
+    variables_m = to_device(variables, device)
+    params_m, bs_m = variables_m["params"], variables_m["batch_stats"]
+    opt_m = optimizer.init(params_m)
+    params_m, bs_m, opt_m, loss_m = step(
+        params_m, bs_m, opt_m,
+        jax.device_put(jnp.asarray(x_data), device),
+        jax.device_put(jnp.asarray(onehot), device),
+    )
+    check_scalar("resnet_train_step_loss", loss_m, loss_c, rtol=2e-3, atol=2e-3)
+    # Loose tolerance to leave room for the conv-grad-in-full-program
+    # value drift that affects multi-conv training (Mini-CNN test 2b).
+    check_tree("resnet_train_step_params", params_m, params_c, rtol=2e-1, atol=2e-1)
+    check_tree("resnet_train_step_batchstats", bs_m, bs_c, rtol=2e-1, atol=2e-1)
+
+
+section("Mini-ResNet train", test_miniresnet_train_step)
 
 
 # ─── 2b. Mini-CNN (LeNet-style, no BatchNorm) ────────────────────────
