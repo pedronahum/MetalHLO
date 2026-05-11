@@ -202,6 +202,20 @@ public final class MetalHLOCompiler: @unchecked Sendable {
         // STAGE 3: OPTIMIZE
         // ═══════════════════════════════════════════════════════════════
         let optimized = optimize(module, analysis: analysis)
+        if let dumpPath = ProcessInfo.processInfo.environment["METALHLO_DUMP_OPTIMIZED"] {
+            // Diagnostic: dump the optimized fused-op IR (post-passes, pre-codegen)
+            // so traces can be diffed across programs to locate where two
+            // related programs diverge in their build sequence.
+            let header = "// optimized IR — \(optimized.operations.count) fused ops\n"
+            var body = ""
+            for op in optimized.operations {
+                let outs = op.outputs.map { $0.id }.joined(separator: ",")
+                let ins = op.inputs.joined(separator: ",")
+                body += "\(outs) = \(op.type) inputs=[\(ins)]\n"
+            }
+            let path = "\(dumpPath)/optimized_\(optimized.operations.count)_\(ProcessInfo.processInfo.systemUptime).txt"
+            try? (header + body).write(toFile: path, atomically: true, encoding: .utf8)
+        }
 
         // ═══════════════════════════════════════════════════════════════
         // STAGE 4: PLAN MEMORY
