@@ -339,10 +339,12 @@ def test_miniresnet_train_step():
         jax.device_put(jnp.asarray(onehot), device),
     )
     check_scalar("resnet_train_step_loss", loss_m, loss_c, rtol=2e-3, atol=2e-3)
-    # Loose tolerance to leave room for the conv-grad-in-full-program
-    # value drift that affects multi-conv training (Mini-CNN test 2b).
-    check_tree("resnet_train_step_params", params_m, params_c, rtol=2e-1, atol=2e-1)
-    check_tree("resnet_train_step_batchstats", bs_m, bs_c, rtol=2e-1, atol=2e-1)
+    # Routing conv-grads through MPSGraph's dedicated grad APIs (instead
+    # of `convolution2D` with permuted dim-numbers) tightened these from
+    # 2e-1 to ~7e-8. Hold them at 1e-6 going forward — anything larger
+    # is a real regression now.
+    check_tree("resnet_train_step_params", params_m, params_c, rtol=1e-6, atol=1e-6)
+    check_tree("resnet_train_step_batchstats", bs_m, bs_c, rtol=1e-6, atol=1e-6)
 
 
 section("Mini-ResNet train", test_miniresnet_train_step)

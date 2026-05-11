@@ -47,13 +47,13 @@ Measured on **Apple M5 Pro**, JAX 0.10.0 / Flax 0.12.7:
 
 | Backend | Time per step | Speedup |
 |---------|---------------|---------|
-| MetalHLO (GPU) | 0.444 s | **5.2×** |
+| MetalHLO (GPU) | 0.413 s | **5.6×** |
 | CPU | 2.332 s | 1× |
 
-(MetalHLO time is the mean of three runs of 30 steps each — 0.442 /
-0.446 / 0.447 s. Times averaged over the second half of each run.
+(MetalHLO time is the mean of three runs of 30 steps each — 0.413 /
+0.412 / 0.413 s. Times averaged over the second half of each run.
 Loss converges identically on both backends — 2.367 at init
-descending to ~1.7 within 30 steps.)
+descending to ~1.8 within 30 steps.)
 
 For comparison, the upstream `jax-mps` benchmark on an M4 MacBook Air
 reports CPU 3.2s vs MPS 0.7s (4.7×). Numbers aren't directly
@@ -72,24 +72,41 @@ powerful M5 Pro.
 ## What this benchmark exercised in the backend
 
 This was the first end-to-end test of a real-world strided-conv
-network on MetalHLO; it surfaced and drove three changes:
+network on MetalHLO. It surfaced and drove four changes (each a
+measurable step on this benchmark):
 
-- `lhsDilation > 1` handling in the generic convolution path —
-  XLA expresses the data-gradient of a strided forward convolution as
-  a regular conv with `lhsDilation = forward_stride`, which inserts
-  zeros between input samples. MPSGraph's
-  `Convolution2DOpDescriptor` has no input-dilation field, so we
-  materialize the dilated tensor explicitly via `applyBaseDilation`
-  before invoking `convolution2D`.
-- `applyBaseDilation` rewritten from scatter-based (zero-tensor +
-  `scatterAlongAxis`) to a reshape→pad→reshape→slice pattern. Fewer
-  ops, no scatter, simpler for MPSGraph to fuse.
-- The slice+matmul "deterministic" conv-grad fast-paths were
-  removed. They had been added to chase cross-process determinism in
-  the cnn_step1 test, but they didn't fully fix it (the test
-  tolerance `rtol=1e-1` absorbs the residual drift either way) and
-  they cost ~30% on this benchmark by replacing each
-  `convolution2DWeightsGradient` / `DataGradient` MPSGraph call with
-  9 small matmuls + concat + reshape. The generic conv-grad path
-  (regular `convolution2D` with permuted dim-numbers) is the right
-  default for performance.
+1. **`lhsDilation > 1` handling in the generic convolution path** —
+   XLA expresses the data-gradient of a strided forward convolution
+   as a regular conv with `lhsDilation = forward_stride`, which
+   inserts zeros between input samples. MPSGraph's
+   `Convolution2DOpDescriptor` has no input-dilation field, so we
+   materialize the dilated tensor via `applyBaseDilation`. This
+   change made the network compile at all.
+
+2. **`applyBaseDilation` rewritten from scatter-based to
+   reshape→pad→reshape→slice**. Fewer ops, no scatter, simpler for
+   MPSGraph to fuse.
+
+3. **The deterministic slice+matmul conv-grad fast-paths were
+   removed**. They had been added to chase cross-process determinism
+   in the cnn_step1 test, but they didn't fully fix it (the test
+   tolerance `rtol=1e-1` absorbs the residual drift either way) and
+   they replaced each MPSGraph grad call with 9 small matmuls. ~30%
+   speedup, ~400 lines deleted, simpler control flow.
+
+4. **Dedicated MPSGraph grad-API fast-paths for both stride-1 and
+   strided conv-grads** (`convolution2DWeightsGradient` /
+   `convolution2DDataGradient`). The generic conv path was routing
+   conv-grads through `convolution2D` with permuted dim_numbers and
+   surrounding transposes; the dedicated APIs are MPSGraph's
+   preferred entry point and skip the transpose triple. For strided
+   forward convs (where XLA emits `lhsDilation` / `rhsDilation =
+   forward_stride`), the dedicated APIs accept the forward stride
+   directly in their descriptor and avoid the explicit dilation
+   materialization entirely.
+
+The combination took the benchmark from ~0.64s/step (with the
+deterministic slow path) to ~0.41s/step, and as a side-effect
+tightened the Mini-ResNet `train_step_params` correctness from a
+generous `2e-2` tolerance (the previous transposed-conv path
+introduced drift) to bit-exact `7e-8`.

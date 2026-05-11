@@ -2523,6 +2523,174 @@ public final class MPSGraphCompiler {
         return graph.reverse(input, axes: axes.map { NSNumber(value: $0) }, name: op.result)
     }
 
+    /// XLA's filter-grad form of `stablehlo.convolution` — when matched,
+    /// dispatch to MPSGraph's dedicated `convolution2DWeightsGradient` API
+    /// instead of the generic `convolution2D` with permuted dim numbers and
+    /// surrounding transposes. The dedicated grad API is MPSGraph's
+    /// preferred entry point for this exact shape, and skipping the
+    /// permutation + transpose triple saves significant per-op overhead
+    /// on conv-heavy backprop (e.g. ResNet18). Returns nil when the op
+    /// isn't a recognized filter-grad layout.
+    private func tryDispatchFilterGrad(
+        op: HLOOperation,
+        input: MPSGraphTensor,
+        weights: MPSGraphTensor,
+        dimNumbers: ConvolutionDimensionNumbers,
+        strides: [Int],
+        lhsDilation: [Int],
+        rhsDilation: [Int],
+        featureGroups: Int,
+        padTop: Int, padBottom: Int,
+        padLeft: Int, padRight: Int
+    ) throws -> MPSGraphTensor? {
+        // Exact dim_number signature of XLA filter-grad-as-conv:
+        //   X (operand[0]) is physically NHWC
+        //   dY (operand[1]) is physically NHWC
+        //   result is physically HWIO
+        let isFilterGrad =
+            dimNumbers.inputBatchDimension == 3 &&
+            dimNumbers.inputFeatureDimension == 0 &&
+            dimNumbers.inputSpatialDimensions == [1, 2] &&
+            dimNumbers.kernelInputFeatureDimension == 0 &&
+            dimNumbers.kernelOutputFeatureDimension == 3 &&
+            dimNumbers.kernelSpatialDimensions == [1, 2] &&
+            dimNumbers.outputSpatialDimensions == [0, 1] &&
+            dimNumbers.outputBatchDimension == 2 &&
+            dimNumbers.outputFeatureDimension == 3
+        guard isFilterGrad else { return nil }
+
+        // The grad API takes the forward conv's descriptor. In the
+        // filter-grad form:
+        //   - `strides` of the grad op corresponds to forward lhsDilation
+        //     (typically [1,1])
+        //   - `rhsDilation` of the grad op encodes the forward STRIDE
+        //     (`rhsDilation = forward_stride`, the dY-as-kernel dilation
+        //     when the forward conv strided over X). So strideY/X for
+        //     `convolution2DWeightsGradient`'s forward descriptor =
+        //     rhsDilation.
+        // We bail on unsupported asymmetries (feature groups, lhs dilation
+        // on the grad op itself, non-unit grad strides).
+        guard featureGroups == 1,
+              lhsDilation == [1, 1] || lhsDilation.isEmpty,
+              strides.allSatisfy({ $0 == 1 }) else {
+            return nil
+        }
+        let fwdStrideY = rhsDilation.count > 0 ? rhsDilation[0] : 1
+        let fwdStrideX = rhsDilation.count > 1 ? rhsDilation[1] : fwdStrideY
+
+        let outShape = op.resultType.shape  // [Hk, Wk, Ci, Co]
+        let descriptor = MPSGraphConvolution2DOpDescriptor(
+            strideInX: fwdStrideX,
+            strideInY: fwdStrideY,
+            dilationRateInX: 1,
+            dilationRateInY: 1,
+            groups: 1,
+            paddingLeft: padLeft,
+            paddingRight: padRight,
+            paddingTop: padTop,
+            paddingBottom: padBottom,
+            paddingStyle: .explicit,
+            dataLayout: .NHWC,
+            weightsLayout: .HWIO
+        )!
+        return graph.convolution2DWeightsGradient(
+            weights,                                    // incoming grad (dY)
+            source: input,                              // forward activation (X)
+            outputShape: outShape.map { NSNumber(value: $0) },
+            forwardConvolutionDescriptor: descriptor,
+            name: op.result
+        )
+    }
+
+    /// XLA's data-grad (input-grad) form of `stablehlo.convolution` — when
+    /// matched, dispatch to MPSGraph's `convolution2DDataGradient`. Same
+    /// motivation as the filter-grad helper above.
+    ///
+    /// Note: operand[1] of the stablehlo data-grad is physically HWIO but
+    /// **spatially reversed** (XLA pre-emits `reverse(W)` so the conv math
+    /// equals dX). `convolution2DDataGradient` expects the un-reversed
+    /// forward W and does the spatial flip internally, so we apply
+    /// `graph.reverse` along the spatial axes.
+    private func tryDispatchDataGrad(
+        op: HLOOperation,
+        input: MPSGraphTensor,
+        weights: MPSGraphTensor,
+        dimNumbers: ConvolutionDimensionNumbers,
+        strides: [Int],
+        lhsDilation: [Int],
+        rhsDilation: [Int],
+        featureGroups: Int,
+        padTop: Int, padBottom: Int,
+        padLeft: Int, padRight: Int
+    ) throws -> MPSGraphTensor? {
+        let isDataGrad =
+            dimNumbers.inputBatchDimension == 0 &&
+            dimNumbers.inputFeatureDimension == 3 &&
+            dimNumbers.inputSpatialDimensions == [1, 2] &&
+            dimNumbers.kernelInputFeatureDimension == 3 &&
+            dimNumbers.kernelOutputFeatureDimension == 2 &&
+            dimNumbers.kernelSpatialDimensions == [0, 1] &&
+            dimNumbers.outputBatchDimension == 0 &&
+            dimNumbers.outputFeatureDimension == 3 &&
+            dimNumbers.outputSpatialDimensions == [1, 2]
+        guard isDataGrad else { return nil }
+        // For data-grad: `lhsDilation` of the grad op encodes the forward
+        // STRIDE (dY zero-interleaved before the conv). `rhsDilation`
+        // would encode kernel dilation, which we don't see in practice
+        // for ResNet-style backprop. Bail on grouped or non-trivial
+        // rhsDilation or non-unit grad strides.
+        guard featureGroups == 1,
+              rhsDilation == [1, 1] || rhsDilation.isEmpty,
+              strides.allSatisfy({ $0 == 1 }) else {
+            return nil
+        }
+        let fwdStrideY = lhsDilation.count > 0 ? lhsDilation[0] : 1
+        let fwdStrideX = lhsDilation.count > 1 ? lhsDilation[1] : fwdStrideY
+
+        // Recover the kernel size to compute forward padding.
+        guard let weightsShape = weights.shape, weightsShape.count == 4 else { return nil }
+        let kH = weightsShape[0].intValue
+        let kW = weightsShape[1].intValue
+        // For stride-1 forward, fwd_pad = K - 1 - grad_pad. For stride-S
+        // forward, the relationship is more complex (the grad's padding
+        // already accounts for the stride). Bail if we can't recover a
+        // valid forward padding and fall through to the generic path,
+        // which handles dilation explicitly.
+        let fwdPadTop = kH - 1 - padTop
+        let fwdPadBottom = kH - 1 - padBottom
+        let fwdPadLeft = kW - 1 - padLeft
+        let fwdPadRight = kW - 1 - padRight
+        guard fwdPadTop >= 0, fwdPadBottom >= 0, fwdPadLeft >= 0, fwdPadRight >= 0 else {
+            return nil
+        }
+        let outShape = op.resultType.shape  // dX shape, NHWC
+        let weightsForward = graph.reverse(
+            weights,
+            axes: [NSNumber(value: 0), NSNumber(value: 1)],
+            name: nil
+        )
+        let descriptor = MPSGraphConvolution2DOpDescriptor(
+            strideInX: fwdStrideX,
+            strideInY: fwdStrideY,
+            dilationRateInX: 1,
+            dilationRateInY: 1,
+            groups: 1,
+            paddingLeft: fwdPadLeft,
+            paddingRight: fwdPadRight,
+            paddingTop: fwdPadTop,
+            paddingBottom: fwdPadBottom,
+            paddingStyle: .explicit,
+            dataLayout: .NHWC,
+            weightsLayout: .HWIO
+        )!
+        return graph.convolution2DDataGradient(
+            input,                                          // incoming grad (dY)
+            weights: weightsForward,                        // forward W in HWIO
+            outputShape: outShape.map { NSNumber(value: $0) },
+            forwardConvolutionDescriptor: descriptor,
+            name: op.result
+        )
+    }
 
     private func compileConvolution(_ op: HLOOperation) throws -> MPSGraphTensor {
         // Check input type - convolution requires floating-point types
@@ -2556,6 +2724,30 @@ public final class MPSGraphCompiler {
 
         // Determine data layout from dimension numbers
         let dimNumbers = op.attributes.convolutionDimensionNumbers
+
+        // For stride-1 forward backprop, dispatch directly to MPSGraph's
+        // dedicated conv-grad APIs. Skips a transposeIn + permuted
+        // convolution2D + transposeOut triple that the generic path
+        // would otherwise emit, which is meaningful on conv-heavy
+        // backprop (e.g. ResNet18 has 17 conv-grad pairs).
+        if let dN = dimNumbers {
+            if let result = try tryDispatchFilterGrad(
+                op: op, input: input, weights: weights, dimNumbers: dN,
+                strides: strides, lhsDilation: lhsDilation, rhsDilation: rhsDilation,
+                featureGroups: featureGroups,
+                padTop: padTop, padBottom: padBottom,
+                padLeft: padLeft, padRight: padRight) {
+                return result
+            }
+            if let result = try tryDispatchDataGrad(
+                op: op, input: input, weights: weights, dimNumbers: dN,
+                strides: strides, lhsDilation: lhsDilation, rhsDilation: rhsDilation,
+                featureGroups: featureGroups,
+                padTop: padTop, padBottom: padBottom,
+                padLeft: padLeft, padRight: padRight) {
+                return result
+            }
+        }
 
         let (dataLayout, weightsLayout, needsTranspose) = determineConvLayoutsFromDimNumbers(dimNumbers)
 
