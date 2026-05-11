@@ -2544,6 +2544,7 @@ public final class MPSGraphCompiler {
         weights: MPSGraphTensor,
         dimNumbers: ConvolutionDimensionNumbers,
         strides: [Int],
+        lhsDilation: [Int],
         rhsDilation: [Int],
         featureGroups: Int,
         padTop: Int, padBottom: Int,
@@ -2564,7 +2565,13 @@ public final class MPSGraphCompiler {
 
         // Bail out on grouped/dilated/strided filter-grad — those have
         // additional semantics our slice+matmul lowering doesn't handle.
+        // lhsDilation > 1 in the grad-as-conv encodes a forward stride > 1
+        // (XLA dilates X by inserting zeros to express transposed conv);
+        // for those we'd need to slice the dilated tensor with strides,
+        // not consecutively. rhsDilation > 1 similarly encodes a different
+        // sub-pattern of the forward stride. Either way, fall through.
         guard featureGroups == 1,
+              lhsDilation == [1, 1] || lhsDilation.isEmpty,
               rhsDilation == [1, 1] || rhsDilation.isEmpty,
               strides.allSatisfy({ $0 == 1 }) else {
             return nil
@@ -2729,6 +2736,7 @@ public final class MPSGraphCompiler {
         weights: MPSGraphTensor,
         dimNumbers: ConvolutionDimensionNumbers,
         strides: [Int],
+        lhsDilation: [Int],
         rhsDilation: [Int],
         featureGroups: Int,
         padTop: Int, padBottom: Int,
@@ -2746,11 +2754,17 @@ public final class MPSGraphCompiler {
             dimNumbers.outputSpatialDimensions == [1, 2]
         guard isDataGrad else { return nil }
 
-        guard featureGroups == 1, rhsDilation == [1, 1] || rhsDilation.isEmpty else {
+        // Reject grouped, strided, or dilated forward — for stride > 1 the
+        // forward was strided and XLA expresses data-grad with
+        // lhsDilation > 1 to insert zeros between dY samples. Our
+        // slice+matmul lowering reads dY consecutively and would compute
+        // the wrong dX.
+        guard featureGroups == 1,
+              lhsDilation == [1, 1] || lhsDilation.isEmpty,
+              rhsDilation == [1, 1] || rhsDilation.isEmpty,
+              strides.allSatisfy({ $0 == 1 }) else {
             return nil
         }
-        // Restrict to stride 1 for now (the avg_pool/conv backward case).
-        guard strides.allSatisfy({ $0 == 1 }) else { return nil }
 
         // Recover the weights shape so we can size the kernel.
         guard let weightsShape = weights.shape, weightsShape.count == 4 else {
@@ -2910,7 +2924,7 @@ public final class MPSGraphCompiler {
 
         // Get convolution parameters
         let strides = op.attributes.windowStrides ?? [1, 1]
-        _ = op.attributes.lhsDilation ?? [1, 1]  // Not used for basic 2D conv
+        let lhsDilation = op.attributes.lhsDilation ?? [1, 1]
         let rhsDilation = op.attributes.rhsDilation ?? [1, 1]
         let featureGroups = op.attributes.featureGroupCount ?? 1
 
@@ -2939,6 +2953,7 @@ public final class MPSGraphCompiler {
                weights: weights,
                dimNumbers: dN,
                strides: strides,
+               lhsDilation: lhsDilation,
                rhsDilation: rhsDilation,
                featureGroups: featureGroups,
                padTop: padTop, padBottom: padBottom,
@@ -2957,6 +2972,7 @@ public final class MPSGraphCompiler {
                weights: weights,
                dimNumbers: dN,
                strides: strides,
+               lhsDilation: lhsDilation,
                rhsDilation: rhsDilation,
                featureGroups: featureGroups,
                padTop: padTop, padBottom: padBottom,
@@ -2977,6 +2993,24 @@ public final class MPSGraphCompiler {
                 targetDataLayout: dataLayout,
                 targetWeightsLayout: weightsLayout,
                 name: op.result
+            )
+        }
+
+        // Apply lhsDilation by interleaving zeros between input elements
+        // along the spatial axes. XLA emits `lhsDilation > 1` to express
+        // data-grad of strided forward convolutions (transposed conv) — the
+        // input dY is conceptually "stretched" by inserting zeros between
+        // samples before the regular conv runs. MPSGraph's
+        // Convolution2DOpDescriptor has no input-dilation field, so we
+        // materialize the dilated tensor explicitly.
+        let lhsDilY = lhsDilation.count > 0 ? lhsDilation[0] : 1
+        let lhsDilX = lhsDilation.count > 1 ? lhsDilation[1] : 1
+        if lhsDilY > 1 || lhsDilX > 1 {
+            processedInput = try applyBaseDilation(
+                processedInput,
+                dilationY: lhsDilY,
+                dilationX: lhsDilX,
+                name: "\(op.result)_lhs_dil"
             )
         }
 
