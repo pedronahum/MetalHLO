@@ -3232,7 +3232,14 @@ public final class CodeGenerator: @unchecked Sendable {
                     transB: transB
                 )
             }
-            if !transA && !transB {
+            // The simdgroup_matrix kernel uses a 32×32 output tile (4 simdgroups,
+            // each computing 8×32). For M<32 or N<32, multiple simdgroups end up
+            // outside the valid output region and race-write to clamped offsets
+            // — produces silently wrong values when feeding into downstream ops.
+            // Concretely surfaced as the einsum→transpose→dot_general chain in
+            // multi-head attention with d_model=8 (BERT-shape MHA). Gate on
+            // M >= 32 AND N >= 32 so that all 4 simdgroups have valid work.
+            if !transA && !transB && M >= 32 && N >= 32 {
                 return generateSimdgroupMatMulSource(batchSize: batchSize, metalType: metalType, elementType: elementType)
             }
             // Fall through to the basic kernel when MPP isn't available and
