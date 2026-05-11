@@ -2551,43 +2551,333 @@ public final class MPSGraphCompiler {
             dimNumbers.outputFeatureDimension == 3
         guard isFilterGrad else { return nil }
 
-        // Bail out on grouped/dilated filter-grad — those have additional
-        // semantics the WeightsGradient API may not handle correctly.
-        guard featureGroups == 1, rhsDilation == [1, 1] || rhsDilation.isEmpty else {
+        // Bail out on grouped/dilated/strided filter-grad — those have
+        // additional semantics our slice+matmul lowering doesn't handle.
+        guard featureGroups == 1,
+              rhsDilation == [1, 1] || rhsDilation.isEmpty,
+              strides.allSatisfy({ $0 == 1 }) else {
             return nil
         }
 
         // Filter-grad output shape is dW: [Hk, Wk, Ci, Co] in HWIO.
         let outShape = op.resultType.shape
 
-        // Build the forward conv descriptor — the inverse mapping of the grad.
-        // operand[0] X is physically NHWC, operand[1] dY is physically NHWC,
-        // result dW is physically HWIO. Use forward stride=1 (filter-grad form
-        // pre-emits any forward stride into the padded/dilated dY layout via
-        // earlier lhsDilation, which JAX handles outside this op).
-        let descriptor = MPSGraphConvolution2DOpDescriptor(
-            strideInX: strides.count > 1 ? strides[1] : strides[0],
-            strideInY: strides[0],
-            dilationRateInX: 1,
-            dilationRateInY: 1,
-            groups: 1,
-            paddingLeft: padLeft,
-            paddingRight: padRight,
-            paddingTop: padTop,
-            paddingBottom: padBottom,
-            paddingStyle: .explicit,
-            dataLayout: .NHWC,
-            weightsLayout: .HWIO
-        )!
-
-        let outShapeNS = outShape.map { NSNumber(value: $0) }
-        return graph.convolution2DWeightsGradient(
-            weights,                                    // incoming gradient (dY)
-            source: input,                              // forward activation (X)
-            outputShape: outShapeNS,
-            forwardConvolutionDescriptor: descriptor,
+        // Express filter-grad as pad + slice + matmul instead of calling
+        // MPSGraph's `convolution2DWeightsGradient`. The dedicated grad API
+        // exhibits cross-process non-determinism for small spatial dims
+        // (cnn_step1 drift); pad+slice+matmul lowers to deterministic
+        // primitives.
+        //
+        // Math:
+        //   dW[kh, kw, ci, co] = Σ_{n, ho, wo} Xp[n, ho+kh, wo+kw, ci] * dY[n, ho, wo, co]
+        // where Xp = pad(X, fwd_padding) — the same padding the forward
+        // conv applied to X. The grad op's `convPadding` attr carries
+        // these pad amounts directly (the grad-as-conv treats X as its
+        // "input" so its padding is the X-side padding).
+        //
+        // For each (kh, kw): slice Xp[:, kh:kh+Ho, kw:kw+Wo, :], reshape to
+        // [N*Ho*Wo, Ci]; reshape dY to [N*Ho*Wo, Co]; matmul X_slice^T @ dY
+        // → [Ci, Co]. Concat across (kh, kw), reshape to [Hk, Wk, Ci, Co].
+        let kH = outShape[0]   // Hk
+        let kW = outShape[1]   // Wk
+        let cI = outShape[2]
+        let cO = outShape[3]
+        // dY shape: [N, Ho, Wo, Co]
+        let dyShapeNS = weights.shape ?? []
+        guard dyShapeNS.count == 4 else { return nil }
+        let dN = dyShapeNS[0].intValue
+        let dHo = dyShapeNS[1].intValue
+        let dWo = dyShapeNS[2].intValue
+        let nhowo = dN * dHo * dWo
+        // Pad X spatially with zeros to match the forward conv's padding.
+        // padTop/padBottom/padLeft/padRight here came from `op.attributes.convPadding`
+        // (the grad-as-conv's padding, which equals the forward X-side padding).
+        let inputPadded: MPSGraphTensor
+        if padTop != 0 || padBottom != 0 || padLeft != 0 || padRight != 0 {
+            inputPadded = graph.padTensor(
+                input,
+                with: .constant,
+                leftPadding: [
+                    NSNumber(value: 0),
+                    NSNumber(value: padTop),
+                    NSNumber(value: padLeft),
+                    NSNumber(value: 0),
+                ],
+                rightPadding: [
+                    NSNumber(value: 0),
+                    NSNumber(value: padBottom),
+                    NSNumber(value: padRight),
+                    NSNumber(value: 0),
+                ],
+                constantValue: 0.0,
+                name: nil
+            )
+        } else {
+            inputPadded = input
+        }
+        // Reshape dY → [N*Ho*Wo, Co]
+        let dyFlat = graph.reshape(
+            weights,
+            shape: [NSNumber(value: nhowo), NSNumber(value: cO)],
+            name: nil
+        )
+        var perKernel: [MPSGraphTensor] = []
+        perKernel.reserveCapacity(kH * kW)
+        let stridesAll1 = Array(repeating: NSNumber(value: 1), count: 4)
+        for kh in 0..<kH {
+            for kw in 0..<kW {
+                // Xp[:, kh:kh+Ho, kw:kw+Wo, :]
+                let starts: [NSNumber] = [
+                    NSNumber(value: 0),
+                    NSNumber(value: kh),
+                    NSNumber(value: kw),
+                    NSNumber(value: 0),
+                ]
+                let ends: [NSNumber] = [
+                    NSNumber(value: dN),
+                    NSNumber(value: kh + dHo),
+                    NSNumber(value: kw + dWo),
+                    NSNumber(value: cI),
+                ]
+                let xSlice = graph.sliceTensor(
+                    inputPadded,
+                    starts: starts,
+                    ends: ends,
+                    strides: stridesAll1,
+                    name: nil
+                )
+                // Reshape to [N*Ho*Wo, Ci]
+                let xFlat = graph.reshape(
+                    xSlice,
+                    shape: [NSNumber(value: nhowo), NSNumber(value: cI)],
+                    name: nil
+                )
+                // dW_kh_kw = X^T @ dY  →  [Ci, Co]
+                let xT = graph.transpose(xFlat, permutation: [1, 0], name: nil)
+                let dWp = graph.matrixMultiplication(primary: xT, secondary: dyFlat, name: nil)
+                // Reshape to [1, 1, Ci, Co] for concat across kernel positions.
+                let dWp4 = graph.reshape(
+                    dWp,
+                    shape: [
+                        NSNumber(value: 1),
+                        NSNumber(value: 1),
+                        NSNumber(value: cI),
+                        NSNumber(value: cO),
+                    ],
+                    name: nil
+                )
+                perKernel.append(dWp4)
+            }
+        }
+        let cat = graph.concatTensors(perKernel, dimension: 0, name: nil)
+        let dW = graph.reshape(
+            cat,
+            shape: [
+                NSNumber(value: kH),
+                NSNumber(value: kW),
+                NSNumber(value: cI),
+                NSNumber(value: cO),
+            ],
             name: op.result
         )
+        return dW
+    }
+
+    /// Detects the XLA input-gradient (data-grad) form of `stablehlo.convolution`
+    /// and routes it to MPSGraph's dedicated `convolution2DDataGradient` API.
+    /// Returns the result tensor on success, or nil if the op isn't a
+    /// recognized data-grad form.
+    ///
+    /// Recognized form (the layout JAX/XLA emits for input-grad of an
+    /// NHWC/HWIO forward conv with SAME padding, stride 1):
+    ///   inputBatchDimension=0, inputFeatureDimension=3, inputSpatialDimensions=[1,2]
+    ///   kernelInputFeatureDimension=3, kernelOutputFeatureDimension=2, kernelSpatialDimensions=[0,1]
+    ///   outputBatchDimension=0, outputFeatureDimension=3, outputSpatialDimensions=[1,2]
+    ///
+    /// In this form:
+    ///   • operand[0] is the upstream gradient dY, physically NHWC
+    ///   • operand[1] is the forward weights **physically HWIO** but
+    ///     **spatially reversed** (XLA precomputes `reverse(W)` so the conv
+    ///     math equals the input gradient). The dim_numbers' channel labels
+    ///     match HWIO: input_feature=3 means "this conv's input channels are
+    ///     at dim 3" which is Co_forward — the contracted axis with dY.
+    ///   • result is dX, physically NHWC
+    ///
+    /// MPSGraph's `convolution2DDataGradient` takes the un-reversed forward W
+    /// in HWIO and does the spatial flip internally, so we un-flip operand[1]
+    /// via `graph.reverse` along spatial axes [0, 1].
+    ///
+    /// Padding: XLA emits grad_padding = (Kh-1 - fwd_padTop, ...) on each
+    /// side — i.e., grad's explicit padding compensates for the forward
+    /// padding when running as a regular conv. We recover the forward
+    /// padding as `fwd_pad = K - 1 - grad_pad`, which MPSGraph then uses to
+    /// re-derive the same dX.
+    private func compileConvolutionDataGradIfMatch(
+        op: HLOOperation,
+        input: MPSGraphTensor,
+        weights: MPSGraphTensor,
+        dimNumbers: ConvolutionDimensionNumbers,
+        strides: [Int],
+        rhsDilation: [Int],
+        featureGroups: Int,
+        padTop: Int, padBottom: Int,
+        padLeft: Int, padRight: Int
+    ) throws -> MPSGraphTensor? {
+        let isDataGrad =
+            dimNumbers.inputBatchDimension == 0 &&
+            dimNumbers.inputFeatureDimension == 3 &&
+            dimNumbers.inputSpatialDimensions == [1, 2] &&
+            dimNumbers.kernelInputFeatureDimension == 3 &&
+            dimNumbers.kernelOutputFeatureDimension == 2 &&
+            dimNumbers.kernelSpatialDimensions == [0, 1] &&
+            dimNumbers.outputBatchDimension == 0 &&
+            dimNumbers.outputFeatureDimension == 3 &&
+            dimNumbers.outputSpatialDimensions == [1, 2]
+        guard isDataGrad else { return nil }
+
+        guard featureGroups == 1, rhsDilation == [1, 1] || rhsDilation.isEmpty else {
+            return nil
+        }
+        // Restrict to stride 1 for now (the avg_pool/conv backward case).
+        guard strides.allSatisfy({ $0 == 1 }) else { return nil }
+
+        // Recover the weights shape so we can size the kernel.
+        guard let weightsShape = weights.shape, weightsShape.count == 4 else {
+            return nil
+        }
+        let kH = weightsShape[0].intValue
+        let kW = weightsShape[1].intValue
+
+        // dX shape (NHWC): result of the grad op = [N, Hi, Wi, Ci]
+        let outShape = op.resultType.shape
+        let dN = outShape[0]
+        let dHi = outShape[1]
+        let dWi = outShape[2]
+        let cI = outShape[3]
+        // dY shape (NHWC): operand[0] = [N, Ho, Wo, Co]
+        let dyShape = input.shape ?? []
+        guard dyShape.count == 4 else { return nil }
+        let cO = dyShape[3].intValue
+        let nhwi = dN * dHi * dWi
+
+        // Express data-grad as pad(dY) + 9 matmuls + sum, instead of calling
+        // MPSGraph's `convolution2DDataGradient`. Same motivation as
+        // filter-grad: the dedicated grad API is process-non-deterministic
+        // for small spatial dims; pad+slice+matmul lowers to deterministic
+        // primitives.
+        //
+        // Math (with operand[1] = W' = reverse(W), the form XLA emits):
+        //   dX[n, h, w, ci] = Σ_{kh, kw, co} dYp[n, h+kh, w+kw, co] * W'[kh, kw, ci, co]
+        // where dYp = pad(dY, grad_padding) — the grad op's `convPadding`
+        // gives exactly the dY-side padding for this conv.
+        //
+        // For each (kh, kw):
+        //   slice dYp[:, kh:kh+Hi, kw:kw+Wi, :] → [N, Hi, Wi, Co]
+        //   reshape → [N*Hi*Wi, Co]
+        //   slice W'[kh, kw, :, :] → [Ci, Co], transpose → [Co, Ci]
+        //   matmul → [N*Hi*Wi, Ci]
+        // Sum over (kh, kw), reshape to [N, Hi, Wi, Ci].
+
+        // Pad dY spatially.
+        let dyPadded: MPSGraphTensor
+        if padTop != 0 || padBottom != 0 || padLeft != 0 || padRight != 0 {
+            dyPadded = graph.padTensor(
+                input,
+                with: .constant,
+                leftPadding: [
+                    NSNumber(value: 0),
+                    NSNumber(value: padTop),
+                    NSNumber(value: padLeft),
+                    NSNumber(value: 0),
+                ],
+                rightPadding: [
+                    NSNumber(value: 0),
+                    NSNumber(value: padBottom),
+                    NSNumber(value: padRight),
+                    NSNumber(value: 0),
+                ],
+                constantValue: 0.0,
+                name: nil
+            )
+        } else {
+            dyPadded = input
+        }
+
+        let stridesAll1 = Array(repeating: NSNumber(value: 1), count: 4)
+        var acc: MPSGraphTensor? = nil
+        for kh in 0..<kH {
+            for kw in 0..<kW {
+                // dYp slice [N, Hi, Wi, Co] → reshape [N*Hi*Wi, Co]
+                let dySlice = graph.sliceTensor(
+                    dyPadded,
+                    starts: [
+                        NSNumber(value: 0),
+                        NSNumber(value: kh),
+                        NSNumber(value: kw),
+                        NSNumber(value: 0),
+                    ],
+                    ends: [
+                        NSNumber(value: dN),
+                        NSNumber(value: kh + dHi),
+                        NSNumber(value: kw + dWi),
+                        NSNumber(value: cO),
+                    ],
+                    strides: stridesAll1,
+                    name: nil
+                )
+                let dyFlat = graph.reshape(
+                    dySlice,
+                    shape: [NSNumber(value: nhwi), NSNumber(value: cO)],
+                    name: nil
+                )
+                // W'[kh, kw] slice: take [Ci, Co] from W'.
+                // weights is shape [Hk, Wk, Ci, Co] (operand[1] is physically HWIO,
+                // spatially reversed but that doesn't change layout).
+                let wSlice = graph.sliceTensor(
+                    weights,
+                    starts: [
+                        NSNumber(value: kh),
+                        NSNumber(value: kw),
+                        NSNumber(value: 0),
+                        NSNumber(value: 0),
+                    ],
+                    ends: [
+                        NSNumber(value: kh + 1),
+                        NSNumber(value: kw + 1),
+                        NSNumber(value: cI),
+                        NSNumber(value: cO),
+                    ],
+                    strides: stridesAll1,
+                    name: nil
+                )
+                let wFlat = graph.reshape(
+                    wSlice,
+                    shape: [NSNumber(value: cI), NSNumber(value: cO)],
+                    name: nil
+                )
+                // W'.T → [Co, Ci]
+                let wT = graph.transpose(wFlat, permutation: [1, 0], name: nil)
+                // matmul: [N*Hi*Wi, Co] @ [Co, Ci] = [N*Hi*Wi, Ci]
+                let prod = graph.matrixMultiplication(primary: dyFlat, secondary: wT, name: nil)
+                if let prev = acc {
+                    acc = graph.addition(prev, prod, name: nil)
+                } else {
+                    acc = prod
+                }
+            }
+        }
+        // Reshape sum [N*Hi*Wi, Ci] → [N, Hi, Wi, Ci]
+        let dX = graph.reshape(
+            acc!,
+            shape: [
+                NSNumber(value: dN),
+                NSNumber(value: dHi),
+                NSNumber(value: dWi),
+                NSNumber(value: cI),
+            ],
+            name: op.result
+        )
+        return dX
     }
 
     private func compileConvolution(_ op: HLOOperation) throws -> MPSGraphTensor {
@@ -2633,6 +2923,24 @@ public final class MPSGraphCompiler {
         // dedicated weights-grad API is stable across processes.
         if let dN = dimNumbers,
            let result = try compileConvolutionWeightsGradIfMatch(
+               op: op,
+               input: input,
+               weights: weights,
+               dimNumbers: dN,
+               strides: strides,
+               rhsDilation: rhsDilation,
+               featureGroups: featureGroups,
+               padTop: padTop, padBottom: padBottom,
+               padLeft: padLeft, padRight: padRight) {
+            return result
+        }
+
+        // Data-grad form fast-path (input-gradient of forward conv). Same
+        // motivation as the filter-grad path: route to MPSGraph's dedicated
+        // `convolution2DDataGradient` instead of coercing through the
+        // generic permuted-conv lowering.
+        if let dN = dimNumbers,
+           let result = try compileConvolutionDataGradIfMatch(
                op: op,
                input: input,
                weights: weights,
@@ -3002,6 +3310,60 @@ public final class MPSGraphCompiler {
         case .max:
             return graph.maxPooling2D(withSourceTensor: processedInput, descriptor: descriptor, name: op.result)
         case .sum:
+            // For the stride-1, dilation-1, no-padding case (the form JAX
+            // emits for avg_pool backward), express sum-reduceWindow as
+            // explicit slice + addition rather than MPSGraph's avgPooling2D
+            // path. The avgPooling2D + multiply path is process-non-
+            // deterministic for small spatial dims (cnn_step1 cross-process
+            // drift traces here); slice+add lowers to elementwise adds with
+            // no reduction kernel and is deterministic by construction.
+            //
+            // The output is the same elementwise sum:
+            //   out[n, ho, wo, c] = Σ_{kh, kw} in[n, ho+kh, wo+kw, c]
+            // computed as Kh*Kw slices of the input added together.
+            let outShapeArr = op.resultType.shape
+            let inShapeNS = processedInput.shape ?? []
+            let inShapeArr = inShapeNS.map { $0.intValue }
+            let isStride1 = strides.allSatisfy { $0 == 1 }
+            let isDil1 = windowDilations.allSatisfy { $0 == 1 }
+                && baseDilations.allSatisfy { $0 == 1 }
+            let noPad = padTop == 0 && padBottom == 0 && padLeft == 0 && padRight == 0
+            let canSliceAdd = inShapeArr.count == 4 && outShapeArr.count == 4
+                && isStride1 && isDil1 && noPad
+                && kernelHeight * kernelWidth <= 25  // bound op count
+            if canSliceAdd {
+                var acc: MPSGraphTensor? = nil
+                let stridesNS = Array(repeating: NSNumber(value: 1), count: 4)
+                for kh in 0..<kernelHeight {
+                    for kw in 0..<kernelWidth {
+                        let starts: [NSNumber] = [
+                            NSNumber(value: 0),
+                            NSNumber(value: kh),
+                            NSNumber(value: kw),
+                            NSNumber(value: 0),
+                        ]
+                        let ends: [NSNumber] = [
+                            NSNumber(value: outShapeArr[0]),
+                            NSNumber(value: kh + outShapeArr[1]),
+                            NSNumber(value: kw + outShapeArr[2]),
+                            NSNumber(value: outShapeArr[3]),
+                        ]
+                        let slice = graph.sliceTensor(
+                            processedInput,
+                            starts: starts,
+                            ends: ends,
+                            strides: stridesNS,
+                            name: nil
+                        )
+                        if let prev = acc {
+                            acc = graph.addition(prev, slice, name: nil)
+                        } else {
+                            acc = slice
+                        }
+                    }
+                }
+                return acc!
+            }
             // Average pooling approximation - need to multiply by window size for sum
             let avgPooled = graph.avgPooling2D(withSourceTensor: processedInput, descriptor: descriptor, name: nil)
             let windowSize = Float(kernelHeight * kernelWidth)
