@@ -1004,8 +1004,13 @@ private func unrollStaticWhileLoops(_ mlir: String) -> String {
 
     var unrolledLines: [String] = []
 
+    // Include the while loop's result SSA name in the unrolled prefix so
+    // bodies from distinct while loops can't collide (e.g. a JAX scan-grad
+    // has two while loops, forward and backward, which used to emit
+    // duplicated `%iterN_<bodyvar>` definitions and broke SSA).
+    let whilePrefix = String(resultName.dropFirst())  // strip leading '%'
     for iter in 0..<loopBound {
-        let prefix = "iter\(iter)"
+        let prefix = "iter\(iter)_w\(whilePrefix)"
 
         // For each body line, rename SSA values and substitute iterArgs
         for bodyLine in doBodyLines {
