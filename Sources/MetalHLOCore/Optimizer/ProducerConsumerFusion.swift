@@ -447,24 +447,24 @@ public final class ProducerConsumerFusion: @unchecked Sendable {
                     if externalOperands.count != 2 {
                         return false
                     }
-                    // Check they are the expected inputs (or same input twice like x*x)
+                    // Reject same-operand-twice (e.g. x*x). The downstream
+                    // codegen in generateElementwiseChainSource increments
+                    // its input slot for every operand reference rather than
+                    // tracking SSA-name equality, so it would emit reads of
+                    // input1 (and beyond) that aren't bound to any buffer
+                    // — surfaces as `error: use of undeclared identifier
+                    // 'input2'` at Metal compile time. Better to skip the
+                    // fusion than miscompile.
                     if externalOperands[0] == externalOperands[1] {
-                        // Same input used twice (like x*x) - OK if it's the first input
+                        return false
+                    }
+                    // Two different inputs - must be in order
+                    for ext in externalOperands {
                         if expectedInputIndex < externalInputs.count &&
-                           externalOperands[0] == externalInputs[expectedInputIndex] {
+                           ext == externalInputs[expectedInputIndex] {
                             expectedInputIndex += 1
                         } else {
                             return false
-                        }
-                    } else {
-                        // Two different inputs - must be in order
-                        for ext in externalOperands {
-                            if expectedInputIndex < externalInputs.count &&
-                               ext == externalInputs[expectedInputIndex] {
-                                expectedInputIndex += 1
-                            } else {
-                                return false
-                            }
                         }
                     }
                 } else {
