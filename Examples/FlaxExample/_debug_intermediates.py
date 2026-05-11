@@ -336,6 +336,23 @@ def case_bert_loss():
         val = float(loss_jit(params_m, tm, ym))
         print(f"  call {i}: loss = {val}")
 
+    # 5) jit'd forward with capture_intermediates — locate first
+    #    divergent layer when the JIT'd program goes NaN
+    print("(e) jit'd forward, capture_intermediates=True — diff CPU vs MHLO:")
+
+    @jax.jit
+    def fwd_capture(p, t):
+        return model.apply(p, t, capture_intermediates=True)
+
+    with jax.default_device(cpu):
+        out_c, state_c = fwd_capture(params, jnp.asarray(tokens))
+    out_m, state_m = fwd_capture(params_m, tm)
+    out_m_arr = np.asarray(out_m)
+    print(f"  output: nan={bool(np.any(np.isnan(out_m_arr)))}, "
+          f"sum cpu={float(np.asarray(out_c).sum()):.6f} mhlo={float(out_m_arr.sum()):.6f}")
+    rows = diff_intermediates(state_c, state_m, tol=1e-3)
+    print_report(rows, tol=1e-3)
+
 
 def case_cnn_grad():
     print("Case: Mini-CNN grad — locate first divergent grad component")

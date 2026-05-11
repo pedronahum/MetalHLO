@@ -432,9 +432,9 @@ public final class IntegratedExecutor: @unchecked Sendable {
                 encoder.setBuffer(buffer, offset: offset, index: binding.index)
                 if debugDispatch {
                     let bufLen = buffer.length
-                    let label = buffer.label ?? "<unlabelled>"
+                    let bufId = ObjectIdentifier(buffer).hashValue & 0xFFFFFF
                     FileHandle.standardError.write(
-                        "[disp] op=\(opID) bind[\(binding.index)]=buf(label=\(label),len=\(bufLen),off=\(offset),end=\(offset + 0))\n"
+                        "[disp] op=\(opID) bind[\(binding.index)]=buf(id=\(String(bufId, radix: 16)),len=\(bufLen),off=\(offset),source=\(binding.source))\n"
                             .data(using: .utf8)!)
                 }
             }
