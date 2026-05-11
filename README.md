@@ -4,6 +4,49 @@
 
 MetalHLO is a standalone library that compiles and executes [StableHLO](https://github.com/openxla/stablehlo) MLIR programs on Apple Silicon GPUs. It provides Swift, C, and [PJRT](https://github.com/openxla/xla/tree/main/xla/pjrt/c) APIs, enabling integration with JAX, XLA, and any project that emits StableHLO IR.
 
+## JAX & Flax Compatibility
+
+MetalHLO is a fully-functional JAX backend for Apple Silicon. **130 tests across 9 test suites verify the supported surface** — the table below summarises what's covered. Each row links to the test file that exercises it.
+
+### JAX primitives
+
+| Capability | Test |
+|---|---|
+| `jit`, `value_and_grad`, full training step with optax (SGD, Adam) | [flax_metalhlo_training.py](Examples/FlaxExample/flax_metalhlo_training.py) |
+| `vmap`, `vmap` of `grad` (per-example gradients), nested `vmap`, non-default `in_axes`/`out_axes` | [flax_metalhlo_vmap.py](Examples/FlaxExample/flax_metalhlo_vmap.py) |
+| `jax.lax.scan`, `flax.linen.scan` forward, `nn.scan` + `grad` (RNN training) | [flax_metalhlo_scan.py](Examples/FlaxExample/flax_metalhlo_scan.py) |
+
+### Dtypes
+
+| Dtype | Forward | Grad | Mixed precision | Test |
+|---|---|---|---|---|
+| `float32` | ✓ | ✓ | n/a | all suites |
+| `float16` | ✓ | ✓ | ✓ (fp32 params + fp16 compute) | [flax_metalhlo_fp16.py](Examples/FlaxExample/flax_metalhlo_fp16.py) |
+| `bfloat16` | ✓ | ✓ | ✓ (fp32 params + bf16 compute), Adam step | [flax_metalhlo_bf16.py](Examples/FlaxExample/flax_metalhlo_bf16.py) |
+
+### Flax layers (`nn.compact` and `nnx` APIs)
+
+| Layer family | Verified |
+|---|---|
+| Dense, MLP, Sequential, ReLU/Tanh/SiLU/GELU, Softmax, Embed, Classifier | [flax_metalhlo_example.py](Examples/FlaxExample/flax_metalhlo_example.py) |
+| Conv1D/2D, ConvTranspose, depthwise conv, grouped conv, max/avg pool | [flax_metalhlo_example.py](Examples/FlaxExample/flax_metalhlo_example.py), [flax_metalhlo_layers.py](Examples/FlaxExample/flax_metalhlo_layers.py) |
+| BatchNorm (train + inference), LayerNorm, RMSNorm, GroupNorm, Dropout | [flax_metalhlo_layers.py](Examples/FlaxExample/flax_metalhlo_layers.py) |
+| MultiHeadDotProductAttention (forward + causal masking), Transformer block | [flax_metalhlo_example.py](Examples/FlaxExample/flax_metalhlo_example.py), [flax_metalhlo_layers.py](Examples/FlaxExample/flax_metalhlo_layers.py) |
+| LSTMCell, GRUCell | [flax_metalhlo_layers.py](Examples/FlaxExample/flax_metalhlo_layers.py) |
+| `flax.nnx` API: Linear, Conv, LayerNorm, RMSNorm, Embed, MLP, MHA, Dropout, BatchNorm, jit, grad | [flax_metalhlo_nnx.py](Examples/FlaxExample/flax_metalhlo_nnx.py) |
+| End-to-end: Mini-BERT (forward), Mini-ResNet (eval + train step), Mini-CNN (3-step Adam training), Autoencoder (5-step Adam training) | [flax_metalhlo_e2e.py](Examples/FlaxExample/flax_metalhlo_e2e.py) |
+
+### Known limitations
+
+- **MHA value-kernel grad**: 7 of 8 grad components are exact; one component drifts ~0.11. Doesn't reproduce when the chain is extracted in isolation — open investigation.
+- **Multi-step CNN training**: step 0 matches CPU exactly; subsequent steps drift up to ~0.1 absolute. Test absorbs with `rtol=1e-1`. Cross-process variance was reduced by routing conv-grad and pool-backward off MPSGraph's autotuned kernels onto deterministic primitives; residual is in MPSGraph's internal small-op fusion.
+- **Sharding** (`pjit` with mesh, `shard_map`, `nn.partitioning`): not supported. MetalHLO is single-device.
+- **Quantization, `nn.custom_vjp`**: not tested.
+
+### Compatibility
+
+Tested against **JAX 0.10.0** and **Flax 0.12.7** with optax 0.2.8. See [Building from Source](#building-from-source) for environment setup.
+
 ## Design Philosophy
 
 MetalHLO draws inspiration from both [OpenXLA](https://github.com/openxla/xla) and [MLX](https://github.com/ml-explore/mlx), combining the best of both worlds:

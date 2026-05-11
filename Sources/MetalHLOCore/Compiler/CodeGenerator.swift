@@ -4071,11 +4071,13 @@ public final class CodeGenerator: @unchecked Sendable {
 
         let metalType = metalTypeName(for: elementType)
 
-        // For non-float types — and for bfloat (whose optimized kernels
-        // below use hard-coded `device const float*` pointers that would
-        // misinterpret bf16 bytes as fp32) — use the simple scalar kernel
-        // that's parameterized on metalType.
-        if !isFloatType(elementType) || elementType == .bfloat16 {
+        // For non-fp32 types use the simple scalar reduction kernel that's
+        // parameterized on metalType. The optimized SIMD/shared-memory
+        // kernels in ReductionKernelGenerator hard-code `device const float*`
+        // pointers, so feeding fp16/bf16 buffers through them reads bytes at
+        // the wrong stride. (Surfaced as huge bias-grad diffs in both the
+        // fp16 and bf16 test suites.)
+        if !isFloatType(elementType) || elementType == .bfloat16 || elementType == .float16 {
             return generateIntegerReductionSource(
                 inputShape: inputShape, reduceDims: reduceDims,
                 reductionKind: reductionKind, metalType: metalType, elementType: elementType
