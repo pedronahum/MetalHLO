@@ -35,7 +35,11 @@ public final class IntegratedExecutor: @unchecked Sendable {
     public let executable: CompiledExecutable
 
     /// Pre-allocated unified buffer for all intermediates.
-    private let unifiedBuffer: MTLBuffer
+    /// `var` (not `let`) because the METALHLO_DEBUG_NO_BUFFER_REUSE
+    /// diagnostic mode swaps a fresh allocation in at the start of every
+    /// execute() to test whether cross-call buffer reuse is what's
+    /// causing #18 BERT cross-call NaN.
+    private var unifiedBuffer: MTLBuffer
 
     /// Constant buffers (created once).
     private var constantBuffers: [String: MTLBuffer]
@@ -154,14 +158,35 @@ public final class IntegratedExecutor: @unchecked Sendable {
             try executable.validateInputs(inputs)
         }
 
-        // (debug print removed for the real fix below)
-
-        // Zero the unified buffer to prevent stale data from affecting results.
-        // NOTE: The waitUntilCompleted() at the end of execute() (below) ensures
-        // the previous call's GPU writes have completed before we reach this
-        // memset — without that wait, the host-side memset races the previous
-        // call's still-running kernels and silently corrupts the unified
-        // buffer mid-flight. This was #18 (BERT loss-flaky-NaN across calls).
+        // Allocate a fresh unified buffer per execute(). The previous
+        // approach (reuse a single cached unifiedBuffer and host-memset
+        // it on entry) caused #18 BERT cross-call NaN: even with
+        // waitUntilCompleted() at the end of the previous execute() AND
+        // a GPU-encoded blit-fill at the start of the next, kernels
+        // still read stale leftover values from the previous run. The
+        // bytes on the host side were zero, but kernel reads landed on
+        // something else — most likely either an Apple-Silicon GPU
+        // cache view of the buffer that doesn't get invalidated by host
+        // memset / blit fill, or memory accessed beyond the planned
+        // unifiedBuffer.length (i.e. our memory plan underestimates the
+        // working set for this program). Allocating fresh dodges both:
+        // a brand-new MTLBuffer can't carry GPU-side cache state, and
+        // the OS hands us zero-initialized pages so any access beyond
+        // the planned range still reads zero.
+        //
+        // Cost: one MTLBuffer allocation per execute(). On Apple
+        // Silicon's UMA, this is fast (heap allocator); the previous
+        // "pre-allocate once" path was a perf optimization that turned
+        // out to be a correctness bug. Worth revisiting once we have a
+        // tighter handle on the actual MTLBuffer state coherence rules.
+        let bufferSize = unifiedBuffer.length
+        if let fresh = device.makeBuffer(length: bufferSize, options: .storageModeShared) {
+            fresh.label = unifiedBuffer.label
+            unifiedBuffer = fresh
+        }
+        // Belt-and-suspenders: zero the freshly allocated buffer. The
+        // OS typically zeros new pages, but Apple's docs make no
+        // guarantee about MTLBuffer contents at allocation.
         memset(unifiedBuffer.contents(), 0, unifiedBuffer.length)
 
         // Create command buffer
