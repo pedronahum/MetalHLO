@@ -154,7 +154,14 @@ public final class IntegratedExecutor: @unchecked Sendable {
             try executable.validateInputs(inputs)
         }
 
+        // (debug print removed for the real fix below)
+
         // Zero the unified buffer to prevent stale data from affecting results.
+        // NOTE: The waitUntilCompleted() at the end of execute() (below) ensures
+        // the previous call's GPU writes have completed before we reach this
+        // memset — without that wait, the host-side memset races the previous
+        // call's still-running kernels and silently corrupts the unified
+        // buffer mid-flight. This was #18 (BERT loss-flaky-NaN across calls).
         memset(unifiedBuffer.contents(), 0, unifiedBuffer.length)
 
         // Create command buffer
@@ -202,16 +209,21 @@ public final class IntegratedExecutor: @unchecked Sendable {
         // Execute
         commandBuffer.commit()
 
+        // extractOutputs() below reads unifiedBuffer on the host
+        // (via memcpy), and the next call's memset(unifiedBuffer, ...)
+        // mutates it from the host. Both require GPU writes to have
+        // completed first. The synchronous path already waited; the
+        // async path was missing this wait, which allowed the next
+        // call's memset to race still-running kernels mid-flight. Wait
+        // unconditionally — the async path no longer hides latency but
+        // it is now correct (#18 BERT cross-call NaN context).
         var gpuTimeMs: Double = 0
+        commandBuffer.waitUntilCompleted()
         if config.synchronous {
-            commandBuffer.waitUntilCompleted()
-
-            // Measure GPU time immediately after completion (before output extraction)
             gpuTimeMs = Double(DispatchTime.now().uptimeNanoseconds - startTime.uptimeNanoseconds) / 1_000_000
-
-            if let error = commandBuffer.error {
-                throw IntegratedExecutorError.executionFailed(error.localizedDescription)
-            }
+        }
+        if let error = commandBuffer.error {
+            throw IntegratedExecutorError.executionFailed(error.localizedDescription)
         }
 
         // Extract outputs (this adds overhead that shouldn't be counted in GPU time)
@@ -371,6 +383,12 @@ public final class IntegratedExecutor: @unchecked Sendable {
         // Set pipeline state (Metal driver optimizes consecutive same-pipeline dispatches)
         encoder.setComputePipelineState(pipeline)
 
+        // Debug logging — when METALHLO_DEBUG_DISPATCH is set, log every
+        // kernel dispatch with the buffers and offsets it binds plus the
+        // grid/threadgroup geometry. Lets us cross-reference an in-flight
+        // GPU page fault to the offending dispatch.
+        let debugDispatch = ProcessInfo.processInfo.environment["METALHLO_DEBUG_DISPATCH"] != nil
+
         // Bind all buffers and scalars
         for binding in bindings {
             switch binding.source {
@@ -378,10 +396,22 @@ public final class IntegratedExecutor: @unchecked Sendable {
                 // Use setBytes for scalar uniform values
                 var scalarValue = value
                 encoder.setBytes(&scalarValue, length: MemoryLayout<UInt32>.size, index: binding.index)
+                if debugDispatch {
+                    FileHandle.standardError.write(
+                        "[disp] op=\(opID) bind[\(binding.index)]=scalar(\(scalarValue))\n"
+                            .data(using: .utf8)!)
+                }
             default:
                 // Use setBuffer for all other sources
                 let (buffer, offset) = try resolveBinding(binding, inputs: inputs)
                 encoder.setBuffer(buffer, offset: offset, index: binding.index)
+                if debugDispatch {
+                    let bufLen = buffer.length
+                    let label = buffer.label ?? "<unlabelled>"
+                    FileHandle.standardError.write(
+                        "[disp] op=\(opID) bind[\(binding.index)]=buf(label=\(label),len=\(bufLen),off=\(offset),end=\(offset + 0))\n"
+                            .data(using: .utf8)!)
+                }
             }
         }
 
@@ -406,8 +436,18 @@ public final class IntegratedExecutor: @unchecked Sendable {
                 height: dispatch.gridSize.height * dispatch.threadgroupSize.height,
                 depth: dispatch.gridSize.depth * dispatch.threadgroupSize.depth
             )
+            if debugDispatch {
+                FileHandle.standardError.write(
+                    "[disp] op=\(opID) pipeline=\(pipeline.label ?? "<unlabelled>") dispatch=threads(\(totalThreads.width)x\(totalThreads.height)x\(totalThreads.depth)) tg=\(dispatch.threadgroupSize.width)x\(dispatch.threadgroupSize.height)x\(dispatch.threadgroupSize.depth)\n"
+                        .data(using: .utf8)!)
+            }
             encoder.dispatchThreads(totalThreads, threadsPerThreadgroup: dispatch.threadgroupSize)
         } else {
+            if debugDispatch {
+                FileHandle.standardError.write(
+                    "[disp] op=\(opID) pipeline=\(pipeline.label ?? "<unlabelled>") dispatch=tg(\(dispatch.gridSize.width)x\(dispatch.gridSize.height)x\(dispatch.gridSize.depth)) x \(dispatch.threadgroupSize.width)x\(dispatch.threadgroupSize.height)x\(dispatch.threadgroupSize.depth)\n"
+                        .data(using: .utf8)!)
+            }
             encoder.dispatchThreadgroups(dispatch.gridSize, threadsPerThreadgroup: dispatch.threadgroupSize)
         }
 

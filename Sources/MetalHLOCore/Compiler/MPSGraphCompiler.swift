@@ -84,6 +84,7 @@ public final class MPSGraphCompiler {
             typeMap[operation.result] = operation.resultType
             constantOperations[operation.result] = operation
             precompiledConstants += 1
+            mpsOpLog(operation, resultTensor)
         }
         fputs("[MetalHLO] Pre-compiled \(precompiledConstants) constants, \(function.operations.count) total ops in '\(function.name)'\n", stderr)
 
@@ -92,7 +93,9 @@ public final class MPSGraphCompiler {
             let resultTensor = try compileOperation(operation)
             valueMap[operation.result] = resultTensor
             typeMap[operation.result] = operation.resultType
+            mpsOpLog(operation, resultTensor)
         }
+        mpsOpLogFlush()
 
         // Get output tensors
         var outputTensors: [MPSGraphTensor] = []
@@ -4325,6 +4328,57 @@ public final class MPSGraphCompiler {
                 }
             }
             return result
+        }
+    }
+
+    // MARK: - MPS-op build logging
+    //
+    // When METALHLO_DEBUG_MPS_OPS is set, emit one line per compiled
+    // operation showing the HLO op kind, result SSA, input SSAs, the
+    // resulting MPSGraphTensor's ObjectIdentifier, its inferred MPS-side
+    // shape and dtype, and the MPS-op kind we ended up with. The trace
+    // is deterministic across runs given identical IR, so two traces can
+    // be diffed to find the first divergent MPS-op build between a
+    // working and a failing program. Set METALHLO_DEBUG_MPS_OPS_FILE to
+    // route output to a file instead of stderr.
+
+    private static let mpsOpLogEnabled =
+        ProcessInfo.processInfo.environment["METALHLO_DEBUG_MPS_OPS"] != nil
+
+    private static let mpsOpLogPath: String? =
+        ProcessInfo.processInfo.environment["METALHLO_DEBUG_MPS_OPS_FILE"]
+
+    /// Lazily-opened log file handle (nil ⇒ write to stderr).
+    private static let mpsOpLogHandle: FileHandle? = {
+        guard let path = mpsOpLogPath else { return nil }
+        FileManager.default.createFile(atPath: path, contents: nil)
+        return FileHandle(forWritingAtPath: path)
+    }()
+
+    private func mpsOpLog(
+        _ op: HLOOperation,
+        _ tensor: MPSGraphTensor,
+        _ extra: String? = nil
+    ) {
+        guard Self.mpsOpLogEnabled else { return }
+        let shape = tensor.shape?.map { $0.intValue.description }.joined(separator: "x")
+            ?? "<unknown>"
+        let mpsKind = String(describing: type(of: tensor.operation))
+        let inputs = op.operands.joined(separator: ", ")
+        let extraStr = extra.map { " " + $0 } ?? ""
+        let line = "[mpsop] \(op.kind) \(op.result) [\(inputs)]"
+            + " -> \(mpsKind):\(shape):\(tensor.dataType.rawValue)\(extraStr)\n"
+        if let h = Self.mpsOpLogHandle {
+            h.write(line.data(using: .utf8)!)
+        } else {
+            FileHandle.standardError.write(line.data(using: .utf8)!)
+        }
+    }
+
+    private func mpsOpLogFlush() {
+        guard Self.mpsOpLogEnabled else { return }
+        if let h = Self.mpsOpLogHandle {
+            try? h.synchronize()
         }
     }
 }
