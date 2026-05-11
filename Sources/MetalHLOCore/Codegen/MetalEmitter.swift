@@ -268,6 +268,8 @@ extension MetalType {
             return "float"
         case .half:
             return "half"
+        case .bfloat:
+            return "bfloat"
         case .int:
             return "int"
         case .uint:

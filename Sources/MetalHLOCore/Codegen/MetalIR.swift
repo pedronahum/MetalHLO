@@ -9,6 +9,10 @@ import Foundation
 public enum MetalType: String, Sendable, Hashable {
     case float = "float"
     case half = "half"
+    /// Native Metal 3 brain-float type (1 sign + 8 exponent + 7 mantissa).
+    /// Available on Apple Silicon with macOS 13+/iOS 16+. Distinct from
+    /// `.half` (fp16: 1+5+10) — same byte width but different bit layout.
+    case bfloat = "bfloat"
     case float2 = "float2"
     case float4 = "float4"
     case half2 = "half2"
@@ -33,7 +37,7 @@ public enum MetalType: String, Sendable, Hashable {
     /// Returns the size in bytes.
     public var byteSize: Int {
         switch self {
-        case .half: return 2
+        case .half, .bfloat: return 2
         case .float, .int, .uint: return 4
         case .half2: return 4
         case .half4, .float2: return 8
@@ -49,6 +53,7 @@ public enum MetalType: String, Sendable, Hashable {
     public static func from(_ elementType: ElementType) -> MetalType {
         switch elementType {
         case .float16: return .half
+        case .bfloat16: return .bfloat
         case .float32: return .float
         case .int32: return .int
         case .uint32: return .uint

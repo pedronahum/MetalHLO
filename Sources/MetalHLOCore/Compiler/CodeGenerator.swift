@@ -252,7 +252,7 @@ public final class CodeGenerator: @unchecked Sendable {
         case .float32: return "float"
         case .float16: return "half"
         case .float64: return "float"  // Metal doesn't support double in kernels, use float
-        case .bfloat16: return "half"  // Approximate with half
+        case .bfloat16: return "bfloat"  // Metal 3 native bf16 (macOS 13+, iOS 16+)
         case .int8: return "char"
         case .int16: return "short"
         case .int32: return "int"
@@ -432,7 +432,11 @@ public final class CodeGenerator: @unchecked Sendable {
         let totalElements = outputShape.reduce(1, *)
         let entryPoint = "kernel_\(opKind.rawValue)"
         let metalType = metalTypeName(for: elementType)
-        let isFloat = isFloatType(elementType)
+        // Metal's math intrinsics (sqrt, exp, log, ...) don't have direct
+        // bfloat overloads — they return fp32 from a bfloat input. For
+        // bfloat we therefore take the same path as integer types: cast
+        // through float, then back to bfloat at assignment.
+        let isFloat = isFloatType(elementType) && elementType != .bfloat16
 
         var source = """
         #include <metal_stdlib>
@@ -953,6 +957,17 @@ public final class CodeGenerator: @unchecked Sendable {
         }
 
         // Non-float types use scalar kernel
+        //
+        // For bfloat, Metal's `max(a, b)` and `min(a, b)` overloads create
+        // an ambiguous call (the implicit conversions to fp16/fp32/int all
+        // match). Rewrite to a ternary so the expression has a definite
+        // type without depending on overload resolution.
+        var resolvedOp = operation
+        if metalType == "bfloat" {
+            resolvedOp = resolvedOp
+                .replacingOccurrences(of: "max(a, b)", with: "(a > b ? a : b)")
+                .replacingOccurrences(of: "min(a, b)", with: "(a < b ? a : b)")
+        }
         return """
         kernel void \(entryPoint)(
             device const \(metalType)* inputA [[buffer(0)]],
@@ -964,7 +979,7 @@ public final class CodeGenerator: @unchecked Sendable {
             if (tid >= count) return;
             \(metalType) a = inputA[tid];
             \(metalType) b = inputB[tid];
-            output[tid] = \(operation);
+            output[tid] = \(resolvedOp);
         }
         """
     }
@@ -1018,8 +1033,15 @@ public final class CodeGenerator: @unchecked Sendable {
                 uint base = tid * 4;
                 if (base + 4 <= count) {
                     \(inputMetal)4 v = ((const device \(inputMetal)4*)input)[tid];
-                    ((device \(outputMetal)4*)output)[tid] =
-                        \(outputMetal)4(v.x, v.y, v.z, v.w);
+                    // Explicit per-component scalar casts: Metal does not provide
+                    // a bfloat4(float, float, float, float) constructor — only the
+                    // strict bfloat4(bfloat, bfloat, bfloat, bfloat) form — so we
+                    // cast component-wise to be uniform across all conversions.
+                    ((device \(outputMetal)4*)output)[tid] = \(outputMetal)4(
+                        \(outputMetal)(v.x),
+                        \(outputMetal)(v.y),
+                        \(outputMetal)(v.z),
+                        \(outputMetal)(v.w));
                 } else {
                     for (uint i = base; i < count; ++i) {
                         output[i] = \(outputMetal)(input[i]);
@@ -3245,14 +3267,18 @@ public final class CodeGenerator: @unchecked Sendable {
             // Fall through to the basic kernel when MPP isn't available and
             // a transpose is requested — the simdgroup_matrix kernel doesn't
             // yet honour transA/transB.
-            let zeroValue = isFloat ? "0.0" : "0"
+            // For bfloat, the literal `0.0` is treated as `double` which
+            // doesn't implicitly convert. Use an explicit construction.
+            let zeroValue = isFloat ? (metalType == "bfloat" ? "\(metalType)(0)" : "0.0") : "0"
             let aRead = transA ? "batchA[k * \(M) + row]" : "batchA[row * K + k]"
             let bRead = transB ? "batchB[col * K + k]" : "batchB[k * N + col]"
             return generateBasicMatMulSourceWithTranspose(
                 batchSize: batchSize, metalType: metalType, zeroValue: zeroValue, M: M, N: N, K: K,
                 aRead: aRead, bRead: bRead)
         } else {
-            let zeroValue = isFloat ? "0.0" : "0"
+            // For bfloat, the literal `0.0` is treated as `double` which
+            // doesn't implicitly convert. Use an explicit construction.
+            let zeroValue = isFloat ? (metalType == "bfloat" ? "\(metalType)(0)" : "0.0") : "0"
             // Generate read expressions that handle transposition
             let aRead = transA ? "batchA[k * \(M) + row]" : "batchA[row * K + k]"
             let bRead = transB ? "batchB[col * K + k]" : "batchB[k * N + col]"
@@ -4045,9 +4071,11 @@ public final class CodeGenerator: @unchecked Sendable {
 
         let metalType = metalTypeName(for: elementType)
 
-        // For non-float types, use a simple scalar reduction kernel
-        // The optimized SIMD/shared-memory kernels assume float
-        if !isFloatType(elementType) {
+        // For non-float types — and for bfloat (whose optimized kernels
+        // below use hard-coded `device const float*` pointers that would
+        // misinterpret bf16 bytes as fp32) — use the simple scalar kernel
+        // that's parameterized on metalType.
+        if !isFloatType(elementType) || elementType == .bfloat16 {
             return generateIntegerReductionSource(
                 inputShape: inputShape, reduceDims: reduceDims,
                 reductionKind: reductionKind, metalType: metalType, elementType: elementType

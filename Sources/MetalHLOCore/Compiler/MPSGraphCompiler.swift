@@ -2408,9 +2408,20 @@ public final class MPSGraphCompiler {
                 var doubles = values
                 data = Data(bytes: &doubles, count: doubles.count * MemoryLayout<Double>.stride)
             case .bfloat16:
-                // BFloat16 needs special handling - convert through Float
-                var floats = values.map { Float($0) }
-                data = Data(bytes: &floats, count: floats.count * MemoryLayout<Float>.stride)
+                // bf16 = upper 16 bits of fp32 (round-to-nearest-even).
+                var bf16Bytes = [UInt16]()
+                bf16Bytes.reserveCapacity(values.count)
+                for v in values {
+                    let f = Float(v)
+                    if f.isNaN {
+                        bf16Bytes.append(0x7FC0)
+                        continue
+                    }
+                    let bits = f.bitPattern
+                    let rounded = bits &+ 0x7FFF &+ ((bits >> 16) & 1)
+                    bf16Bytes.append(UInt16(truncatingIfNeeded: rounded >> 16))
+                }
+                data = Data(bytes: &bf16Bytes, count: bf16Bytes.count * MemoryLayout<UInt16>.stride)
             case .int8:
                 var ints = values.map { Int8($0) }
                 data = Data(bytes: &ints, count: ints.count * MemoryLayout<Int8>.stride)

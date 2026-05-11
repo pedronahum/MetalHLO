@@ -326,9 +326,22 @@ public final class BufferStorage: @unchecked Sendable {
             return Data(bytes: &doubles, count: doubles.count * MemoryLayout<Double>.stride)
 
         case .bfloat16:
-            // BFloat16 not directly supported, convert through Float
-            var floats = values.map { floatValue($0) }
-            return Data(bytes: &floats, count: floats.count * MemoryLayout<Float>.stride)
+            // bf16 = upper 16 bits of fp32 (round-to-nearest-even). Earlier
+            // this wrote 4 bytes/element into a 2-byte-stride buffer, which
+            // corrupted bf16 constants throughout the graph.
+            var bf16Bytes = [UInt16]()
+            bf16Bytes.reserveCapacity(values.count)
+            for v in values {
+                let f = floatValue(v)
+                if f.isNaN {
+                    bf16Bytes.append(0x7FC0)
+                    continue
+                }
+                let bits = f.bitPattern
+                let rounded = bits &+ 0x7FFF &+ ((bits >> 16) & 1)
+                bf16Bytes.append(UInt16(truncatingIfNeeded: rounded >> 16))
+            }
+            return Data(bytes: &bf16Bytes, count: bf16Bytes.count * MemoryLayout<UInt16>.stride)
 
         case .int1:
             var bools = values.map { intValue($0) != 0 ? UInt8(1) : UInt8(0) }
