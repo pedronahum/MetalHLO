@@ -194,9 +194,31 @@ public final class StaticMemoryPlanner: @unchecked Sendable {
         // 4. Filter out inputs and constants - they come from external buffers, not the unified buffer
         let intermediateLifetimes = orderedLifetimes.filter { !$0.value.isInput && !$0.value.isConstant }
 
-        // 5. Assign offsets — disable reuse to test buffer aliasing hypothesis
+        // 5. Assign offsets.
+        //
+        // The interference-graph-based offset assignment uses the lifetimes
+        // computed under the planner's execution order. Earlier that order
+        // was non-deterministic (Swift dictionary iteration in
+        // `optimizeExecutionOrder`), which produced inconsistent interference
+        // graphs and intermittently aliased tensors that still had readers in
+        // flight — the long-running symptom of "BERT works with NO_REUSE=1,
+        // breaks without". With deterministic ordering the interference graph
+        // is consistent run-to-run, so reuse is back on by default.
+        // METALHLO_NO_REUSE=1 still forces the flat-offset path for
+        // bisection.
+        if ProcessInfo.processInfo.environment["METALHLO_DEBUG_LIFETIMES"] != nil {
+            for (id, lt) in intermediateLifetimes.sorted(by: { $0.key < $1.key }) {
+                FileHandle.standardError.write(
+                    "[lifetime] \(id): created=\(lt.createdAt) lastUsed=\(lt.lastUsedAt) bytes=\(lt.byteSize)\n"
+                        .data(using: .utf8)!)
+            }
+        }
         let (offsets, totalSize, peakMemory): ([TensorID: Int], Int, Int)
-        if ProcessInfo.processInfo.environment["METALHLO_NO_REUSE"] != nil {
+        let reuseOff = ProcessInfo.processInfo.environment["METALHLO_NO_REUSE"] != nil
+        if ProcessInfo.processInfo.environment["METALHLO_DEBUG_LIFETIMES"] != nil {
+            FileHandle.standardError.write("[planner] reuseOff=\(reuseOff)\n".data(using: .utf8)!)
+        }
+        if reuseOff {
             var offs: [TensorID: Int] = [:]
             var next = 0
             let a = config.bufferAlignment
@@ -212,6 +234,12 @@ public final class StaticMemoryPlanner: @unchecked Sendable {
             (offsets, totalSize, peakMemory) = assignOffsets(intermediateLifetimes, interference: interference)
         }
 
+        if ProcessInfo.processInfo.environment["METALHLO_DEBUG_LIFETIMES"] != nil {
+            for (id, off) in offsets.sorted(by: { $0.key < $1.key }) {
+                FileHandle.standardError.write(
+                    "[offset] \(id): offset=\(off)\n".data(using: .utf8)!)
+            }
+        }
         // 5. Identify sharing groups
         let groups = findSharingGroups(offsets, interference: interference, lifetimes: orderedLifetimes)
 
@@ -368,10 +396,20 @@ public final class StaticMemoryPlanner: @unchecked Sendable {
         var available: Set<TensorID> = Set(function.inputs.map { $0.name })
 
         while scheduled.count < function.operations.count {
-            // Find ready operations
+            // Find ready operations.
+            //
+            // Iterate over a sorted opID range rather than the `dependencies`
+            // dictionary — Swift dictionary iteration order is non-deterministic
+            // across runs (hash seed randomization), and when multiple ready ops
+            // tie on `bestDelta` below, the picker keeps the first one seen.
+            // Without sorted iteration, that "first one" varied run-to-run,
+            // producing different execution orders and (under some memory
+            // layouts) different numerical results. Sorted iteration makes the
+            // tie-break deterministic.
             var ready: [OperationID] = []
-            for (opID, deps) in dependencies {
-                if !completed.contains(opID) && deps.isSubset(of: completed) {
+            for opID in 0..<function.operations.count {
+                if completed.contains(opID) { continue }
+                if dependencies[opID]?.isSubset(of: completed) ?? true {
                     ready.append(opID)
                 }
             }
