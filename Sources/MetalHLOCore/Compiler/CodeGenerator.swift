@@ -1142,18 +1142,16 @@ public final class CodeGenerator: @unchecked Sendable {
         operandType: String,
         indicesType: String
     ) -> String {
-        // Check for batched gather (operand_batching_dims is non-empty)
-        if !dimNumbers.operandBatchingDims.isEmpty {
-            return generateBatchedGatherKernel(
-                entryPoint: entryPoint,
-                operandShape: operandShape,
-                indicesShape: indicesShape,
-                outputShape: outputShape,
-                dimNumbers: dimNumbers,
-                operandType: operandType,
-                indicesType: indicesType
-            )
-        }
+        // The specialized batched-gather kernel below was written for the
+        // vmap'd-jnp.roll pattern (1D batch index) and assumed batchDim=0,
+        // 1 index per batch, and 0 offset dims. It silently produced wrong
+        // results for the patterns that show up under value_and_grad of
+        // `optax.softmax_cross_entropy_with_integer_labels` — multi-dim
+        // batching, batch dim != 0, offset_dims present. The general kernel
+        // below (extended to honour operand_batching_dims) handles all of
+        // them correctly. Route everything through it for now; revisit if a
+        // dedicated fast path becomes necessary.
+        _ = generateBatchedGatherKernel  // keep symbol alive; unused.
 
         // General gather kernel.
         //
@@ -1257,6 +1255,20 @@ public final class CodeGenerator: @unchecked Sendable {
             body += "            if (startIdx\(comp) >= \(operandShape[mappedDim])) startIdx\(comp) = \(operandShape[mappedDim] - 1);\n"
         }
 
+        // Helper: indices dim → grid coord index (skips index_vector_dim).
+        // gc indices were emitted earlier in output-dim order over the
+        // non-offset output dims; those map 1:1 to indices' non-IVD dims
+        // (StableHLO gather semantics).
+        func gridIndexForIndicesDim(_ indicesDim: Int) -> Int {
+            var idx = 0
+            for d in 0..<indicesShape.count {
+                if d == ivd { continue }
+                if d == indicesDim { return idx }
+                idx += 1
+            }
+            return -1
+        }
+
         // Compute flat operand index
         body += "            uint srcPos = 0;\n"
         var offsetDimCounter = 0
@@ -1266,8 +1278,17 @@ public final class CodeGenerator: @unchecked Sendable {
                 if let comp = dimNumbers.startIndexMap.firstIndex(of: d) {
                     body += "            srcPos += startIdx\(comp) * \(operandStrides[d]);\n"
                 }
-            } else if dimNumbers.operandBatchingDims.contains(d) {
-                // Batch dim (shouldn't reach here for non-batched)
+            } else if let bIdx = dimNumbers.operandBatchingDims.firstIndex(of: d) {
+                // Operand batching dim — paired with start_indices_batching_dims[bIdx].
+                // The matching start_indices dim is one of the non-IVD indices
+                // dims, whose coord comes from the gc emitted earlier.
+                let siDim = bIdx < dimNumbers.startIndicesBatchingDims.count
+                    ? dimNumbers.startIndicesBatchingDims[bIdx]
+                    : bIdx
+                let gridIdx = gridIndexForIndicesDim(siDim)
+                if gridIdx >= 0 {
+                    body += "            srcPos += gc\(gridIdx) * \(operandStrides[d]);\n"
+                }
             } else {
                 // Offset dim: start_index (if indexed) + offset coordinate
                 if let comp = dimNumbers.startIndexMap.firstIndex(of: d) {
@@ -3092,60 +3113,66 @@ public final class CodeGenerator: @unchecked Sendable {
             inputStrides[i] = inputStrides[i + 1] * inputShape[i + 1]
         }
 
-        // Build index computation code
+        // Build index computation code.
+        //
+        // Each coord is computed independently from outputStrides:
+        //   coord = (tid / outputStrides[d]) % outputShape[d]
+        //
+        // METAL UINT-MODULO MISCOMPILE WORKAROUND
+        // ───────────────────────────────────────
+        // On Apple Silicon (verified on M5 Pro / macOS 26 / Metal 4), the `%`
+        // operator on unsigned ints produces garbage when both:
+        //   (a) the dividend is a `tid`-derived expression (e.g. `tid / K`)
+        //   (b) the divisor is a non-power-of-2 compile-time constant
+        // Concrete repro: `(tid / 65536u) % 6u` returns 65530 instead of 0
+        // for small tid. The same expression rewritten as
+        //   `a - (a / b) * b`
+        // produces correct results. Unsigned divide is fine; only `%` is
+        // miscompiled. Symptom for callers: broadcast (16,6,256) →
+        // (16,6,256,256) produced 0x60000000 (= ~3.7e19 as float) at >99%
+        // of output positions, which then propagated as NaN through the
+        // softmax/attention pipeline that consumed the broadcast result.
+        //
+        // We always emit the manual form for non-power-of-2 sizes; for
+        // power-of-2 sizes the `% N` form compiles to `& (N-1)` and works.
+        func emitMod(dividend: String, divisor: Int) -> String {
+            if divisor > 0 && (divisor & (divisor - 1)) == 0 {
+                return "(\(dividend)) % \(divisor)u"
+            }
+            return "((\(dividend)) - ((\(dividend)) / \(divisor)u) * \(divisor)u)"
+        }
         var indexCode = ""
         if inputShape.isEmpty || inputShape == [1] || (inputShape.count == 1 && inputShape[0] == 1) {
             // Scalar broadcast - all elements read from same location
             indexCode = "uint inputIdx = 0;"
         } else if broadcastDims.isEmpty {
-            // No explicit dimensions - assume trailing dimensions match
-            // This is a simple element-by-element broadcast
-            indexCode = """
-            uint inputIdx = 0;
-            uint remaining = tid;
-            """
-            for (outDim, outSize) in outputShape.enumerated().reversed() {
-                let coord = "remaining % \(outSize)"
-                indexCode += "\n    uint coord\(outDim) = \(coord);"
-                indexCode += "\n    remaining /= \(outSize);"
-
-                // Check if this output dimension maps to an input dimension
+            // No explicit dimensions — assume trailing dimensions match.
+            indexCode = "uint inputIdx = 0;"
+            for outDim in 0..<outputShape.count {
                 let inputDim = outDim - (outputShape.count - inputShape.count)
-                if inputDim >= 0 && inputDim < inputShape.count {
-                    if inputShape[inputDim] == 1 {
-                        // Broadcast dimension - use 0
-                        indexCode += "\n    // dim \(outDim) broadcasts from input dim \(inputDim)"
-                    } else {
-                        indexCode += "\n    inputIdx += coord\(outDim) * \(inputStrides[inputDim]);"
-                    }
-                }
+                guard inputDim >= 0 && inputDim < inputShape.count else { continue }
+                if inputShape[inputDim] == 1 { continue }  // broadcasts (size 1)
+                let stride = outputStrides[outDim]
+                let size = outputShape[outDim]
+                let div = stride == 1 ? "tid" : "(tid / \(stride)u)"
+                indexCode += "\n    uint bcCoord\(outDim) = \(emitMod(dividend: div, divisor: size));"
+                indexCode += "\n    inputIdx += bcCoord\(outDim) * \(inputStrides[inputDim])u;"
             }
         } else {
-            // Explicit broadcast dimensions mapping
-            indexCode = """
-            uint inputIdx = 0;
-            uint remaining = tid;
-            """
-            for (outDim, outSize) in outputShape.enumerated().reversed() {
-                let coord = "remaining % \(outSize)"
-                indexCode += "\n    uint coord\(outDim) = \(coord);"
-                indexCode += "\n    remaining /= \(outSize);"
-            }
-
-            // Map output coordinates to input coordinates using broadcast_dimensions
+            // Explicit broadcast dimensions mapping.
+            indexCode = "uint inputIdx = 0;"
             for (inputDim, outputDim) in broadcastDims.enumerated() {
-                if inputDim < inputShape.count && outputDim < outputShape.count {
-                    if inputShape[inputDim] == 1 {
-                        // Broadcast dimension
-                        indexCode += "\n    // input dim \(inputDim) broadcasts (size 1)"
-                    } else {
-                        indexCode += "\n    inputIdx += coord\(outputDim) * \(inputStrides[inputDim]);"
-                    }
-                }
+                guard inputDim < inputShape.count && outputDim < outputShape.count else { continue }
+                if inputShape[inputDim] == 1 { continue }  // broadcasts (size 1)
+                let stride = outputStrides[outputDim]
+                let size = outputShape[outputDim]
+                let div = stride == 1 ? "tid" : "(tid / \(stride)u)"
+                indexCode += "\n    uint bcCoord\(outputDim) = \(emitMod(dividend: div, divisor: size));"
+                indexCode += "\n    inputIdx += bcCoord\(outputDim) * \(inputStrides[inputDim])u;"
             }
         }
 
-        let outputCount = outputShape.reduce(1, *)
+        _ = outputShape.reduce(1, *)  // outputCount available if needed; no longer baked into kernel.
 
         return """
         kernel void \(entryPoint)(
