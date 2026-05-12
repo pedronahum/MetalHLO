@@ -148,6 +148,21 @@ public final class IntegratedExecutor: @unchecked Sendable {
     /// - Returns: Execution result with output buffers.
     /// - Throws: `ExecutorError` if execution fails.
     public func execute(inputs: [String: MTLBuffer]) throws -> ExecutionResult {
+        // Wrap the whole body in an autoreleasepool. MTLCommandBuffer (and the
+        // resources it retains — pipeline state, buffer bindings, including the
+        // *previous* unifiedBuffer that we replaced earlier this call) is an
+        // NSObject and only gets released when its autorelease pool drains.
+        // Without an explicit pool here, every execute() leaves the just-used
+        // command buffer plus its unifiedBuffer retention alive until the next
+        // top-level runloop turn — which never comes when JAX is calling us in
+        // a tight Python loop. Measured at full nanoGPT scale: ~2.64 GB leak
+        // per step until OOM at ~step 14 in a 51 GB machine.
+        return try autoreleasepool {
+            try executeImpl(inputs: inputs)
+        }
+    }
+
+    private func executeImpl(inputs: [String: MTLBuffer]) throws -> ExecutionResult {
         let startTime = DispatchTime.now()
 
         // Note: Semaphore removed - Metal command queues handle concurrent submission safely.
