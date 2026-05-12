@@ -3339,8 +3339,15 @@ public final class CodeGenerator: @unchecked Sendable {
             // TF32Transform uses (in MetalHLOCompiler) must mirror this.
             let mppTgCount = (M / 128) * (N / 128) * batchSize
             let inputElementType = attributes.inputElementTypes?.first ?? elementType
-            if supportsMetalPerformancePrimitives()
-                && M % 128 == 0 && N % 128 == 0 && mppTgCount >= 16 {
+            let mppEligible = supportsMetalPerformancePrimitives()
+                && M % 128 == 0 && N % 128 == 0 && mppTgCount >= 16
+            if ProcessInfo.processInfo.environment["METALHLO_DEBUG_MATMUL_PATH"] != nil {
+                let kernelChoice = mppEligible
+                    ? "MPP"
+                    : (!transA && !transB && M >= 32 && N >= 32 ? "simdgroup" : "basic")
+                FileHandle.standardError.write("[matmul] M=\(M) N=\(N) K=\(K) batch=\(batchSize) transA=\(transA) transB=\(transB) → \(kernelChoice)\n".data(using: .utf8)!)
+            }
+            if mppEligible {
                 return generateMatMul2dMPPSource(
                     batchSize: batchSize,
                     inputElementType: inputElementType,

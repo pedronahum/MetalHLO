@@ -228,7 +228,17 @@ public final class IntegratedExecutor: @unchecked Sendable {
             encoder.label = label
         }
 
-        // Encode all operations to the single encoder
+        // Encode all operations to the single encoder.
+        //
+        // The default dispatch type for `makeComputeCommandEncoder()` is
+        // `.serial`, which means consecutive dispatches on the same encoder
+        // already see each other's writes — Metal serializes them on the
+        // device queue. Explicit `memoryBarrier(scope: .buffers)` between
+        // every op is therefore redundant and just adds CPU encoding cost
+        // (measured 288ms of CPU overhead vs 162ms of GPU compute on a
+        // 2360-op nanoGPT train step). Set METALHLO_BARRIER_PER_OP=1 to
+        // restore the per-op barrier if a regression appears.
+        let perOpBarrier = ProcessInfo.processInfo.environment["METALHLO_BARRIER_PER_OP"] == "1"
         for (index, opID) in executable.executionOrder.enumerated() {
             try encodeOperationToEncoder(
                 opID,
@@ -236,15 +246,29 @@ public final class IntegratedExecutor: @unchecked Sendable {
                 inputs: inputs,
                 kernelTimings: &kernelTimings
             )
-
-            // Add memory barrier between operations for data hazard protection
-            // (Skip after last operation since there's nothing following)
-            if index < executable.executionOrder.count - 1 {
+            if perOpBarrier && index < executable.executionOrder.count - 1 {
                 encoder.memoryBarrier(scope: .buffers)
             }
         }
 
         encoder.endEncoding()
+
+        if ProcessInfo.processInfo.environment["METALHLO_DUMP_DISPATCH_SUMMARY"] != nil {
+            var byPipeline: [String: (count: Int, threads: Int)] = [:]
+            for opID in executable.executionOrder {
+                let pipeline = executable.pipelines[opID]
+                let label = pipeline?.label ?? "<unlabelled>"
+                let dispatch = executable.dispatches[opID]
+                let threads = dispatch.map { Int($0.gridSize.width * $0.gridSize.height * $0.gridSize.depth * $0.threadgroupSize.width * $0.threadgroupSize.height * $0.threadgroupSize.depth) } ?? 0
+                let prev = byPipeline[label] ?? (count: 0, threads: 0)
+                byPipeline[label] = (count: prev.count + 1, threads: prev.threads + threads)
+            }
+            let sorted = byPipeline.sorted { $0.value.threads > $1.value.threads }
+            FileHandle.standardError.write("[dispatch_summary] \(executable.executionOrder.count) ops in this execute()\n".data(using: .utf8)!)
+            for (label, info) in sorted.prefix(20) {
+                FileHandle.standardError.write(String(format: "  %-40s  count=%4d  total_threads=%12d\n", label.prefix(40).description, info.count, info.threads).data(using: .utf8)!)
+            }
+        }
 
         // Execute
         commandBuffer.commit()
@@ -261,6 +285,13 @@ public final class IntegratedExecutor: @unchecked Sendable {
         commandBuffer.waitUntilCompleted()
         if config.synchronous {
             gpuTimeMs = Double(DispatchTime.now().uptimeNanoseconds - startTime.uptimeNanoseconds) / 1_000_000
+        }
+        if ProcessInfo.processInfo.environment["METALHLO_PROFILE_GPU"] == "1" {
+            // GPUStartTime / GPUEndTime are wall-clock seconds — only the GPU
+            // execution slice between commit and completion, no CPU dispatch.
+            let gpuOnly = (commandBuffer.gpuEndTime - commandBuffer.gpuStartTime) * 1000.0
+            FileHandle.standardError.write(String(format: "[gpu_time] ops=%d wall=%.2fms gpu=%.2fms\n",
+                executable.executionOrder.count, gpuTimeMs, gpuOnly).data(using: .utf8)!)
         }
         if let error = commandBuffer.error {
             throw IntegratedExecutorError.executionFailed(error.localizedDescription)
