@@ -380,6 +380,12 @@ public final class MetalHLOCompiler: @unchecked Sendable {
             pipelineDescriptor.threadGroupSizeIsMultipleOfThreadExecutionWidth = true
         }
 
+        // IntegratedExecutor bakes the program into an MTLIndirectCommandBuffer
+        // and re-executes it across train steps; the encoded
+        // MTLComputePipelineState is part of that pre-bake, so every kernel
+        // we compile has to opt in.
+        pipelineDescriptor.supportIndirectCommandBuffers = true
+
         let pipeline: MTLComputePipelineState
         do {
             pipeline = try device.makeComputePipelineState(

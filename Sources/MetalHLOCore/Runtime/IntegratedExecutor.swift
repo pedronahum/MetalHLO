@@ -52,6 +52,21 @@ public final class IntegratedExecutor: @unchecked Sendable {
     /// view-chain walk *and* the `Dictionary` hashing per op.
     private let resolvedPlanOrdered: [ResolvedOpPlan]
 
+    // NOTE: an MTLIndirectCommandBuffer migration was attempted here. It
+    // *does* run the full program from a single `executeCommandsInBuffer`
+    // call (one driver dispatch instead of 12k+ setBuffer + setBytes +
+    // dispatch calls per step) but MTLIndirectCommandType for compute is
+    // only `.concurrentDispatch` — the parent .serial encoder doesn't
+    // serialise commands *inside* an ICB, and the Metal driver can't see
+    // our sub-buffer hazards because every intermediate tensor lives at a
+    // distinct offset inside a single unifiedBuffer it tracks as one
+    // resource. Result: scatter-then-read pairs race and we get NaN
+    // (verified on a 3-op chain `a @ b + c`). Revisiting this needs a
+    // dependency-aware chunking pass that inserts explicit
+    // `executeCommandsInBuffer`+`memoryBarrier` pairs between independent
+    // chunks; not worth the code right now since the cached binding plan
+    // already gets us to ~190 ms / step.
+
     /// Pre-resolved binding for a single kernel argument slot. Keeps the
     /// per-op encode loop branch-light and avoids per-call dictionary work.
     fileprivate enum ResolvedBinding {
@@ -228,6 +243,7 @@ public final class IntegratedExecutor: @unchecked Sendable {
             ))
         }
         self.resolvedPlanOrdered = planArr
+
     }
 
     // MARK: - Execution
@@ -315,16 +331,12 @@ public final class IntegratedExecutor: @unchecked Sendable {
             encoder.label = label
         }
 
-        // Encode all operations to the single encoder.
-        //
-        // The default dispatch type for `makeComputeCommandEncoder()` is
-        // `.serial`, which means consecutive dispatches on the same encoder
-        // already see each other's writes — Metal serializes them on the
-        // device queue. Explicit `memoryBarrier(scope: .buffers)` between
-        // every op is therefore redundant and just adds CPU encoding cost
-        // (measured 288ms of CPU overhead vs 162ms of GPU compute on a
-        // 2360-op nanoGPT train step). Set METALHLO_BARRIER_PER_OP=1 to
-        // restore the per-op barrier if a regression appears.
+        // Direct per-op encode using the cached binding plan. Each op's
+        // dispatch is issued onto the (.serial-by-default) compute encoder,
+        // which gives the GPU the inter-op ordering it needs without any
+        // explicit barriers. The matching .resolvedPlanOrdered cache means
+        // every step avoids the StableHLO view-chain walk and the three
+        // Dictionary lookups (pipelines / dispatches / bindings) per op.
         let perOpBarrier = ProcessInfo.processInfo.environment["METALHLO_BARRIER_PER_OP"] == "1"
         let debugDispatch = ProcessInfo.processInfo.environment["METALHLO_DEBUG_DISPATCH"] != nil
         let unified = unifiedBuffer
@@ -333,14 +345,10 @@ public final class IntegratedExecutor: @unchecked Sendable {
         var lastPipeline: MTLComputePipelineState? = nil
         for i in 0..<plan.count {
             let opPlan = plan[i]
-            // Skip the redundant setComputePipelineState API call when two
-            // adjacent ops share a kernel. Each call has measurable CPU
-            // cost even though the driver no-ops the state change itself.
             if opPlan.pipeline !== lastPipeline {
                 encoder.setComputePipelineState(opPlan.pipeline)
                 lastPipeline = opPlan.pipeline
             }
-
             for binding in opPlan.bindings {
                 switch binding {
                 case .scalar(let value, let index):
@@ -357,7 +365,6 @@ public final class IntegratedExecutor: @unchecked Sendable {
                     encoder.setBuffer(inputBuffer, offset: extraOffset, index: index)
                 }
             }
-
             if opPlan.sharedMemoryBytes > 0 {
                 if opPlan.threadgroupBufferCount == 2 {
                     let tileSize = opPlan.sharedMemoryBytes / 2
@@ -367,7 +374,6 @@ public final class IntegratedExecutor: @unchecked Sendable {
                     encoder.setThreadgroupMemoryLength(opPlan.sharedMemoryBytes, index: 0)
                 }
             }
-
             let dispatch = opPlan.dispatch
             if dispatch.useNonUniform {
                 let totalThreads = MTLSize(
@@ -379,13 +385,11 @@ public final class IntegratedExecutor: @unchecked Sendable {
             } else {
                 encoder.dispatchThreadgroups(dispatch.gridSize, threadsPerThreadgroup: dispatch.threadgroupSize)
             }
-
             if debugDispatch {
                 FileHandle.standardError.write(
                     "[disp] op=\(opPlan.opID) pipeline=\(opPlan.pipeline.label ?? "<unlabelled>") dispatch=tg(\(dispatch.gridSize.width)x\(dispatch.gridSize.height)x\(dispatch.gridSize.depth)) x \(dispatch.threadgroupSize.width)x\(dispatch.threadgroupSize.height)x\(dispatch.threadgroupSize.depth)\n"
                         .data(using: .utf8)!)
             }
-
             if perOpBarrier && i < lastIdx {
                 encoder.memoryBarrier(scope: .buffers)
             }
