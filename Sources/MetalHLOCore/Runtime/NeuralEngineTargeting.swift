@@ -1138,6 +1138,26 @@ public final class HeterogeneousExecutor: @unchecked Sendable {
     /// Maximum consecutive ANE failures before disabling ANE for this executor.
     private let maxConsecutiveANEFailures: Int = 3
 
+    /// Cached partition plan. A `HeterogeneousExecutor` is created per compiled
+    /// `Executable` and always sees the same `HLOFunction`, so the plan is
+    /// identical across all `execute(...)` calls — partitioning a 3,420-op
+    /// function costs ~16ms and is the same answer every time.
+    private var cachedPartitionPlan: GPUANEPartitioner.PartitionPlan?
+    private let planCacheLock = NSLock()
+
+    /// Per-partition cache of the extracted subFunction and compiled MPSGraph.
+    /// Avoids re-extracting (~7ms) and re-hashing module.description (~1.5ms)
+    /// on every execute() call. Populated lazily on first execute(), keyed by
+    /// partition index in the plan. Only GPU partitions are cached; ANE
+    /// partitions go through their own caching path.
+    private var compiledPartitionsByIndex: [Int: CompiledPartition] = [:]
+    private let compiledPartitionsLock = NSLock()
+
+    private struct CompiledPartition {
+        let subFunction: HLOFunction
+        let compiled: CompiledGraph
+    }
+
     public init(
         metalExecutor: MetalExecutor,
         config: Config = .default,
@@ -1166,21 +1186,39 @@ public final class HeterogeneousExecutor: @unchecked Sendable {
         inputs: [String: BufferStorage]
     ) throws -> HeterogeneousExecutionResult {
         let startTime = DispatchTime.now()
+        let profileHet = ProcessInfo.processInfo.environment["METALHLO_PROFILE_HET"] == "1"
 
-        // Partition the function
-        let plan = partitioner.partition(function)
+        // Partition the function (cached — same function every call).
+        let partStart = DispatchTime.now()
+        let plan: GPUANEPartitioner.PartitionPlan
+        planCacheLock.lock()
+        if let cached = cachedPartitionPlan {
+            plan = cached
+            planCacheLock.unlock()
+        } else {
+            planCacheLock.unlock()
+            let computed = partitioner.partition(function)
+            planCacheLock.lock()
+            cachedPartitionPlan = computed
+            planCacheLock.unlock()
+            plan = computed
+        }
+        let partMs = Double(DispatchTime.now().uptimeNanoseconds - partStart.uptimeNanoseconds) / 1_000_000.0
 
         // Reset transfer manager for this execution
+        let setupStart = DispatchTime.now()
         transferManager.clear()
 
         // Store initial inputs in transfer manager
         for (name, storage) in inputs {
             transferManager.storeGPUResult(name: name, storage: storage)
         }
+        let setupMs = Double(DispatchTime.now().uptimeNanoseconds - setupStart.uptimeNanoseconds) / 1_000_000.0
 
         let partitionResults: [PartitionResult]
         var localStats = ExecutionStats()
 
+        let execStart = DispatchTime.now()
         if config.enablePipelining && plan.hasConcurrentLevels {
             partitionResults = try executeConcurrent(plan: plan, function: function, stats: &localStats)
         } else if config.enablePipelining && plan.canPipeline {
@@ -1188,6 +1226,7 @@ public final class HeterogeneousExecutor: @unchecked Sendable {
         } else {
             partitionResults = try executeSequential(plan: plan, function: function, stats: &localStats)
         }
+        let execMs = Double(DispatchTime.now().uptimeNanoseconds - execStart.uptimeNanoseconds) / 1_000_000.0
 
         let endTime = DispatchTime.now()
         let totalTime = Double(endTime.uptimeNanoseconds - startTime.uptimeNanoseconds) / 1_000_000.0
@@ -1205,11 +1244,19 @@ public final class HeterogeneousExecutor: @unchecked Sendable {
         lock.unlock()
 
         // Collect outputs for the original function's return values
+        let outStart = DispatchTime.now()
         var outputStorages: [String: BufferStorage] = [:]
         for retVal in function.returnValues {
             if let storage = try? transferManager.getBufferStorage(name: retVal) {
                 outputStorages[retVal] = storage
             }
+        }
+        let outMs = Double(DispatchTime.now().uptimeNanoseconds - outStart.uptimeNanoseconds) / 1_000_000.0
+
+        if profileHet {
+            FileHandle.standardError.write(
+                "[het] total=\(String(format: "%.2f", totalTime))ms partition=\(String(format: "%.2f", partMs))ms setup=\(String(format: "%.2f", setupMs))ms exec=\(String(format: "%.2f", execMs))ms out=\(String(format: "%.2f", outMs))ms returns=\(function.returnValues.count)\n"
+                    .data(using: .utf8)!)
         }
 
         return HeterogeneousExecutionResult(
@@ -1234,7 +1281,7 @@ public final class HeterogeneousExecutor: @unchecked Sendable {
 
             let result: PartitionResult
             do {
-                result = try executePartition(partition, function: function)
+                result = try executePartition(partition, function: function, partitionIndex: partitionIndex)
             } catch {
                 // ANE failure: fall back to GPU if enabled
                 if partition.device == .ane && config.enableCPUFallback {
@@ -1245,7 +1292,7 @@ public final class HeterogeneousExecutor: @unchecked Sendable {
                         inputTensors: partition.inputTensors,
                         outputTensors: partition.outputTensors
                     )
-                    result = try executePartition(gpuPartition, function: function)
+                    result = try executePartition(gpuPartition, function: function, partitionIndex: partitionIndex)
                 } else {
                     throw error
                 }
@@ -1295,7 +1342,7 @@ public final class HeterogeneousExecutor: @unchecked Sendable {
                 // Single partition — execute inline, no dispatch overhead
                 let partitionIndex = level[0]
                 let partition = plan.partitions[partitionIndex]
-                let result = try executePartitionWithFallback(partition, function: function)
+                let result = try executePartitionWithFallback(partition, function: function, partitionIndex: partitionIndex)
                 state.results[partitionIndex] = result
             } else {
                 // Multiple independent partitions — dispatch concurrently
@@ -1310,7 +1357,7 @@ public final class HeterogeneousExecutor: @unchecked Sendable {
                         defer { group.leave() }
                         do {
                             let result = try self.executePartitionWithFallback(
-                                partition, function: function
+                                partition, function: function, partitionIndex: partitionIndex
                             )
                             state.lock.lock()
                             state.results[partitionIndex] = result
@@ -1402,7 +1449,7 @@ public final class HeterogeneousExecutor: @unchecked Sendable {
 
                 aneQueue.async { [self] in
                     do {
-                        let result = try self.executePartitionWithFallback(partition, function: function)
+                        let result = try self.executePartitionWithFallback(partition, function: function, partitionIndex: partitionIndex)
                         state.lock.lock()
                         state.results[partitionIndex] = result
                         state.lock.unlock()
@@ -1434,7 +1481,7 @@ public final class HeterogeneousExecutor: @unchecked Sendable {
                 }
             } else {
                 // Execute synchronously (GPU partition or ANE with dependency)
-                let result = try executePartitionWithFallback(partition, function: function)
+                let result = try executePartitionWithFallback(partition, function: function, partitionIndex: partitionIndex)
 
                 state.lock.lock()
                 state.results[partitionIndex] = result
@@ -1476,7 +1523,8 @@ public final class HeterogeneousExecutor: @unchecked Sendable {
     /// and all ANE partitions are automatically routed to GPU.
     private func executePartitionWithFallback(
         _ partition: GPUANEPartitioner.DevicePartition,
-        function: HLOFunction
+        function: HLOFunction,
+        partitionIndex: Int? = nil
     ) throws -> PartitionResult {
         // If ANE is disabled due to repeated failures, route directly to GPU
         if partition.device == .ane && aneDisabled {
@@ -1487,11 +1535,11 @@ public final class HeterogeneousExecutor: @unchecked Sendable {
                 inputTensors: partition.inputTensors,
                 outputTensors: partition.outputTensors
             )
-            return try executePartition(gpuPartition, function: function)
+            return try executePartition(gpuPartition, function: function, partitionIndex: partitionIndex)
         }
 
         do {
-            let result = try executePartition(partition, function: function)
+            let result = try executePartition(partition, function: function, partitionIndex: partitionIndex)
             // Reset failure counter on ANE success (thread-safe for concurrent execution)
             if partition.device == .ane {
                 lock.lock()
@@ -1514,31 +1562,50 @@ public final class HeterogeneousExecutor: @unchecked Sendable {
                     inputTensors: partition.inputTensors,
                     outputTensors: partition.outputTensors
                 )
-                return try executePartition(gpuPartition, function: function)
+                return try executePartition(gpuPartition, function: function, partitionIndex: partitionIndex)
             }
             throw error
         }
     }
 
-    /// Executes a single partition on its assigned device.
+    /// Executes a single partition on its assigned device. `partitionIndex` is
+    /// the partition's index in the cached plan; passing `nil` (e.g. for ANE
+    /// fallback rebuilds) bypasses the compiled-partition cache.
     private func executePartition(
         _ partition: GPUANEPartitioner.DevicePartition,
-        function: HLOFunction
+        function: HLOFunction,
+        partitionIndex: Int? = nil
     ) throws -> PartitionResult {
         let startTime = DispatchTime.now()
 
-        let opIds = Set(partition.operationIds)
-        let externalConsumers = SubFunctionExtractor.findExternalConsumers(of: opIds, in: function)
-        let subFunction = SubFunctionExtractor.extract(
-            from: function,
-            operationIds: opIds,
-            outputConsumers: externalConsumers
-        )
-
         switch partition.device {
         case .gpu:
-            try executeOnGPU(subFunction)
+            // Reuse the cached (subFunction, compiledGraph) pair if available.
+            if let idx = partitionIndex, let cached = lookupCompiledPartition(at: idx) {
+                try executeOnGPU(cached.subFunction, compiled: cached.compiled)
+            } else {
+                let opIds = Set(partition.operationIds)
+                let externalConsumers = SubFunctionExtractor.findExternalConsumers(of: opIds, in: function)
+                let subFunction = SubFunctionExtractor.extract(
+                    from: function,
+                    operationIds: opIds,
+                    outputConsumers: externalConsumers
+                )
+                let module = HLOModule(name: subFunction.name, function: subFunction)
+                let compiled = try metalExecutor.compile(module: module)
+                if let idx = partitionIndex {
+                    storeCompiledPartition(CompiledPartition(subFunction: subFunction, compiled: compiled), at: idx)
+                }
+                try executeOnGPU(subFunction, compiled: compiled)
+            }
         case .ane:
+            let opIds = Set(partition.operationIds)
+            let externalConsumers = SubFunctionExtractor.findExternalConsumers(of: opIds, in: function)
+            let subFunction = SubFunctionExtractor.extract(
+                from: function,
+                operationIds: opIds,
+                outputConsumers: externalConsumers
+            )
             try executeOnANE(subFunction)
         case .cpu:
             throw HeterogeneousExecutorError.deviceNotAvailable("CPU execution not implemented")
@@ -1555,27 +1622,50 @@ public final class HeterogeneousExecutor: @unchecked Sendable {
         )
     }
 
-    /// Executes a sub-function on GPU via MetalExecutor (MPSGraph path).
-    private func executeOnGPU(_ subFunction: HLOFunction) throws {
-        // Build an HLOModule from the sub-function
-        let module = HLOModule(name: subFunction.name, function: subFunction)
+    private func lookupCompiledPartition(at index: Int) -> CompiledPartition? {
+        compiledPartitionsLock.lock()
+        defer { compiledPartitionsLock.unlock() }
+        return compiledPartitionsByIndex[index]
+    }
 
-        // Compile via MPSGraph
-        let compiled = try metalExecutor.compile(module: module)
+    private func storeCompiledPartition(_ partition: CompiledPartition, at index: Int) {
+        compiledPartitionsLock.lock()
+        defer { compiledPartitionsLock.unlock() }
+        compiledPartitionsByIndex[index] = partition
+    }
+
+    /// Executes a sub-function on GPU via MetalExecutor. The `compiled` graph is
+    /// passed in (already cached by the caller) so this path skips the per-call
+    /// `metalExecutor.compile` cache lookup (whose key cost ~1.5ms for a 3,420-op
+    /// graph from hashing module.description).
+    private func executeOnGPU(_ subFunction: HLOFunction, compiled: CompiledGraph) throws {
+        let profileHet = ProcessInfo.processInfo.environment["METALHLO_PROFILE_HET"] == "1"
 
         // Gather inputs from transfer manager as BufferStorage
+        let inStart = DispatchTime.now()
         var inputStorages: [BufferStorage] = []
         for arg in subFunction.inputs {
             let storage = try transferManager.getBufferStorage(name: arg.name)
             inputStorages.append(storage)
         }
+        let inMs = Double(DispatchTime.now().uptimeNanoseconds - inStart.uptimeNanoseconds) / 1_000_000.0
 
         // Execute
+        let runStart = DispatchTime.now()
         let outputs = try metalExecutor.execute(compiled: compiled, inputs: inputStorages)
+        let runMs = Double(DispatchTime.now().uptimeNanoseconds - runStart.uptimeNanoseconds) / 1_000_000.0
 
         // Store outputs in transfer manager
+        let storeStart = DispatchTime.now()
         for (i, retVal) in subFunction.returnValues.enumerated() where i < outputs.count {
             transferManager.storeGPUResult(name: retVal, storage: outputs[i])
+        }
+        let storeMs = Double(DispatchTime.now().uptimeNanoseconds - storeStart.uptimeNanoseconds) / 1_000_000.0
+
+        if profileHet {
+            FileHandle.standardError.write(
+                "[gpu] inputs=\(String(format: "%.2f", inMs))ms run=\(String(format: "%.2f", runMs))ms store=\(String(format: "%.2f", storeMs))ms ins=\(subFunction.inputs.count) outs=\(subFunction.returnValues.count)\n"
+                    .data(using: .utf8)!)
         }
     }
 

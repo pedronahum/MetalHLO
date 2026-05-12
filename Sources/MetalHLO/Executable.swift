@@ -263,8 +263,19 @@ public final class Executable: @unchecked Sendable {
         let inputNames = executable.inputOrder
 
         for (index, name) in inputNames.enumerated() where index < inputs.count {
-            // Create Metal buffer from storage data
             let storage = inputs[index].storage
+            // Zero-copy fast path: BufferStorage already wraps an MTLBuffer.
+            // Avoids `storage.toData()` + `device.makeBuffer(bytes:)` which would
+            // memcpy the input twice — a real problem when an op takes a large
+            // tensor as input (e.g. `jit_dynamic_slice` on the full preloaded
+            // CIFAR-10 dataset = 600 MB copied twice, ~80 ms per step).
+            if let buffer = storage.metalBuffer {
+                metalInputs[name] = buffer
+                continue
+            }
+            // Slow path: small tensors stored as `.data` — copy once into a new
+            // shared MTLBuffer. (Acceptable: small tensors are by construction
+            // well under the LargeTensorStorage threshold.)
             let data = (try? storage.toData()) ?? Data()
             if let buffer = device.makeBuffer(bytes: (data as NSData).bytes, length: data.count, options: .storageModeShared) {
                 metalInputs[name] = buffer
@@ -277,15 +288,19 @@ public final class Executable: @unchecked Sendable {
         let device = executor.device
         // Use outputOrder to preserve function signature order (not alphabetical)
         let outputNames = executor.executable.outputOrder
+        // Outputs are copied (not zero-copy wrapped) because IntegratedExecutor
+        // pools its output buffers across executes — a zero-copy reference
+        // would see its data overwritten by a subsequent execute. The cost is
+        // small in practice (outputs are by definition the result of one
+        // kernel pass, much smaller than the dataset-sized inputs that the
+        // zero-copy path in `buildMetalInputs` handles).
         return outputNames.compactMap { name -> Buffer? in
             guard let metalBuffer = result.outputs[name],
                   let spec = executor.executable.outputSpecs[name] else {
                 return nil
             }
-            // Copy data from Metal buffer to Data
             let byteCount = metalBuffer.length
             let data = Data(bytes: metalBuffer.contents(), count: byteCount)
-            // Create BufferStorage with the data
             let storage = try? BufferStorage(
                 bytes: data,
                 shape: spec.shape,

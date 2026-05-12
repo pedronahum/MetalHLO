@@ -2024,6 +2024,8 @@ func pjrt_loaded_executable_execute(
         return makeError(PJRT_Error_Code_INVALID_ARGUMENT, "NULL args")
     }
     let loaded = fromOpaque(OpaquePointer(loadedPtr), as: PJRTLoadedExecutableImpl.self)
+    let profilePJRT = ProcessInfo.processInfo.environment["METALHLO_PROFILE_PJRT"] == "1"
+    let pjrtStart = profilePJRT ? CFAbsoluteTimeGetCurrent() : 0
 
     let numDevices = Int(args.pointee.num_devices)
     let numArgs = Int(args.pointee.num_args)
@@ -2047,10 +2049,12 @@ func pjrt_loaded_executable_execute(
             inputs.append(bufImpl.buffer)
         }
     }
+    let inputsEnd = profilePJRT ? CFAbsoluteTimeGetCurrent() : 0
 
     // Execute
     do {
         let outputs = try loaded.executable.execute(inputs)
+        let execEnd = profilePJRT ? CFAbsoluteTimeGetCurrent() : 0
 
         // Write output buffers to output_lists[0]
         if let outputLists = args.pointee.output_lists, numDevices > 0,
@@ -2075,6 +2079,16 @@ func pjrt_loaded_executable_execute(
             events[0] = UnsafeMutablePointer<PJRT_Event>(
                 retainAsOpaque(event)
             )
+        }
+
+        if profilePJRT {
+            let totalMs = (CFAbsoluteTimeGetCurrent() - pjrtStart) * 1000
+            let inputMs = (inputsEnd - pjrtStart) * 1000
+            let execMs = (execEnd - inputsEnd) * 1000
+            let outputMs = totalMs - execMs - inputMs
+            FileHandle.standardError.write(
+                "[pjrt] total=\(String(format: "%.2f", totalMs))ms inputs=\(String(format: "%.2f", inputMs))ms exec=\(String(format: "%.2f", execMs))ms outputs=\(String(format: "%.2f", outputMs))ms numInputs=\(numArgs) numOutputs=\(outputs.count)\n"
+                    .data(using: .utf8)!)
         }
 
         return nil

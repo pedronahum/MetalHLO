@@ -286,12 +286,42 @@ public final class MetalExecutor: @unchecked Sendable {
         let inputDataArray = compiled.inputTensors.compactMap { inputDict[$0] }
 
         // Execute: synchronous run() ensures GPU work completes before reading results.
-        let outputDataArray = compiled.executable.run(
-            with: commandQueue,
-            inputs: inputDataArray,
-            results: nil,
-            executionDescriptor: nil
-        )
+        // When METALHLO_PROFILE_GPU=1 is set, attach scheduled/completion handlers to
+        // split CPU dispatch time (startTime → scheduled) from GPU compute (scheduled
+        // → completion). Prints one line per call to stderr; aggregate externally.
+        let profileGPU = ProcessInfo.processInfo.environment["METALHLO_PROFILE_GPU"] == "1"
+        let outputDataArray: [MPSGraphTensorData]
+        if profileGPU {
+            var scheduledTime: CFAbsoluteTime = 0
+            var completedTime: CFAbsoluteTime = 0
+            let descriptor = MPSGraphExecutableExecutionDescriptor()
+            descriptor.waitUntilCompleted = true
+            descriptor.scheduledHandler = { _, _ in
+                scheduledTime = CFAbsoluteTimeGetCurrent()
+            }
+            descriptor.completionHandler = { _, _ in
+                completedTime = CFAbsoluteTimeGetCurrent()
+            }
+            outputDataArray = compiled.executable.run(
+                with: commandQueue,
+                inputs: inputDataArray,
+                results: nil,
+                executionDescriptor: descriptor
+            )
+            let dispatchMs = (scheduledTime - encodeEndTime) * 1000
+            let gpuMs = (completedTime - scheduledTime) * 1000
+            let encodeMs = (encodeEndTime - startTime) * 1000
+            FileHandle.standardError.write(
+                "[prof] encode=\(String(format: "%.2f", encodeMs))ms dispatch=\(String(format: "%.2f", dispatchMs))ms gpu=\(String(format: "%.2f", gpuMs))ms\n"
+                    .data(using: .utf8)!)
+        } else {
+            outputDataArray = compiled.executable.run(
+                with: commandQueue,
+                inputs: inputDataArray,
+                results: nil,
+                executionDescriptor: nil
+            )
+        }
 
         let gpuEndTime = CFAbsoluteTimeGetCurrent()
 
