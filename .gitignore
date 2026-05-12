@@ -35,3 +35,7 @@ Package.resolved
 CMakeCache.txt
 CMakeFiles/
 __pycache__/
+
+# Benchmark-downloaded datasets (re-fetched on first run)
+Examples/Benchmarks/karpathy_gpt/input.txt
+Examples/Benchmarks/nanogpt/input.txt
