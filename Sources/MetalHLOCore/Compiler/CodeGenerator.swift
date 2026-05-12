@@ -3196,9 +3196,18 @@ public final class CodeGenerator: @unchecked Sendable {
             rhsBatchDims = swapLastTwoDimPositions(rhsBatchDims, rank: rhsShape.count)
         }
 
-        // Calculate batch size from batch dimensions
-        let batchSize = lhsBatchDims.isEmpty ? (lhsShape.count > 2 ? lhsShape.dropLast(2).reduce(1, *) : 1) :
-            lhsBatchDims.reduce(1) { $0 * lhsShape[$1] }
+        // Calculate batch size from batch dimensions.
+        // Mirror dotGeneralDims: implicit batch only applies when LHS and RHS
+        // have the same rank > 2 (true batched matmul). For (B,T,C) @ (C,D)
+        // the leading LHS dims fold into M, batch is 1.
+        let batchSize: Int
+        if !lhsBatchDims.isEmpty {
+            batchSize = lhsBatchDims.reduce(1) { $0 * lhsShape[$1] }
+        } else if lhsShape.count > 2 && lhsShape.count == rhsShape.count {
+            batchSize = lhsShape.dropLast(2).reduce(1, *)
+        } else {
+            batchSize = 1
+        }
 
         // Extract M, K, N:
         // M = product of LHS non-contracting, non-batch dims
@@ -5974,9 +5983,20 @@ public final class CodeGenerator: @unchecked Sendable {
         for (i, s) in rhsShape.enumerated() {
             if !rhsContractDims.contains(i) && !rhsBatchDims.contains(i) { nVal *= s }
         }
-        let batchVal = lhsBatchDims.isEmpty
-            ? (lhsShape.count > 2 ? lhsShape.dropLast(2).reduce(1, *) : 1)
-            : lhsBatchDims.reduce(1) { $0 * lhsShape[$1] }
+        // Implicit batch from LHS leading dims is only correct when RHS has
+        // matching leading dims (true batched matmul: (B,M,K) @ (B,K,N)). When
+        // RHS has fewer dims (e.g. (B,T,C) @ (C,D)), the leading LHS dims are
+        // part of M, not batch — the kernel would otherwise read `batchCount`
+        // times M*K elements from a buffer holding only M*K, scribbling OOB
+        // writes that corrupt neighbouring slots in the unified buffer.
+        let batchVal: Int
+        if !lhsBatchDims.isEmpty {
+            batchVal = lhsBatchDims.reduce(1) { $0 * lhsShape[$1] }
+        } else if lhsShape.count > 2 && lhsShape.count == rhsShape.count {
+            batchVal = lhsShape.dropLast(2).reduce(1, *)
+        } else {
+            batchVal = 1
+        }
         return (UInt32(mVal), UInt32(kVal), UInt32(nVal), UInt32(batchVal))
     }
 
