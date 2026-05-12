@@ -207,7 +207,11 @@ public final class TransposeCanonicalizer: OptimizationPass, @unchecked Sendable
             if let inputDef = definingOps[op.operands[0]],
                inputDef.op.kind == .transpose,
                let innerPerm = inputDef.op.attributes.dimensions {
-                // Compose permutations: perm2[perm1[i]] for all i
+                // Compose permutations. For y = x.transpose(p1) and
+                // z = y.transpose(p2), z axis i is y axis p2[i] which is
+                // x axis p1[p2[i]] — so the composed permutation is
+                // p2.map { p1[$0] }, NOT p1.map { p2[$0] }. The two only
+                // happen to agree when p1 and p2 are involutions.
                 let composedPerm = composePermutations(innerPerm, permutation)
 
                 // Check if composed is identity
@@ -282,9 +286,12 @@ public final class TransposeCanonicalizer: OptimizationPass, @unchecked Sendable
         return true
     }
 
-    /// Composes two permutations: result[i] = perm2[perm1[i]].
+    /// Composes two permutations for `x.transpose(perm1).transpose(perm2)`.
+    /// Result axis `i` is `y`'s axis `perm2[i]`, which is `x`'s axis
+    /// `perm1[perm2[i]]` — so the composed permutation is
+    /// `[perm1[perm2[i]] for i in 0..<rank]`, i.e. `perm2.map { perm1[$0] }`.
     private func composePermutations(_ perm1: [Int], _ perm2: [Int]) -> [Int] {
-        return perm1.map { perm2[$0] }
+        return perm2.map { perm1[$0] }
     }
 
     /// Replaces all uses of a tensor with another.

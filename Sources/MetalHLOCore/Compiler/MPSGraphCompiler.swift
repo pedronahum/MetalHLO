@@ -1172,7 +1172,29 @@ public final class MPSGraphCompiler {
         let predicate = try getOperand(op.operands[0])
         let trueValue = try getOperand(op.operands[1])
         let falseValue = try getOperand(op.operands[2])
-        return graph.select(predicate: predicate, trueTensor: trueValue, falseTensor: falseValue, name: op.result)
+
+        // StableHLO allows a scalar predicate (rank 0) to be implicitly
+        // broadcast to the value-tensor shape. MPSGraph's `select` doesn't
+        // broadcast a scalar predicate — it ends up reading only the first
+        // byte and producing garbage for all positions past index 0
+        // (manifests as NaN downstream when one of the value branches is NaN,
+        // which is how `jnp.var`'s safe-divide-by-N wrapper triggers this).
+        // If the predicate is lower-rank than the values, broadcast it.
+        let predRank = predicate.shape?.count ?? 0
+        let valueShape = trueValue.shape ?? falseValue.shape
+        let valueRank = valueShape?.count ?? 0
+        let broadcastedPredicate: MPSGraphTensor
+        if predRank < valueRank, let target = valueShape {
+            broadcastedPredicate = graph.broadcast(predicate, shape: target, name: nil)
+        } else {
+            broadcastedPredicate = predicate
+        }
+        return graph.select(
+            predicate: broadcastedPredicate,
+            trueTensor: trueValue,
+            falseTensor: falseValue,
+            name: op.result
+        )
     }
 
     private func compileClamp(_ op: HLOOperation) throws -> MPSGraphTensor {

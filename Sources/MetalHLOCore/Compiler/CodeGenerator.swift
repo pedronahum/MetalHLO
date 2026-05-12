@@ -784,9 +784,12 @@ public final class CodeGenerator: @unchecked Sendable {
         case .select:
             let inputType = attributes.inputElementTypes?.last ?? elementType
             let valueMetal = metalTypeName(for: inputType)
+            let predShape = inputShapes.first ?? []
+            let predIsScalar = predShape.reduce(1, *) == 1
             source += generateSelectKernel(
                 entryPoint: entryPoint,
-                metalType: valueMetal
+                metalType: valueMetal,
+                predIsScalar: predIsScalar
             )
 
         // Clamp operations
@@ -2007,8 +2010,16 @@ public final class CodeGenerator: @unchecked Sendable {
     /// Generates a select kernel: output = pred ? on_true : on_false.
     private func generateSelectKernel(
         entryPoint: String,
-        metalType: String
+        metalType: String,
+        predIsScalar: Bool = false
     ) -> String {
+        // StableHLO permits a rank-0 predicate that's implicitly broadcast to
+        // the value-tensor shape; without the scalar branch below the kernel
+        // indexes off the end of a 1-element bool buffer for every position
+        // past 0 and gets garbage (this is precisely how jnp.var's
+        // safe-divide-by-N wrapper produces NaN downstream — see the var
+        // jaxpr's `select_n(scalar_bool, NaN_bcast, var)`).
+        let predIndex = predIsScalar ? "0" : "tid"
         return """
         kernel void \(entryPoint)(
             device const bool* pred [[buffer(0)]],
@@ -2019,7 +2030,7 @@ public final class CodeGenerator: @unchecked Sendable {
             uint tid [[thread_position_in_grid]])
         {
             if (tid >= count) return;
-            output[tid] = pred[tid] ? on_true[tid] : on_false[tid];
+            output[tid] = pred[\(predIndex)] ? on_true[tid] : on_false[tid];
         }
         """
     }
