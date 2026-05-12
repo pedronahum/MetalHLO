@@ -44,6 +44,45 @@ public final class IntegratedExecutor: @unchecked Sendable {
     /// Constant buffers (created once).
     private var constantBuffers: [String: MTLBuffer]
 
+    /// Pre-resolved op plans in execution order. `executable.bindings[opID]`
+    /// walks the StableHLO view chain and does multiple dictionary lookups
+    /// per binding; that all resolves to a static answer (the offsets and
+    /// constant buffers are fixed by the memory planner). Caching as a flat
+    /// array indexed by execution position lets the hot loop skip both the
+    /// view-chain walk *and* the `Dictionary` hashing per op.
+    private let resolvedPlanOrdered: [ResolvedOpPlan]
+
+    /// Pre-resolved binding for a single kernel argument slot. Keeps the
+    /// per-op encode loop branch-light and avoids per-call dictionary work.
+    fileprivate enum ResolvedBinding {
+        /// `setBytes` of a 32-bit scalar (compile-time constant).
+        case scalar(value: UInt32, index: Int)
+        /// `setBuffer(unifiedBuffer, offset:)` — offset is precomputed.
+        case unified(offset: Int, index: Int)
+        /// `setBuffer(constantBuffer, offset:)` — constant buffer is fixed at
+        /// init time.
+        case constant(buffer: MTLBuffer, offset: Int, index: Int)
+        /// `setBuffer(inputs[name], offset:)` — only this one needs a
+        /// per-execute lookup. `name` is the *resolved* (post-view-chain)
+        /// tensor id; `extraOffset` is the view byte offset baked in.
+        case input(name: String, extraOffset: Int, index: Int)
+    }
+
+    /// Per-op cached dispatch + bindings. Reading the three executable
+    /// dictionaries (pipelines / dispatches / bindings) on every op is what
+    /// the encode loop used to spend most of its time on.
+    fileprivate struct ResolvedOpPlan {
+        let pipeline: MTLComputePipelineState
+        let dispatch: DispatchConfig
+        let bindings: [ResolvedBinding]
+        /// (threadgroupMemorySize, bufferCount) — both zero when the op
+        /// doesn't ask for shared memory.
+        let sharedMemoryBytes: Int
+        let threadgroupBufferCount: Int
+        /// Original op ID, kept for diagnostics (`METALHLO_DEBUG_DISPATCH`).
+        let opID: OpID
+    }
+
     /// Configuration.
     public let config: Config
 
@@ -138,6 +177,57 @@ public final class IntegratedExecutor: @unchecked Sendable {
                 poolSize: config.outputPoolSize
             )
         }
+
+        // Build the per-op resolved plan once. Walk every binding through
+        // the view chain + memory plan now so the encode hot path skips
+        // those lookups entirely.
+        var planArr: [ResolvedOpPlan] = []
+        planArr.reserveCapacity(executable.executionOrder.count)
+        let memoryPlan = executable.memoryPlan
+        let constants = executable.constantBuffers
+        for opID in executable.executionOrder {
+            guard let pipeline = executable.pipelines[opID],
+                  let dispatch = executable.dispatches[opID],
+                  let bindings = executable.bindings[opID] else { continue }
+            var resolved: [ResolvedBinding] = []
+            resolved.reserveCapacity(bindings.count)
+            for binding in bindings {
+                switch binding.source {
+                case .scalar(let value):
+                    resolved.append(.scalar(value: value, index: binding.index))
+                case .unified(let offset):
+                    resolved.append(.unified(offset: offset + binding.offset, index: binding.index))
+                case .constant(let id):
+                    guard let buf = constants[id] else { continue }
+                    resolved.append(.constant(buffer: buf, offset: binding.offset, index: binding.index))
+                case .input(let name):
+                    let (baseName, viewOffset) = executable.resolveViewChain(name)
+                    resolved.append(.input(name: baseName, extraOffset: binding.offset + viewOffset, index: binding.index))
+                case .output(let name):
+                    let (baseName, viewOffset) = executable.resolveViewChain(name)
+                    if let off = memoryPlan.tensorOffsets[baseName] {
+                        resolved.append(.unified(offset: off + binding.offset + viewOffset, index: binding.index))
+                    } else if let off = memoryPlan.tensorOffsets[name] {
+                        resolved.append(.unified(offset: off + binding.offset, index: binding.index))
+                    } else {
+                        // Direct output without a plan entry — fall back to
+                        // the input slot the caller will provide.
+                        resolved.append(.input(name: name, extraOffset: binding.offset, index: binding.index))
+                    }
+                case .threadgroup:
+                    continue  // never bound as a buffer
+                }
+            }
+            planArr.append(ResolvedOpPlan(
+                pipeline: pipeline,
+                dispatch: dispatch,
+                bindings: resolved,
+                sharedMemoryBytes: executable.sharedMemorySizes[opID] ?? 0,
+                threadgroupBufferCount: executable.threadgroupBufferCounts[opID] ?? 1,
+                opID: opID
+            ))
+        }
+        self.resolvedPlanOrdered = planArr
     }
 
     // MARK: - Execution
@@ -239,17 +329,71 @@ public final class IntegratedExecutor: @unchecked Sendable {
         // 2360-op nanoGPT train step). Set METALHLO_BARRIER_PER_OP=1 to
         // restore the per-op barrier if a regression appears.
         let perOpBarrier = ProcessInfo.processInfo.environment["METALHLO_BARRIER_PER_OP"] == "1"
-        for (index, opID) in executable.executionOrder.enumerated() {
-            try encodeOperationToEncoder(
-                opID,
-                encoder: encoder,
-                inputs: inputs,
-                kernelTimings: &kernelTimings
-            )
-            if perOpBarrier && index < executable.executionOrder.count - 1 {
+        let debugDispatch = ProcessInfo.processInfo.environment["METALHLO_DEBUG_DISPATCH"] != nil
+        let unified = unifiedBuffer
+        let plan = resolvedPlanOrdered
+        let lastIdx = plan.count - 1
+        var lastPipeline: MTLComputePipelineState? = nil
+        for i in 0..<plan.count {
+            let opPlan = plan[i]
+            // Skip the redundant setComputePipelineState API call when two
+            // adjacent ops share a kernel. Each call has measurable CPU
+            // cost even though the driver no-ops the state change itself.
+            if opPlan.pipeline !== lastPipeline {
+                encoder.setComputePipelineState(opPlan.pipeline)
+                lastPipeline = opPlan.pipeline
+            }
+
+            for binding in opPlan.bindings {
+                switch binding {
+                case .scalar(let value, let index):
+                    var v = value
+                    encoder.setBytes(&v, length: MemoryLayout<UInt32>.size, index: index)
+                case .unified(let offset, let index):
+                    encoder.setBuffer(unified, offset: offset, index: index)
+                case .constant(let buffer, let offset, let index):
+                    encoder.setBuffer(buffer, offset: offset, index: index)
+                case .input(let name, let extraOffset, let index):
+                    guard let inputBuffer = inputs[name] else {
+                        throw IntegratedExecutorError.missingInput(name)
+                    }
+                    encoder.setBuffer(inputBuffer, offset: extraOffset, index: index)
+                }
+            }
+
+            if opPlan.sharedMemoryBytes > 0 {
+                if opPlan.threadgroupBufferCount == 2 {
+                    let tileSize = opPlan.sharedMemoryBytes / 2
+                    encoder.setThreadgroupMemoryLength(tileSize, index: 0)
+                    encoder.setThreadgroupMemoryLength(tileSize, index: 1)
+                } else {
+                    encoder.setThreadgroupMemoryLength(opPlan.sharedMemoryBytes, index: 0)
+                }
+            }
+
+            let dispatch = opPlan.dispatch
+            if dispatch.useNonUniform {
+                let totalThreads = MTLSize(
+                    width: dispatch.gridSize.width * dispatch.threadgroupSize.width,
+                    height: dispatch.gridSize.height * dispatch.threadgroupSize.height,
+                    depth: dispatch.gridSize.depth * dispatch.threadgroupSize.depth
+                )
+                encoder.dispatchThreads(totalThreads, threadsPerThreadgroup: dispatch.threadgroupSize)
+            } else {
+                encoder.dispatchThreadgroups(dispatch.gridSize, threadsPerThreadgroup: dispatch.threadgroupSize)
+            }
+
+            if debugDispatch {
+                FileHandle.standardError.write(
+                    "[disp] op=\(opPlan.opID) pipeline=\(opPlan.pipeline.label ?? "<unlabelled>") dispatch=tg(\(dispatch.gridSize.width)x\(dispatch.gridSize.height)x\(dispatch.gridSize.depth)) x \(dispatch.threadgroupSize.width)x\(dispatch.threadgroupSize.height)x\(dispatch.threadgroupSize.depth)\n"
+                        .data(using: .utf8)!)
+            }
+
+            if perOpBarrier && i < lastIdx {
                 encoder.memoryBarrier(scope: .buffers)
             }
         }
+        _ = kernelTimings  // not used in the fast path — kept for executeAsync caller
 
         encoder.endEncoding()
 
