@@ -47,19 +47,18 @@ Measured on **Apple M5 Pro**, JAX 0.10.0 / Flax 0.12.7:
 
 | Backend | Time per step | Speedup |
 |---------|---------------|---------|
-| MetalHLO (GPU) | 0.413 s | **5.6×** |
+| MetalHLO (GPU) | 0.275 s | **8.48×** |
 | CPU | 2.332 s | 1× |
 
-(MetalHLO time is the mean of three runs of 30 steps each — 0.413 /
-0.412 / 0.413 s. Times averaged over the second half of each run.
-Loss converges identically on both backends — 2.367 at init
-descending to ~1.8 within 30 steps.)
+(MetalHLO time is the mean of three back-to-back runs of 30 steps each
+— 0.275 / 0.275 / 0.275 s, zero variance to 3 decimals. Times averaged
+over the second half of each run. Loss converges identically on both
+backends — 2.367 at init, 1.728 at step 30, bit-equal with CPU.)
 
 For comparison, the upstream `jax-mps` benchmark on an M4 MacBook Air
 reports CPU 3.2s vs MPS 0.7s (4.7×). Numbers aren't directly
-comparable (different chip, different JAX backend), but we land in
-the same neighbourhood with marginally better speedup on the more
-powerful M5 Pro.
+comparable (different chip, different JAX backend), but MetalHLO now
+runs nearly 2× faster than that ratio on the more powerful M5 Pro.
 
 ## Files
 
@@ -110,3 +109,41 @@ deterministic slow path) to ~0.41s/step, and as a side-effect
 tightened the Mini-ResNet `train_step_params` correctness from a
 generous `2e-2` tolerance (the previous transposed-conv path
 introduced drift) to bit-exact `7e-8`.
+
+A second round of profiling-driven work took the same benchmark from
+0.41s to **0.275 s/step** (5.6× → 8.48×):
+
+5. **HeterogeneousExecutor caches.** Each PJRT execute was re-running
+   the GPU/ANE partitioner over all 3,420 ops (~16 ms wasted) and
+   re-extracting the per-partition sub-function + re-hashing
+   `module.description` for the compile-cache key (~9 ms more).
+   `cachedPartitionPlan` plus a `compiledPartitionsByIndex` cache
+   make the first execute pay this cost and subsequent ones skip it.
+
+6. **Zero-copy inputs into IntegratedExecutor.** A 600 MB-per-step
+   memcpy bug surfaced via PJRT-level timing: `buildMetalInputs` was
+   doing `storage.toData() → device.makeBuffer(bytes:)` on every
+   input, every execute. The hot offender was `jit_dynamic_slice` on
+   the preloaded CIFAR-10 dataset — 600 MB copied twice per step,
+   ~80 ms of pure memcpy. When `BufferStorage.metalBuffer` is already
+   present, we now pass that MTLBuffer through directly. The single
+   `dynamic_slice` PJRT call went from 82 ms to ~1.9 ms.
+
+7. **BatchNorm training-apply fusion.** JAX emits BN training as a
+   ~17-op chain (broadcast(reshape(mean)) → subtract → broadcast(rsqrt
+   × gamma) → multiply → add(broadcast(reshape(beta)))) — each step
+   round-trips through the full N×H×W×C tensor. A new
+   `BatchNormFusionPass` detects this pattern (distinguishing it from
+   LayerNorm via the multi-axis reduce that produces the 1D mean) and
+   replaces the root op with one `graph.normalize` MPSGraph call.
+   20 BN forwards detected on ResNet18 (17 main + 3 stage-transition
+   projection BNs). The upstream reduce/mean/variance chain stays in
+   place — JAX consumes those same values for the running-stats update
+   and for the BN gradient.
+
+The runtime profile harnesses that drove (5)–(7) are committed and
+env-gated for follow-up perf work: `METALHLO_PROFILE_GPU=1` (encode
+/ CPU dispatch / GPU compute via MPSGraph scheduled+completion
+handlers), `METALHLO_PROFILE_HET=1` (heterogeneous executor stage
+times), and `METALHLO_PROFILE_PJRT=1` (per-PJRT-call timing at the
+C-API boundary).

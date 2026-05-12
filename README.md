@@ -35,6 +35,7 @@ MetalHLO is a fully-functional JAX backend for Apple Silicon. **130 tests across
 | LSTMCell, GRUCell | [flax_metalhlo_layers.py](Examples/FlaxExample/flax_metalhlo_layers.py) |
 | `flax.nnx` API: Linear, Conv, LayerNorm, RMSNorm, Embed, MLP, MHA, Dropout, BatchNorm, jit, grad | [flax_metalhlo_nnx.py](Examples/FlaxExample/flax_metalhlo_nnx.py) |
 | End-to-end: Mini-BERT (forward), Mini-ResNet (eval + train step), Mini-CNN (3-step Adam training), Autoencoder (5-step Adam training) | [flax_metalhlo_e2e.py](Examples/FlaxExample/flax_metalhlo_e2e.py) |
+| Full ResNet18 on CIFAR-10 (batch 256, fp32, Adam) — **8.48× over JAX CPU** on M5 Pro | [Examples/Benchmarks/resnet_cifar10](Examples/Benchmarks/resnet_cifar10) |
 
 ### Known limitations
 
