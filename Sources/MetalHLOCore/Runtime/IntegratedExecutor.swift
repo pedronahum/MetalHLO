@@ -263,35 +263,32 @@ public final class IntegratedExecutor: @unchecked Sendable {
             try executable.validateInputs(inputs)
         }
 
-        // Allocate a fresh unified buffer per execute(). The previous
-        // approach (reuse a single cached unifiedBuffer and host-memset
-        // it on entry) caused #18 BERT cross-call NaN: even with
-        // waitUntilCompleted() at the end of the previous execute() AND
-        // a GPU-encoded blit-fill at the start of the next, kernels
-        // still read stale leftover values from the previous run. The
-        // bytes on the host side were zero, but kernel reads landed on
-        // something else — most likely either an Apple-Silicon GPU
-        // cache view of the buffer that doesn't get invalidated by host
-        // memset / blit fill, or memory accessed beyond the planned
-        // unifiedBuffer.length (i.e. our memory plan underestimates the
-        // working set for this program). Allocating fresh dodges both:
-        // a brand-new MTLBuffer can't carry GPU-side cache state, and
-        // the OS hands us zero-initialized pages so any access beyond
-        // the planned range still reads zero.
+        // unifiedBuffer reuse vs fresh-alloc-per-execute.
         //
-        // Cost: one MTLBuffer allocation per execute(). On Apple
-        // Silicon's UMA, this is fast (heap allocator); the previous
-        // "pre-allocate once" path was a perf optimization that turned
-        // out to be a correctness bug. Worth revisiting once we have a
-        // tighter handle on the actual MTLBuffer state coherence rules.
-        let bufferSize = unifiedBuffer.length
-        if let fresh = device.makeBuffer(length: bufferSize, options: .storageModeShared) {
-            fresh.label = unifiedBuffer.label
-            unifiedBuffer = fresh
+        // The historic prior bug ("BERT cross-call NaN", documented in the
+        // earlier comment) was that reusing the same MTLBuffer across
+        // execute()s left scatter / gather / atomic-add updates from the
+        // previous step visible to the next. Allocating fresh dodged that.
+        //
+        // Since then we've fixed the underlying ops:
+        //   - scatter no longer relies on the bogus in-kernel copy phase
+        //     (commit d25515b)
+        //   - the autoreleasepool wrapper releases the previous
+        //     command-buffer-retained buffer ARC reference per step
+        //   - the memory planner places each tensor at a non-overlapping
+        //     offset so old values never feed a fresh op
+        //
+        // Reusing the persistent buffer + host-memset is cheaper than
+        // allocating + zero-faulting a fresh 24-MB-to-100-MB region per
+        // step. Default to reuse; `METALHLO_FRESH_UNIFIED=1` restores
+        // fresh-per-execute for diagnostics.
+        if ProcessInfo.processInfo.environment["METALHLO_FRESH_UNIFIED"] == "1" {
+            let bufferSize = unifiedBuffer.length
+            if let fresh = device.makeBuffer(length: bufferSize, options: .storageModeShared) {
+                fresh.label = unifiedBuffer.label
+                unifiedBuffer = fresh
+            }
         }
-        // Belt-and-suspenders: zero the freshly allocated buffer. The
-        // OS typically zeros new pages, but Apple's docs make no
-        // guarantee about MTLBuffer contents at allocation.
         memset(unifiedBuffer.contents(), 0, unifiedBuffer.length)
 
         // Create command buffer
