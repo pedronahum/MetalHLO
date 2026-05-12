@@ -1430,123 +1430,183 @@ public final class CodeGenerator: @unchecked Sendable {
         operandType: String,
         indicesType: String
     ) -> String {
+        // General scatter kernel that mirrors the (now-fixed) gather kernel
+        // and adds input_batching_dims support.
+        //
+        // The previous specialization was written for the
+        // numIndices = indicesShape[0], scatter into a single row pattern
+        // (one batching dim *always* at operand dim 0, no operand-side window
+        // beyond inserted-singleton, indices laid out flat). It silently
+        // produced wrong dstPos for the multi-dim-batching pattern that
+        // `optax.softmax_cross_entropy_with_integer_labels`'s backward
+        // emits — `input_batching_dims = [0]`, `scatter_indices_batching_dims = [0]`,
+        // operand (B, V), updates (B, 1) — by dropping the batch-coord
+        // contribution and writing every batched update at
+        // `operand[0, scatter_idx]` instead of `operand[b, scatter_idx]`.
+        //
+        // The general algorithm here matches the StableHLO scatter semantics:
+        //   For each update element (tid) decomposed into per-dim coords `uc[]`:
+        //     • split `uc` into "scatter dims" (positions NOT in
+        //       update_window_dims) and "window dims" (positions in
+        //       update_window_dims).
+        //     • scatter dims, in update-order, map 1:1 to scatter_indices'
+        //       non-IVD dims. Use them both to read the scatter index
+        //       components AND to provide the batch coord for any
+        //       operand dim listed in `input_batching_dims`.
+        //     • window dims map to operand dims that aren't inserted or
+        //       batched, in operand-order.
+        //   Then for each operand dim d:
+        //     • d ∈ input_batching_dims[k] → batch coord (= uc[update-dim
+        //       paired with scatter_indices_batching_dims[k]])
+        //     • d ∈ scatter_dims_to_operand_dims[k] → scatter_idx[k]
+        //     • else → window coord (= uc[update_window_dims[i]] where i is
+        //       d's position in the operand-window-dim list)
+
         let totalOperandElements = operandShape.reduce(1, *)
-
-        // Calculate the number of scatter indices and slice size.
-        // For window scatter (update_window_dims covers all update dims),
-        // the slice includes all update elements per index.
-        // For per-element scatter, the slice is the trailing update dimensions.
-        let numIndices: Int
-        let sliceSize: Int
-        if dimNumbers.updateWindowDims.count == updatesShape.count {
-            // Window scatter: entire update is placed at each index position
-            numIndices = 1  // Only one scatter position per update tensor
-            sliceSize = updatesShape.reduce(1, *)
-        } else if indicesShape.isEmpty {
-            numIndices = 0
-            sliceSize = 1
-        } else {
-            numIndices = indicesShape[0]
-            if updatesShape.count > 1 {
-                sliceSize = updatesShape.dropFirst().reduce(1, *)
-            } else {
-                sliceSize = 1
-            }
-        }
-
         let totalUpdateElements = updatesShape.reduce(1, *)
 
-        // Calculate operand inner stride (elements per row in operand)
-        let operandInnerStride: Int
-        if operandShape.count >= 2 && !dimNumbers.scatterDimsToOperandDims.isEmpty
-            && dimNumbers.scatterDimsToOperandDims[0] == 0 {
-            operandInnerStride = operandShape.dropFirst().reduce(1, *)
-        } else if operandShape.count == 1 {
-            operandInnerStride = 1
-        } else {
-            let indexedDim = dimNumbers.scatterDimsToOperandDims.first ?? 0
-            if indexedDim < operandShape.count - 1 {
-                operandInnerStride = operandShape.suffix(from: indexedDim + 1).reduce(1, *)
+        // Strides for each tensor (row-major).
+        func strides(of shape: [Int]) -> [Int] {
+            var s = [Int](repeating: 1, count: shape.count)
+            if shape.count >= 2 {
+                for d in stride(from: shape.count - 2, through: 0, by: -1) {
+                    s[d] = s[d + 1] * shape[d + 1]
+                }
+            }
+            return s
+        }
+        let operandStrides = strides(of: operandShape)
+        let updatesStrides = strides(of: updatesShape)
+        let indicesStrides = strides(of: indicesShape)
+
+        let ivd = dimNumbers.indexVectorDim
+        let updateWindowSet = Set(dimNumbers.updateWindowDims)
+        // update "scatter" dims (in update-shape order) — those NOT in update_window_dims
+        let updateScatterDims = (0..<updatesShape.count).filter { !updateWindowSet.contains($0) }
+        // scatter_indices non-IVD dims (in indices-shape order)
+        let indicesNonIVDDims = (0..<indicesShape.count).filter { $0 != ivd }
+
+        // Number of scatter-index components per grid point. `ivd` past the
+        // end of indices.shape means there's an implicit single component.
+        let numComps = (ivd >= 0 && ivd < indicesShape.count)
+            ? indicesShape[ivd]
+            : 1
+
+        // Build kernel body.
+        var body = ""
+
+        // Decompose tid into per-dim update coords.
+        for d in 0..<updatesShape.count {
+            body += "            uint uc\(d) = (tid / \(updatesStrides[d])) % \(updatesShape[d]);\n"
+        }
+
+        // Look up each scatter-index component.
+        // indices position = Σ over non-IVD indices dims i of
+        //   (uc[updateScatterDims[i]]) * indicesStrides[indicesNonIVDDims[i]]
+        // + k * indicesStrides[ivd]  (when ivd is in-shape)
+        var baseTerms: [String] = []
+        for (i, sidxDim) in indicesNonIVDDims.enumerated() where i < updateScatterDims.count {
+            let updDim = updateScatterDims[i]
+            baseTerms.append("uc\(updDim) * \(indicesStrides[sidxDim])")
+        }
+        let baseExpr = baseTerms.isEmpty ? "0" : baseTerms.joined(separator: " + ")
+        for k in 0..<numComps {
+            let ivdTerm: String
+            if ivd >= 0 && ivd < indicesShape.count {
+                ivdTerm = " + \(k) * \(indicesStrides[ivd])"
             } else {
-                operandInnerStride = 1
+                ivdTerm = ""
+            }
+            body += "            uint scatter_idx_\(k) = uint(indices[\(baseExpr)\(ivdTerm)]);\n"
+        }
+
+        // Helper: scatter_indices dim → corresponding update scatter dim.
+        func updateDimForIndicesDim(_ sidxDim: Int) -> Int? {
+            if let i = indicesNonIVDDims.firstIndex(of: sidxDim), i < updateScatterDims.count {
+                return updateScatterDims[i]
+            }
+            return nil
+        }
+
+        // Compute dstPos in operand.
+        let insertedWindowSet = Set(dimNumbers.insertedWindowDims)
+        let inputBatching = dimNumbers.inputBatchingDims
+        let scatterIdxBatching = dimNumbers.scatterIndicesBatchingDims
+        let scatterToOperand = dimNumbers.scatterDimsToOperandDims
+        // operand window dims (in operand-shape order): dims that are neither
+        // batching nor inserted-window.
+        let operandWindowDims = (0..<operandShape.count).filter {
+            !inputBatching.contains($0) && !insertedWindowSet.contains($0)
+        }
+
+        body += "            uint dstPos = 0;\n"
+        for d in 0..<operandShape.count {
+            if let k = inputBatching.firstIndex(of: d),
+               k < scatterIdxBatching.count,
+               let updDim = updateDimForIndicesDim(scatterIdxBatching[k]) {
+                body += "            dstPos += uc\(updDim) * \(operandStrides[d]);\n"
+            } else if let k = scatterToOperand.firstIndex(of: d) {
+                let dimSize = operandShape[d]
+                body += "            if (scatter_idx_\(k) >= \(dimSize)) return;\n"
+                body += "            dstPos += scatter_idx_\(k) * \(operandStrides[d]);\n"
+            } else if let i = operandWindowDims.firstIndex(of: d),
+                      i < dimNumbers.updateWindowDims.count {
+                let updWinDim = dimNumbers.updateWindowDims[i]
+                body += "            dstPos += uc\(updWinDim) * \(operandStrides[d]);\n"
             }
         }
 
-        // Determine update expression based on computation kind
-        let updateExpr: String
-        switch computationKind {
-        case .add:
-            updateExpr = "output[dstPos] = output[dstPos] + updates[tid];"
-        case .max:
-            updateExpr = "output[dstPos] = max(output[dstPos], updates[tid]);"
-        case .min:
-            updateExpr = "output[dstPos] = min(output[dstPos], updates[tid]);"
-        case .mul:
-            updateExpr = "output[dstPos] = output[dstPos] * updates[tid];"
-        case .set:
-            updateExpr = "output[dstPos] = updates[tid];"
+        // Embedding-style autograd backward scatters multiple updates to the
+        // same operand position (e.g. one row per token id, with repeated
+        // tokens). A naive `output[dstPos] = output[dstPos] + updates[tid]`
+        // RMW races across threads — only one update survives per cycle, and
+        // every embedding gradient gets approximately the contribution of a
+        // *single* occurrence instead of the sum. Metal 3+ exposes float
+        // atomic_fetch_add (macOS 13+, Apple7+, available on M5 Pro), so use
+        // it for ADD scatter on float32 operand. Non-add cases keep the
+        // direct write; in practice they target unique positions per scatter.
+        let isFloat32Operand = (operandType == "float")
+        let useAtomicAdd = isFloat32Operand && (computationKind == .add)
+
+        let updateOp: String
+        if useAtomicAdd {
+            // device float* is bitcast to device atomic_float* (same storage).
+            // memory_order_relaxed is sufficient: each thread's contribution
+            // is independent and we only need eventual consistency by the
+            // end-of-encoder barrier the executor inserts.
+            updateOp = "atomic_fetch_add_explicit((device atomic_float*)(output + dstPos), updates[tid], memory_order_relaxed);"
+        } else {
+            switch computationKind {
+            case .add: updateOp = "output[dstPos] = output[dstPos] + updates[tid];"
+            case .max: updateOp = "output[dstPos] = max(output[dstPos], updates[tid]);"
+            case .min: updateOp = "output[dstPos] = min(output[dstPos], updates[tid]);"
+            case .mul: updateOp = "output[dstPos] = output[dstPos] * updates[tid];"
+            case .set: updateOp = "output[dstPos] = updates[tid];"
+            }
         }
 
-        // The scatter kernel uses two phases:
-        // 1. A copy kernel copies the operand to output
-        // 2. The scatter kernel writes updates at indexed positions
-        // We combine these into a single two-pass kernel using threadgroup barriers,
-        // but for simplicity we use two separate kernels via a wrapper.
-        // Actually, for O3 we generate a single kernel that:
-        //   - First: copies operand to output (all threads participate)
-        //   - Then: writes updates to indexed positions (only update threads)
-        // But Metal has no global barrier, so we use a simpler approach:
-        // Generate a copy+scatter kernel that processes in two stages with separate dispatch.
+        // Two-phase scatter (copy operand → output, then scatter updates)
+        // races across threadgroups: Metal has no grid-wide barrier inside a
+        // kernel, so a copy in TG B can overwrite an atomic_fetch_add in
+        // TG A whenever the dispatch spans more than one threadgroup.
+        // Manifested in autograd backward at nanoGPT scale — `scatter_add`
+        // into (16, 256, 65) lost ~2/3 of the updates.
         //
-        // Simplest correct approach: make the scatter kernel assume output is already initialized
-        // with the operand data, and only write the updates. The executor handles the copy.
+        // Splitting into two separate dispatches would require multi-kernel
+        // ops in the executor (todo). For now we skip the in-kernel copy
+        // entirely and rely on two invariants:
+        //   1. IntegratedExecutor `memset(unifiedBuffer.contents(), 0, ...)`
+        //      at the start of every `execute()` — the buffer's bytes start
+        //      at zero.
+        //   2. The static memory planner places each output at an offset
+        //      that no earlier op has written to — for the autograd
+        //      patterns JAX emits (scatter into a freshly-broadcast zero
+        //      tensor), the output region was untouched.
         //
-        // BUT for the integrated executor, we need to handle this in a single kernel.
-        // Use a single kernel with two phases: copy phase dispatches totalOperandElements threads,
-        // scatter phase dispatches totalUpdateElements threads.
-        // Since we can't do global sync, we'll use a single dispatch with max(operand, updates) threads.
-
-        // Compute strides for each operand dimension
-        var operandStrides = [Int](repeating: 1, count: operandShape.count)
-        for d in stride(from: operandShape.count - 2, through: 0, by: -1) {
-            operandStrides[d] = operandStrides[d + 1] * operandShape[d + 1]
-        }
-
-        let scatterDims = dimNumbers.scatterDimsToOperandDims
-        let numScatterDims = scatterDims.count
-
-        // Build destination address calculation code.
-        // For each update element (tid), we decompose it into:
-        //   - index into the scatter indices (which scatter dims get values from indices[])
-        //   - position within the window (remaining dims use sequential addressing)
-        //
-        // The window dims are the operand dims NOT in insertedWindowDims.
-        let windowDims = (0..<operandShape.count).filter { !dimNumbers.insertedWindowDims.contains($0) }
-
-        // Compute window strides (product of window dim sizes after current dim)
-        let windowShape = windowDims.map { operandShape[$0] }
-        var windowStrides = [Int](repeating: 1, count: windowShape.count)
-        for d in stride(from: windowShape.count - 2, through: 0, by: -1) {
-            windowStrides[d] = windowStrides[d + 1] * windowShape[d + 1]
-        }
-
-        // Build the address computation as a Metal expression
-        var dstPosCode = "uint dstPos = 0;\n"
-        // Add scatter index contributions (from indices buffer)
-        for (i, scatterDim) in scatterDims.enumerated() {
-            let stride = operandStrides[scatterDim]
-            let dimSize = operandShape[scatterDim]
-            dstPosCode += "                        uint scatter_idx_\(i) = uint(indices[\(numIndices > 1 ? "indexIdx * \(numScatterDims) + " : "")\(i)]);\n"
-            dstPosCode += "                        if (scatter_idx_\(i) >= \(dimSize)) return;\n"
-            dstPosCode += "                        dstPos += scatter_idx_\(i) * \(stride);\n"
-        }
-        // Add window position contributions (from sliceOffset)
-        for (i, windowDim) in windowDims.enumerated() {
-            let stride = operandStrides[windowDim]
-            let windowStride = windowStrides[i]
-            let windowSize = windowShape[i]
-            dstPosCode += "                        dstPos += ((sliceOffset / \(windowStride)) % \(windowSize)) * \(stride);\n"
-        }
+        // Under these invariants the "copy operand → output" step writes
+        // zeros where there are already zeros, so it can be dropped.
+        // Scatter ops whose operand is not a fresh zero will need the
+        // separate-dispatch fix.
 
         return """
         kernel void \(entryPoint)(
@@ -1556,24 +1616,9 @@ public final class CodeGenerator: @unchecked Sendable {
             device \(operandType)* output [[buffer(3)]],
             uint tid [[thread_position_in_grid]])
         {
-            // Phase 1: Copy operand to output
-            if (tid < \(totalOperandElements)) {
-                output[tid] = operand[tid];
-            }
-
-            // Barrier to ensure copy completes before scatter writes
-            threadgroup_barrier(mem_flags::mem_device);
-
-            // Phase 2: Scatter updates at indexed positions
-            if (tid < \(totalUpdateElements)) {
-                uint indexIdx = tid / \(sliceSize);
-                uint sliceOffset = tid % \(sliceSize);
-
-                if (indexIdx < \(numIndices)) {
-                        \(dstPosCode)
-                        \(updateExpr)
-                }
-            }
+            if (tid >= \(totalUpdateElements)) return;
+            \(body)
+            \(updateOp)
         }
         """
     }

@@ -402,6 +402,26 @@ public final class Parser {
                             attributes.reductionKind = .product
                         }
                     }
+                    // Detect scatter combine op the same way — JAX-emitted
+                    // scatter (e.g. embedding-table backward) puts the
+                    // reducer inline as a region after the attribute block.
+                    // Without this, computation kind silently defaults to
+                    // `.set`, so scatter-add of repeated indices keeps only
+                    // one update — embedding gradients off by ~the average
+                    // occurrence count per token.
+                    if kind == .scatter && attributes.scatterComputationKind == nil
+                        && currentToken.kind == .identifier {
+                        let t = currentToken.text
+                        if t == "stablehlo.add" || t == "add" {
+                            attributes.scatterComputationKind = .add
+                        } else if t == "stablehlo.maximum" || t == "maximum" {
+                            attributes.scatterComputationKind = .max
+                        } else if t == "stablehlo.minimum" || t == "minimum" {
+                            attributes.scatterComputationKind = .min
+                        } else if t == "stablehlo.multiply" || t == "multiply" {
+                            attributes.scatterComputationKind = .mul
+                        }
+                    }
                     advance()
                 }
                 // After consuming this region, optionally skip a comma to
