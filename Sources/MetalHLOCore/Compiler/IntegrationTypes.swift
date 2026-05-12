@@ -170,6 +170,7 @@ public enum PatternType: String, Sendable, CaseIterable {
     case gatedFFN
     case layerNorm
     case rmsNorm
+    case batchNorm
     case softmax
     case gelu
     case silu
@@ -242,6 +243,9 @@ public enum FusedOpType: Sendable, Hashable {
 
     /// Fused layer normalization.
     case fusedLayerNorm(NormConfig)
+
+    /// Fused batch normalization (training-mode apply chain).
+    case fusedBatchNorm(NormConfig)
 
     /// Fused matmul + bias + activation.
     case fusedMatMulBiasAct(MatMulConfig)
@@ -493,6 +497,10 @@ public struct FusedOp: Sendable {
         case FusedRMSNormHandler.targetName:
             let eps = (config["eps"] as? NSNumber)?.floatValue ?? 1e-5
             return .fusedRMSNorm(NormConfig(epsilon: eps, axis: -1))
+
+        case FusedBatchNormHandler.targetName:
+            let eps = (config["eps"] as? NSNumber)?.floatValue ?? 1e-5
+            return .fusedBatchNorm(NormConfig(epsilon: eps, axis: -1))
 
         case FusedGeluHandler.targetName:
             let approximate = (config["approximate"] as? Bool) ?? true

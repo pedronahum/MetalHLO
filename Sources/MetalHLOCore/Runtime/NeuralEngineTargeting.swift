@@ -1586,11 +1586,20 @@ public final class HeterogeneousExecutor: @unchecked Sendable {
             } else {
                 let opIds = Set(partition.operationIds)
                 let externalConsumers = SubFunctionExtractor.findExternalConsumers(of: opIds, in: function)
-                let subFunction = SubFunctionExtractor.extract(
+                let rawSubFunction = SubFunctionExtractor.extract(
                     from: function,
                     operationIds: opIds,
                     outputConsumers: externalConsumers
                 )
+                // Run BN fusion before MPSGraph lowering. The heterogeneous
+                // path bypasses the PassManager, so the fusion has to be
+                // invoked here. Cheap relative to MPSGraph compile (and the
+                // compiled result lands in the per-partition cache, so this
+                // runs once per executable, not per execute).
+                let analyzer = Analyzer()
+                let analysis = analyzer.analyze(rawSubFunction)
+                let bnResult = BatchNormFusionPass().run(on: rawSubFunction, analysis: analysis)
+                let subFunction = bnResult.function
                 let module = HLOModule(name: subFunction.name, function: subFunction)
                 let compiled = try metalExecutor.compile(module: module)
                 if let idx = partitionIndex {

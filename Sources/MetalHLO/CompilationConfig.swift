@@ -196,6 +196,7 @@ public enum OptimizationPass: String, CaseIterable, Sendable {
     case attentionFusion = "attention-fusion"
     case ffnFusion = "ffn-fusion"
     case normFusion = "norm-fusion"
+    case batchNormFusion = "batch-norm-fusion"
     case geluFusion = "gelu-fusion"
     case softmaxFusion = "softmax-fusion"
     case matmulBiasActFusion = "matmul-bias-act-fusion"
@@ -248,6 +249,7 @@ public enum OptimizationPass: String, CaseIterable, Sendable {
             transposeCanonicalizer.rawValue,
             broadcastCanonicalizer.rawValue,
             producerConsumerFusion.rawValue,
+            batchNormFusion.rawValue,
             finalDCE.rawValue,
         ])
         return passes

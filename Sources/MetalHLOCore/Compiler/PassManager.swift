@@ -163,6 +163,9 @@ public final class PassManager: @unchecked Sendable {
         register(name: "norm-fusion", phase: .patternFusion) {
             NormFusionPass()
         }
+        register(name: "batch-norm-fusion", phase: .patternFusion) {
+            BatchNormFusionPass()
+        }
         register(name: "gelu-fusion", phase: .patternFusion) {
             GELUFusionPass()
         }
@@ -996,6 +999,127 @@ final class NormFusionPass: OptimizationPass, @unchecked Sendable {
             stats: [
                 "operationsRemoved": opsToRemove.count,
                 "operationsFused": normPatterns.count
+            ]
+        )
+    }
+}
+
+/// Batch normalization fusion pass.
+///
+/// Replaces the JAX-emitted BN training apply chain
+///   subtract → broadcast(reshape(mean)) → multiply → broadcast(rsqrt*gamma) → add(beta_bc)
+/// with a single `fused_batch_norm` custom_call carrying
+///   [input, gamma, beta, mean, variance]
+/// plus `eps` in the backend config. The handler emits one `graph.normalize`
+/// MPSGraph op — one fused kernel pass over the large N×H×W×C tensor instead
+/// of ~17 elementwise ops that each round-trip through GPU memory.
+///
+/// The upstream reduce → divide → maximum chain that produces the 1D mean
+/// and variance tensors is intentionally NOT collapsed by this pass: those
+/// values are also consumed by the running-stats update that JAX emits
+/// alongside the apply chain. Leaving them in place means the existing dead
+/// op elimination won't remove them and downstream consumers still see the
+/// same SSA names.
+final class BatchNormFusionPass: OptimizationPass, @unchecked Sendable {
+    let name = "batch-norm-fusion"
+    let invalidates: Set<AnalysisType> = [.lifetimes, .patterns]
+
+    func run(on function: HLOFunction, analysis: AnalysisResults) -> PassResult {
+        let bnPatterns = analysis.patterns.filter { $0.type == .batchNorm }
+        if bnPatterns.isEmpty {
+            return .unchanged(function)
+        }
+
+        var newOperations = function.operations
+        var opsToRemove = Set<Int>()
+        var changed = false
+
+        for pattern in bnPatterns {
+            let rootIdx = pattern.rootIndex
+            guard rootIdx < function.operations.count else { continue }
+            let rootOp = function.operations[rootIdx]
+
+            // The detector encoded the five operand TensorIDs in
+            // metadata.activation (see Analyzer.detectBatchNormPatterns).
+            // Parse them back out — there's no other field on PatternMetadata
+            // that fits, and adding one would touch too much surface for a
+            // detector-pass handshake that's used in exactly one place.
+            guard let encoded = pattern.metadata.activation,
+                  encoded.hasPrefix("bn:") else { continue }
+            let parts = String(encoded.dropFirst(3)).split(separator: ";")
+            var fields: [String: String] = [:]
+            for part in parts {
+                let kv = part.split(separator: "=", maxSplits: 1)
+                if kv.count == 2 { fields[String(kv[0])] = String(kv[1]) }
+            }
+            guard let input = fields["input"],
+                  let gamma = fields["gamma"],
+                  let beta = fields["beta"],
+                  let mean = fields["mean"],
+                  let variance = fields["variance"] else { continue }
+
+            let eps = pattern.metadata.epsilon ?? 1e-5
+
+            let configDict: [String: Any] = [
+                "eps": eps,
+            ]
+            let backendConfig = (try? JSONSerialization.data(withJSONObject: configDict))
+                .flatMap { String(data: $0, encoding: .utf8) } ?? "{\"eps\": \(eps)}"
+
+            var attrs = HLOAttributes()
+            attrs.callTargetName = FusedBatchNormHandler.targetName
+            attrs.backendConfig = backendConfig
+
+            let fusedOp = HLOOperation(
+                result: rootOp.result,
+                kind: .customCall,
+                operands: [input, gamma, beta, mean, variance],
+                resultType: rootOp.resultType,
+                attributes: attrs
+            )
+
+            newOperations[rootIdx] = fusedOp
+
+            // Don't remove intermediate apply-chain ops. JAX's autodiff often
+            // reuses values from the BN forward (centered = X - mean, rsqrt,
+            // etc.) in the backward graph, and the existing-uses scan can
+            // miss subtle aliasing where one chain feeds into another via
+            // skip connections. Leaving the chain in place is safe — the
+            // big win is that the fused root op replaces the *consumer*
+            // multiply/add on the N×H×W×C tensor; whether the (already-fast)
+            // small-tensor intermediates also get reduced is secondary, and
+            // any truly-dead ops here get cleaned up by the later DCE pass.
+            //
+            // The dead-op pruning below is left intentionally disabled until
+            // we verify which intermediates are safe to remove per BN
+            // configuration (with vs without grad, with vs without
+            // running-stats updates).
+            // for idx in pattern.operationIndices where idx != rootIdx { ... }
+            changed = true
+        }
+
+        if !changed {
+            return .unchanged(function)
+        }
+
+        let filteredOps = newOperations.enumerated()
+            .filter { !opsToRemove.contains($0.offset) }
+            .map { $0.element }
+
+        let newFunction = HLOFunction(
+            name: function.name,
+            inputs: function.inputs,
+            outputTypes: function.outputTypes,
+            operations: filteredOps,
+            returnValues: function.returnValues
+        )
+
+        return PassResult(
+            function: newFunction,
+            changed: true,
+            stats: [
+                "operationsRemoved": opsToRemove.count,
+                "operationsFused": bnPatterns.count,
             ]
         )
     }

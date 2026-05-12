@@ -664,7 +664,7 @@ public final class MetalHLOCompiler: @unchecked Sendable {
                 kind = opKind
             case .fusedAttention, .fusedMultiHeadAttention:
                 kind = .customCall
-            case .fusedRMSNorm, .fusedLayerNorm:
+            case .fusedRMSNorm, .fusedLayerNorm, .fusedBatchNorm:
                 kind = .customCall
             case .fusedMatMulBiasAct:
                 kind = .dot

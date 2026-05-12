@@ -395,6 +395,7 @@ public final class Analyzer: @unchecked Sendable {
         // softmax not already inside an attention block.
         patterns.append(contentsOf: detectAttentionPatterns(function, definingOps: definingOps, shapes: shapes))
         patterns.append(contentsOf: detectNormPatterns(function, definingOps: definingOps, shapes: shapes))
+        patterns.append(contentsOf: detectBatchNormPatterns(function, definingOps: definingOps, shapes: shapes))
         patterns.append(contentsOf: detectActivationPatterns(function, definingOps: definingOps))
         patterns.append(contentsOf: detectFFNPatterns(function, definingOps: definingOps, shapes: shapes))
         patterns.append(contentsOf: detectMatMulBiasActPatterns(function, definingOps: definingOps))
@@ -889,6 +890,191 @@ public final class Analyzer: @unchecked Sendable {
                     metadata: metadata
                 ))
             }
+        }
+
+        return patterns
+    }
+
+    /// Detects the BatchNorm-training apply chain JAX emits for `nn.BatchNorm`.
+    ///
+    /// JAX produces this canonical structure (NHWC, channel = last axis):
+    ///   mean_1d   = reduce(input, axes=[0,1,2]) / N
+    ///   var_1d    = max(0, reduce(input², axes=[0,1,2]) / N - mean²)
+    ///   mean_bc   = broadcast(reshape(mean_1d, [1,1,1,C]))
+    ///   centered  = input - mean_bc
+    ///   var_eps   = reshape(var_1d, [1,1,1,C]) + eps
+    ///   rsqrt_val = rsqrt(var_eps)
+    ///   scale     = rsqrt_val * reshape(gamma, [1,1,1,C])
+    ///   scale_bc  = broadcast(scale)
+    ///   scaled    = centered * scale_bc            ← detected as the "root multiply"
+    ///   beta_bc   = broadcast(reshape(beta, [1,1,1,C]))
+    ///   result    = scaled + beta_bc               ← the pattern's rootIndex
+    ///
+    /// Distinguishes from LayerNorm by:
+    ///   - The reduce(input) has multiple axes (e.g. [0,1,2]) producing a 1D
+    ///     channel tensor, not a single trailing-axis reduce.
+    ///   - Gamma is folded into rsqrt *before* the broadcast (not after).
+    ///
+    /// The mean / variance / reduce ops upstream are intentionally NOT included
+    /// in `operationIndices`. They have external uses (the running-stats
+    /// update consumes them too) so leaving them out keeps the existing
+    /// dead-op elimination from accidentally removing them — and the fused
+    /// custom_call takes the small precomputed mean / variance as inputs.
+    private func detectBatchNormPatterns(
+        _ function: HLOFunction,
+        definingOps: [TensorID: (op: HLOOperation, index: Int)],
+        shapes: [TensorID: [Int]]
+    ) -> [DetectedPattern] {
+        var patterns: [DetectedPattern] = []
+
+        // Walks broadcast → multiply(rsqrt, reshape(gamma_1d)) to extract
+        // (rsqrt def, gamma source 1D tensor). Returns nil if the chain
+        // doesn't match.
+        func parseScaleSide(_ tid: TensorID) -> (rsqrtIdx: Int, rsqrtDef: HLOOperation, gammaSrc: TensorID, scaleBcIdx: Int, scaleMulIdx: Int, gammaReshapeIdx: Int)? {
+            guard let bcDef = definingOps[tid], bcDef.op.kind == .broadcastInDim,
+                  !bcDef.op.operands.isEmpty else { return nil }
+            guard let mulDef = definingOps[bcDef.op.operands[0]], mulDef.op.kind == .multiply,
+                  mulDef.op.operands.count == 2 else { return nil }
+            // One operand is rsqrt(...) (or broadcast of it for size-1), the
+            // other is reshape(gamma_1d, [1,1,...,C]).
+            for (rsqrtSlot, gammaSlot) in [(0, 1), (1, 0)] {
+                guard let rDef = definingOps[mulDef.op.operands[rsqrtSlot]],
+                      rDef.op.kind == .rsqrt else { continue }
+                guard let gDef = definingOps[mulDef.op.operands[gammaSlot]],
+                      gDef.op.kind == .reshape, !gDef.op.operands.isEmpty else { continue }
+                let gammaSrc = gDef.op.operands[0]
+                if let gshape = shapes[gammaSrc], gshape.count == 1 {
+                    return (rDef.index, rDef.op, gammaSrc, bcDef.index, mulDef.index, gDef.index)
+                }
+            }
+            return nil
+        }
+
+        // Walks broadcast → reshape(small_1d) to extract the small tensor id.
+        func parseSmallBroadcast(_ tid: TensorID) -> (bcIdx: Int, reshapeIdx: Int, src: TensorID)? {
+            guard let bcDef = definingOps[tid], bcDef.op.kind == .broadcastInDim,
+                  !bcDef.op.operands.isEmpty else { return nil }
+            guard let rsDef = definingOps[bcDef.op.operands[0]], rsDef.op.kind == .reshape,
+                  !rsDef.op.operands.isEmpty else { return nil }
+            return (bcDef.index, rsDef.index, rsDef.op.operands[0])
+        }
+
+        // Walks an rsqrt's input back to the 1D variance tensor (the operand
+        // of the reshape that feeds the var+eps add). Also returns eps.
+        func parseVarianceSide(_ rsqrtInput: TensorID) -> (varianceSrc: TensorID, varReshapeIdx: Int, varEpsAddIdx: Int, eps: Float)? {
+            guard let addDef = definingOps[rsqrtInput], addDef.op.kind == .add,
+                  addDef.op.operands.count == 2 else { return nil }
+            // One operand is reshape(variance_1d, [1,1,...,1,C]); the other is
+            // broadcast(epsilon-shaped scalar). Try both orderings.
+            for (varSlot, epsSlot) in [(0, 1), (1, 0)] {
+                guard let rsDef = definingOps[addDef.op.operands[varSlot]], rsDef.op.kind == .reshape,
+                      !rsDef.op.operands.isEmpty else { continue }
+                let varianceSrc = rsDef.op.operands[0]
+                guard let vshape = shapes[varianceSrc], vshape.count == 1 else { continue }
+                // Resolve eps if we can — it's a broadcast(constant). Default
+                // to 1e-5 if the chain is shaped slightly differently.
+                var eps: Float = 1e-5
+                if let epsBcDef = definingOps[addDef.op.operands[epsSlot]],
+                   epsBcDef.op.kind == .broadcastInDim,
+                   !epsBcDef.op.operands.isEmpty,
+                   let epsConstDef = definingOps[epsBcDef.op.operands[0]],
+                   epsConstDef.op.kind == .constant,
+                   let cv = epsConstDef.op.attributes.constantValue {
+                    switch cv {
+                    case .scalar(let d): eps = Float(d)
+                    case .splat(let d, _): eps = Float(d)
+                    case .dense(let arr, _): if let first = arr.first { eps = Float(first) }
+                    case .hexBytes: break  // skip: would require decoding raw bytes
+                    }
+                }
+                return (varianceSrc, rsDef.index, addDef.index, eps)
+            }
+            return nil
+        }
+
+        // Verifies that the 1D mean tensor really came from a reduce over
+        // multiple axes (batch + spatial — that's the BN signature, distinct
+        // from LayerNorm's last-axis-only reduce).
+        func meanFromMultiAxisReduce(_ meanSrc: TensorID, inputRank: Int) -> Bool {
+            guard let dDef = definingOps[meanSrc], dDef.op.kind == .divide,
+                  !dDef.op.operands.isEmpty else { return false }
+            guard let rDef = definingOps[dDef.op.operands[0]], rDef.op.kind == .reduce else {
+                return false
+            }
+            let axes = rDef.op.attributes.dimensions ?? []
+            // BN's reduce collapses all-but-feature, so for a 4D input we
+            // expect 3 reduction axes. RMS / LN reduce only over the last.
+            return axes.count >= 2 && axes.count == inputRank - 1
+        }
+
+        for (rootMulIdx, op) in function.operations.enumerated() {
+            guard op.kind == .multiply, op.operands.count == 2 else { continue }
+            guard let inputShape = shapes[op.result], inputShape.count >= 3 else { continue }
+
+            // Try both operand orderings — which one carries the scale path
+            // (broadcast→multiply(rsqrt,reshape(gamma))) depends on JAX's
+            // canonicalisation pass, which isn't stable across releases.
+            var matched: (scale: (rsqrtIdx: Int, rsqrtDef: HLOOperation, gammaSrc: TensorID, scaleBcIdx: Int, scaleMulIdx: Int, gammaReshapeIdx: Int), centeredIdx: Int, centeredSubIdx: Int, mean: (bcIdx: Int, reshapeIdx: Int, src: TensorID), inputX: TensorID)?
+            for (centeredSlot, scaleSlot) in [(0, 1), (1, 0)] {
+                guard let scale = parseScaleSide(op.operands[scaleSlot]) else { continue }
+                guard let subDef = definingOps[op.operands[centeredSlot]], subDef.op.kind == .subtract,
+                      subDef.op.operands.count == 2 else { continue }
+                let inputX = subDef.op.operands[0]
+                guard let mean = parseSmallBroadcast(subDef.op.operands[1]) else { continue }
+                // Confirm the 1D mean came from a multi-axis reduce — this is
+                // the test that says "BN, not LN".
+                guard meanFromMultiAxisReduce(mean.src, inputRank: inputShape.count) else { continue }
+                matched = (scale, subDef.index, subDef.index, mean, inputX)
+                break
+            }
+            guard let m = matched else { continue }
+
+            // Pull eps + variance source through the rsqrt chain.
+            guard !m.scale.rsqrtDef.operands.isEmpty,
+                  let vinfo = parseVarianceSide(m.scale.rsqrtDef.operands[0]) else { continue }
+
+            // Find the trailing `add(scaled, broadcast(reshape(beta)))`. JAX
+            // emits this as the next consumer of the multiply result.
+            var betaInfo: (addIdx: Int, betaBcIdx: Int, betaReshapeIdx: Int, betaSrc: TensorID)?
+            for (i, candidate) in function.operations.enumerated() where i > rootMulIdx {
+                guard candidate.kind == .add, candidate.operands.contains(op.result) else { continue }
+                let other = candidate.operands.first(where: { $0 != op.result }) ?? op.result
+                guard let bc = parseSmallBroadcast(other) else { break }
+                betaInfo = (i, bc.bcIdx, bc.reshapeIdx, bc.src)
+                break
+            }
+            guard let beta = betaInfo else { continue }
+
+            // Build the index set. We do NOT include the upstream reduce /
+            // divide / max chain that produces mean_1d and variance_1d — those
+            // are also consumed by the running-stats update and must stick
+            // around. The pass removes everything in `operationIndices` (when
+            // unreferenced externally) and replaces `rootIndex` with the
+            // fused custom_call.
+            let chainIndices: [Int] = [
+                m.centeredSubIdx,
+                m.mean.bcIdx, m.mean.reshapeIdx,
+                m.scale.gammaReshapeIdx, m.scale.scaleMulIdx, m.scale.scaleBcIdx,
+                vinfo.varReshapeIdx, vinfo.varEpsAddIdx, m.scale.rsqrtIdx,
+                rootMulIdx,
+                beta.betaReshapeIdx, beta.betaBcIdx, beta.addIdx,
+            ]
+
+            var metadata = PatternMetadata()
+            metadata.epsilon = vinfo.eps
+            metadata.hiddenDim = inputShape.last
+            // Stash the operand tensor IDs by name in the activation field —
+            // a small hack to thread them to the pass without expanding the
+            // PatternMetadata API surface. The pass parses these out.
+            // Format: "bn:input=<id>;gamma=<id>;beta=<id>;mean=<id>;variance=<id>"
+            metadata.activation = "bn:input=\(m.inputX);gamma=\(m.scale.gammaSrc);beta=\(beta.betaSrc);mean=\(m.mean.src);variance=\(vinfo.varianceSrc)"
+
+            patterns.append(DetectedPattern(
+                type: .batchNorm,
+                operationIndices: chainIndices,
+                rootIndex: beta.addIdx,
+                metadata: metadata
+            ))
         }
 
         return patterns

@@ -77,6 +77,7 @@ public final class CustomCallRegistry: @unchecked Sendable {
         register(FusedScaledDotProductAttentionHandler())
         register(FusedLayerNormHandler())
         register(FusedRMSNormHandler())
+        register(FusedBatchNormHandler())
         register(FusedMatMulBiasActivationHandler())
         register(FusedConvBiasActHandler())
         register(FusedSoftmaxHandler())
@@ -388,6 +389,61 @@ public final class FusedRMSNormHandler: CustomCallHandler {
         // Scale: normalized * weight
         let output = graph.multiplication(normalized, weight, name: "rms_output")
 
+        return [output]
+    }
+}
+
+// MARK: - Fused Batch Norm Handler
+
+/// Handles fused batch normalization (training-mode apply chain).
+///
+/// Replaces the chain JAX emits for `nn.BatchNorm` training mode:
+///   centered  = X - broadcast(reshape(mean))
+///   var_eps   = broadcast(reshape(variance)) + eps
+///   normalized = centered * rsqrt(var_eps)
+///   scaled    = normalized * broadcast(reshape(gamma))
+///   result    = scaled + broadcast(reshape(beta))
+/// with a single call to `graph.normalize(...)` — one fused MPSGraph kernel
+/// that does the apply in a single pass over the large (N, H, W, C) tensor.
+///
+/// Inputs: [input, gamma, beta, mean, variance]
+/// where mean/variance are the channel-shaped 1D tensors produced by the
+/// upstream reduce/divide/maximum chain. Those upstream ops are intentionally
+/// left in place by the fusion pass so the running-stats updates that also
+/// consume them still see the same values.
+public final class FusedBatchNormHandler: CustomCallHandler {
+
+    public static let targetName = "fused_batch_norm"
+
+    public init() {}
+
+    public func emit(
+        operation: HLOOperation,
+        graph: MPSGraph,
+        inputs: [MPSGraphTensor],
+        config: [String: Any]
+    ) throws -> [MPSGraphTensor] {
+        guard inputs.count >= 5 else {
+            throw CustomCallError.invalidInputCount(expected: 5, got: inputs.count)
+        }
+
+        let x = inputs[0]
+        let gamma = inputs[1]
+        let beta = inputs[2]
+        let mean = inputs[3]
+        let variance = inputs[4]
+
+        let eps = BackendConfigParser.getFloat(config, key: "eps", default: 1e-5)
+
+        let output = graph.normalize(
+            x,
+            mean: mean,
+            variance: variance,
+            gamma: gamma,
+            beta: beta,
+            epsilon: eps,
+            name: "bn_output"
+        )
         return [output]
     }
 }

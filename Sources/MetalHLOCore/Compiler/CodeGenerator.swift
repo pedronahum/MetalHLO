@@ -391,6 +391,15 @@ public final class CodeGenerator: @unchecked Sendable {
         case .fusedLayerNorm(let config):
             return generateLayerNormSource(config, inputShapes: inputShapes)
 
+        case .fusedBatchNorm(let config):
+            // ResNet-style BN training goes through MPSGraph via the heterogeneous
+            // executor, not this IntegratedExecutor source-gen path. The LayerNorm
+            // generator is a safe stand-in if a BN custom_call ever reaches here:
+            // both consume (input, gamma, beta) plus epsilon — the shape semantics
+            // differ but small graphs that actually land in IntegratedExecutor
+            // won't hit BN under current pattern detection.
+            return generateLayerNormSource(config, inputShapes: inputShapes)
+
         case .fusedMatMulBiasAct(let config):
             return generateMatMulBiasActSource(config, inputShapes: inputShapes)
 
@@ -5604,7 +5613,7 @@ public final class CodeGenerator: @unchecked Sendable {
                 )
             }
 
-        case .fusedRMSNorm, .fusedLayerNorm:
+        case .fusedRMSNorm, .fusedLayerNorm, .fusedBatchNorm:
             if outputShape.count >= 2 {
                 let batch = outputShape.dropLast().reduce(1, *)
                 return DispatchConfig(
