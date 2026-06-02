@@ -113,4 +113,48 @@ struct ElementwiseChainTypeTests {
         }}}
         #expect(result == expected, "transpose perm wrong (forward instead of inverse): \(result)")
     }
+
+    // A BOOLEAN-result chain that mixes integer index arithmetic with a bool
+    // output — the causal-mask `tril`: iota → add → compare(GE) → (bool). If
+    // the chain computes temps in its bool output type, the integer `add` is
+    // truncated to 0/1 and the mask is corrupted (forward causal attention was
+    // wrong at O2). The broadcast to 4D forces the bool mask into its own
+    // chain (the failing shape). Temps must be computed in float.
+    @Test("Boolean-result chain with integer arithmetic (causal mask) is correct")
+    func boolChainIntegerArithmetic() async throws {
+        let mlir = """
+        module @bool_mask_test {
+          func.func @main(%x: tensor<2x2x4x4xf32>) -> (tensor<2x2x4x4xf32>) {
+            %i = stablehlo.iota dim = 0 : tensor<4x4xi32>
+            %j = stablehlo.iota dim = 1 : tensor<4x4xi32>
+            %off = stablehlo.constant dense<1> : tensor<i32>
+            %offb = stablehlo.broadcast_in_dim %off, dims = [] : (tensor<i32>) -> tensor<4x4xi32>
+            %iplus = stablehlo.add %i, %offb : tensor<4x4xi32>
+            %mask = stablehlo.compare GE, %iplus, %j : (tensor<4x4xi32>, tensor<4x4xi32>) -> tensor<4x4xi1>
+            %mask4d = stablehlo.broadcast_in_dim %mask, dims = [2, 3] : (tensor<4x4xi1>) -> tensor<2x2x4x4xi1>
+            %neg = stablehlo.constant dense<-9.900000e+02> : tensor<f32>
+            %neg4d = stablehlo.broadcast_in_dim %neg, dims = [] : (tensor<f32>) -> tensor<2x2x4x4xf32>
+            %r = stablehlo.select %mask4d, %x, %neg4d : tensor<2x2x4x4xi1>, tensor<2x2x4x4xf32>
+            return %r : tensor<2x2x4x4xf32>
+          }
+        }
+        """
+
+        let client = try Client.create()
+        let executable = try client.compile(mlir, config: CompilationConfig(optimizationLevel: .O2))
+
+        let xin = (0..<64).map { Float($0) }
+        let x = try client.createBuffer(xin, shape: [2, 2, 4, 4], elementType: .float32)
+
+        let outputs = try executable.execute([x])
+        let result = try outputs[0].toFloatArray()
+
+        // mask[r,c] = (r+1 >= c); out = x where mask else -990.
+        var expected = [Float](repeating: 0, count: 64)
+        for b in 0..<2 { for h in 0..<2 { for r in 0..<4 { for c in 0..<4 {
+            let idx = ((b * 2 + h) * 4 + r) * 4 + c
+            expected[idx] = (r + 1 >= c) ? xin[idx] : -990.0
+        }}}}
+        #expect(result == expected, "bool chain int-arithmetic mask corrupted: \(result)")
+    }
 }
