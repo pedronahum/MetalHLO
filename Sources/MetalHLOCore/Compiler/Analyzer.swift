@@ -775,17 +775,20 @@ public final class Analyzer: @unchecked Sendable {
                 // Resolves a tensor through optional broadcast nodes to its
                 // rsqrt definer, returning that rsqrt op (or nil).
                 func rsqrtThrough(_ tid: TensorID) -> (op: HLOOperation, index: Int)? {
-                    var cur = tid
-                    var hops = 0
-                    while hops < 3 {
-                        guard let def = definingOps[cur] else { return nil }
+                    // Walk back through broadcast AND multiply to find the rsqrt.
+                    // JAX folds gamma into the scale: the normalize multiply's
+                    // operand is `multiply(broadcast(rsqrt(var+eps)), broadcast(gamma))`,
+                    // not just `broadcast(rsqrt)`. Walk both multiply operands.
+                    var stack: [(TensorID, Int)] = [(tid, 0)]
+                    while let (cur, hops) = stack.popLast() {
+                        if hops > 4 { continue }
+                        guard let def = definingOps[cur] else { continue }
                         if def.op.kind == .rsqrt { return def }
                         if def.op.kind == .broadcastInDim, !def.op.operands.isEmpty {
-                            cur = def.op.operands[0]
-                            hops += 1
-                            continue
+                            stack.append((def.op.operands[0], hops + 1))
+                        } else if def.op.kind == .multiply {
+                            for o in def.op.operands { stack.append((o, hops + 1)) }
                         }
-                        return nil
                     }
                     return nil
                 }
@@ -806,7 +809,10 @@ public final class Analyzer: @unchecked Sendable {
                         // variance computation.
                         switch def.op.kind {
                         case .add, .subtract, .multiply, .divide,
-                             .broadcastInDim, .convert:
+                             .broadcastInDim, .convert, .reshape,
+                             .maximum, .minimum:
+                            // maximum/minimum: JAX clamps variance to ≥0 via
+                            // max(eps, E[x²]−E[x]²) before rsqrt.
                             stack.append(contentsOf: def.op.operands)
                         default:
                             break
@@ -816,17 +822,35 @@ public final class Analyzer: @unchecked Sendable {
                 }
 
                 // Find which operand carries the rsqrt; the other carries X.
+                // scaleOperand is the rsqrt-carrying side (= multiply(bc(rsqrt),
+                // bc(gamma)) when gamma is folded in).
                 let xOperand: TensorID
+                let scaleOperand: TensorID
                 let rsqrtDef: (op: HLOOperation, index: Int)
                 if let r = rsqrtThrough(op.operands[1]) {
                     xOperand = op.operands[0]
+                    scaleOperand = op.operands[1]
                     rsqrtDef = r
                 } else if let r = rsqrtThrough(op.operands[0]) {
                     xOperand = op.operands[1]
+                    scaleOperand = op.operands[0]
                     rsqrtDef = r
                 } else {
                     continue
                 }
+                if ProcessInfo.processInfo.environment["METALHLO_DEBUG_NORM_DETECT"] == "1" {
+                    let rr = !rsqrtDef.op.operands.isEmpty && reachesReduce(from: rsqrtDef.op.operands[0])
+                    let xk = definingOps[xOperand]?.op.kind
+                    FileHandle.standardError.write("[norm-cand] mul=\(op.result) foundRsqrt=\(rsqrtDef.op.result) reachesReduce=\(rr) xKind=\(String(describing: xk))\n".data(using: .utf8)!)
+                }
+
+                // Skip the SCALE multiply `broadcast(rsqrt) * broadcast(gamma)`
+                // (gamma fold): there X is a broadcast, not the centered value.
+                // The real normalize multiply has X = subtract(input, mean) for
+                // LayerNorm, or the input directly for RMSNorm — never a bare
+                // broadcast. Matching the scale multiply would treat gamma as
+                // the input and double-apply rsqrt.
+                if definingOps[xOperand]?.op.kind == .broadcastInDim { continue }
 
                 // Confirm the rsqrt is normalization-shaped (variance chain
                 // eventually hits a reduce). Without this, any
@@ -834,64 +858,87 @@ public final class Analyzer: @unchecked Sendable {
                 guard !rsqrtDef.op.operands.isEmpty,
                       reachesReduce(from: rsqrtDef.op.operands[0]) else { continue }
 
-                // Determine LayerNorm vs RMSNorm from the X side. For
-                // LayerNorm the X feeding the normalize multiply is
-                // `subtract(input, mean_bc)`; the *real* input to the kernel
-                // is the subtract's first operand.
-                let xDef = definingOps[xOperand]
-                let isLayerNorm = xDef?.op.kind == .subtract
-                let firstIdx: Int
-                if isLayerNorm, let xDef {
-                    // Point firstOpIdx at the subtract so NormFusionPass
-                    // reads `subtract.operands[0]` (the original input
-                    // tensor) as the kernel input.
-                    firstIdx = xDef.index
-                } else {
-                    // RMSNorm: the normalize multiply itself feeds the input
-                    // directly; firstOp.operands[0] is the input.
-                    firstIdx = index
+                // LayerNorm: X = subtract(input, mean_bc). The kernel input is
+                // the subtract's first operand. (RMSNorm has no subtract; skip
+                // here — the fused LayerNorm kernel needs the affine tail.)
+                guard let xDef = definingOps[xOperand],
+                      xDef.op.kind == .subtract, !xDef.op.operands.isEmpty else { continue }
+                let inputTensor = xDef.op.operands[0]
+
+                // Unwrap broadcast/reshape down to the underlying param tensor.
+                func unwrap(_ tid: TensorID) -> TensorID {
+                    var cur = tid; var hops = 0
+                    while hops < 5, let d = definingOps[cur],
+                          d.op.kind == .broadcastInDim || d.op.kind == .reshape,
+                          !d.op.operands.isEmpty {
+                        cur = d.op.operands[0]; hops += 1
+                    }
+                    return cur
                 }
 
-                // Walk forward to pick up the optional affine tail —
-                // `multiply(normalize, gamma_bc)` then `add(scaled, beta_bc)`.
-                // Linear scan is fine for the few-hundred-op functions
-                // MetalHLO produces.
+                // gamma = the non-rsqrt operand of the scale multiply
+                // (scale = multiply(broadcast(rsqrt), broadcast(gamma))).
+                var gammaTensor: TensorID?
+                if let sd = definingOps[scaleOperand], sd.op.kind == .multiply,
+                   sd.op.operands.count == 2 {
+                    let a = sd.op.operands[0], b = sd.op.operands[1]
+                    if rsqrtThrough(a) != nil { gammaTensor = unwrap(b) }
+                    else if rsqrtThrough(b) != nil { gammaTensor = unwrap(a) }
+                }
+
+                // Affine tail: add(normalize, broadcast(beta)) → beta + root.
                 var rootIdx = index
-                var chainIndices: [Int] = [firstIdx, rsqrtDef.index, index]
-                var current = op.result
-                func findFirstConsumer(of tid: TensorID, kind: HLOOpKind) -> (op: HLOOperation, index: Int)? {
-                    for (i, candidate) in function.operations.enumerated() where i > rootIdx {
-                        if candidate.kind == kind, candidate.operands.contains(tid) {
-                            return (candidate, i)
-                        }
-                    }
-                    return nil
+                var betaTensor: TensorID?
+                for (i, c) in function.operations.enumerated()
+                where i > index && c.kind == .add && c.operands.contains(op.result) {
+                    rootIdx = i
+                    for o in c.operands where o != op.result { betaTensor = unwrap(o); break }
+                    break
                 }
-                if let gammaMul = findFirstConsumer(of: current, kind: .multiply) {
-                    chainIndices.append(gammaMul.index)
-                    rootIdx = gammaMul.index
-                    current = gammaMul.op.result
-                    if let betaAdd = findFirstConsumer(of: current, kind: .add) {
-                        chainIndices.append(betaAdd.index)
-                        rootIdx = betaAdd.index
-                    }
-                }
+                guard let gammaTensor, let betaTensor else { continue }
+
+                // Shape sanity: LayerNorm preserves shape (out == input) and
+                // gamma/beta are 1-D [hiddenDim] matching the input's last dim.
+                // Rejects mis-rooted / false-positive matches whose custom_call
+                // would claim a wrong result shape (→ invalid dispatch / crash).
+                let rootShape = shapes[function.operations[rootIdx].result]
+                let inShape = shapes[inputTensor]
+                let gShape = shapes[gammaTensor]
+                let bShape = shapes[betaTensor]
+                guard let inShape, let rootShape, rootShape == inShape,
+                      let hidden = inShape.last,
+                      gShape?.reduce(1, *) == hidden, bShape?.reduce(1, *) == hidden
+                else { continue }
 
                 var metadata = PatternMetadata()
                 metadata.epsilon = 1e-5
-                if let shape = shapes[xOperand] {
-                    metadata.hiddenDim = shape.last
-                }
+                metadata.inputTensor = inputTensor
+                metadata.gammaTensor = gammaTensor
+                metadata.betaTensor = betaTensor
+                metadata.outputTensor = function.operations[rootIdx].result
+                if let shape = shapes[inputTensor] { metadata.hiddenDim = shape.last }
 
+                // operationIndices empty on purpose: NormFusionPass only
+                // REPLACES the root (betaAdd) with the fused custom_call.
+                // We do NOT remove the layernorm's intermediate ops — in a
+                // training step the mean/rstd/centered values are live into the
+                // BACKWARD pass. final-dce then removes whichever forward ops
+                // became dead (used only by the now-replaced root), which is
+                // correct regardless of backward liveness.
                 patterns.append(DetectedPattern(
-                    type: isLayerNorm ? .layerNorm : .rmsNorm,
-                    operationIndices: chainIndices,
+                    type: .layerNorm,
+                    operationIndices: [rootIdx],
                     rootIndex: rootIdx,
                     metadata: metadata
                 ))
             }
         }
 
+        if ProcessInfo.processInfo.environment["METALHLO_DEBUG_NORM_DETECT"] == "1" {
+            let nMul = function.operations.filter { $0.kind == .multiply }.count
+            let nRsqrt = function.operations.filter { $0.kind == .rsqrt }.count
+            FileHandle.standardError.write("[norm-detect] fn=\(function.name) ops=\(function.operations.count) multiplies=\(nMul) rsqrts=\(nRsqrt) → layerNorm/rmsNorm patterns=\(patterns.count)\n".data(using: .utf8)!)
+        }
         return patterns
     }
 

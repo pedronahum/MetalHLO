@@ -277,7 +277,10 @@ struct IntegrationTypesTests {
             .fusedMatMulBiasAct(matmulConfig),
             .fusedGELU(approximate: true),
             .fusedSiLU,
-            .fusedElementwise([.add, .multiply]),
+            .fusedElementwise(FusedElementwiseChain(ops: [
+                FusedElementwiseChain.Op(kind: .add, operands: [.external(0), .external(1)]),
+                FusedElementwiseChain.Op(kind: .multiply, operands: [.prior(0), .external(2)])
+            ])),
             .fusedFFN(ffnConfig),
             .fusedTransformerBlock(blockConfig),
             .fusedRoPE(ropeConfig)

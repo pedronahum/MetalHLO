@@ -227,14 +227,24 @@ public final class Executable: @unchecked Sendable {
         _ inputs: [Buffer],
         executor: IntegratedExecutor
     ) throws -> [Buffer] {
+        let prof = ProcessInfo.processInfo.environment["METALHLO_PROFILE_EXEC"] == "1"
+        let t0 = prof ? DispatchTime.now().uptimeNanoseconds : 0
         let metalInputs = buildMetalInputs(inputs, executable: executor.executable, device: executor.device)
+        let t1 = prof ? DispatchTime.now().uptimeNanoseconds : 0
         let result: ExecutionResult
         do {
             result = try executor.execute(inputs: metalInputs)
         } catch let error as IntegratedExecutorError {
             throw Self.convertIntegratedError(error)
         }
-        return buildOutputBuffers(from: result, executor: executor)
+        let t2 = prof ? DispatchTime.now().uptimeNanoseconds : 0
+        let out = buildOutputBuffers(from: result, executor: executor)
+        if prof {
+            let t3 = DispatchTime.now().uptimeNanoseconds
+            let ms = { (a: UInt64, b: UInt64) in Double(b - a) / 1_000_000 }
+            FileHandle.standardError.write("[exec-integrated] buildInputs=\(String(format: "%.2f", ms(t0,t1)))ms execute=\(String(format: "%.2f", ms(t1,t2)))ms buildOutputs=\(String(format: "%.2f", ms(t2,t3)))ms (nOut=\(out.count))\n".data(using: .utf8)!)
+        }
+        return out
     }
 
     private func executeWithTimingIntegrated(
@@ -288,16 +298,22 @@ public final class Executable: @unchecked Sendable {
         let device = executor.device
         // Use outputOrder to preserve function signature order (not alphabetical)
         let outputNames = executor.executable.outputOrder
-        // Outputs are copied (not zero-copy wrapped) because IntegratedExecutor
-        // pools its output buffers across executes — a zero-copy reference
-        // would see its data overwritten by a subsequent execute. The cost is
-        // small in practice (outputs are by definition the result of one
-        // kernel pass, much smaller than the dataset-sized inputs that the
-        // zero-copy path in `buildMetalInputs` handles).
+        // Zero-copy output handoff (default; METALHLO_ZEROCOPY_OUTPUTS=0 to
+        // disable). The executor allocates a FRESH owned buffer per output in
+        // this mode (extractOutputs bypasses its reuse pool), so we can wrap it
+        // directly instead of the old Data → new-buffer double-copy. For
+        // training, outputs are the updated params + optimizer state (~130 MB),
+        // so the double-copy was ~17 ms/step — the dominant host overhead.
+        let zeroCopy = ProcessInfo.processInfo.environment["METALHLO_ZEROCOPY_OUTPUTS"] != "0"
         return outputNames.compactMap { name -> Buffer? in
             guard let metalBuffer = result.outputs[name],
                   let spec = executor.executable.outputSpecs[name] else {
                 return nil
+            }
+            if zeroCopy {
+                let large = LargeTensorStorage(
+                    buffer: metalBuffer, shape: spec.shape, elementType: spec.elementType)
+                return Buffer(storage: BufferStorage(largeTensor: large, device: device))
             }
             let byteCount = metalBuffer.length
             let data = Data(bytes: metalBuffer.contents(), count: byteCount)

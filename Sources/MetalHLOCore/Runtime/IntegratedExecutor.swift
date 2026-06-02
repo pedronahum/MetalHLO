@@ -52,6 +52,26 @@ public final class IntegratedExecutor: @unchecked Sendable {
     /// view-chain walk *and* the `Dictionary` hashing per op.
     private let resolvedPlanOrdered: [ResolvedOpPlan]
 
+    /// Op indices (into resolvedPlanOrdered) that need an explicit
+    /// `encoder.memoryBarrier(scope: .buffers)` BEFORE them. Computed
+    /// at init time from the unified-buffer access ranges of each op;
+    /// covers the producer→consumer / WAW edges that Metal would
+    /// otherwise auto-barrier via its hazard tracker. Pre-set so the
+    /// hot loop only does a `Set.contains(i)` lookup per op.
+    private let barrierBeforeOp: Set<Int>
+
+    /// MTLResidencySet holding the unified buffer + constants so the GPU
+    /// driver doesn't redo residency tracking on every dispatch (MLX
+    /// device.cpp:274-276 pattern). Per-execute inputs / outputs get added
+    /// transiently. nil if METALHLO_EXPLICIT_BARRIERS is off (default).
+    /// Type-erased as `Any?` because MTLResidencySet is macOS 15+ — the
+    /// downcast `as? MTLResidencySet` is `#available`-gated at every use.
+    private var residencySet: Any?
+
+    /// True when METALHLO_EXPLICIT_BARRIERS is set at init time. Used to
+    /// gate the residency-set + unretained command-buffer paths.
+    private let useDispatchOpts: Bool
+
     // NOTE: an MTLIndirectCommandBuffer migration was attempted here. It
     // *does* run the full program from a single `executeCommandsInBuffer`
     // call (one driver dispatch instead of 12k+ setBuffer + setBytes +
@@ -83,6 +103,16 @@ public final class IntegratedExecutor: @unchecked Sendable {
         case input(name: String, extraOffset: Int, index: Int)
     }
 
+    /// A byte range inside the unified buffer this op reads or writes.
+    /// Used at init time to compute the producer→consumer barrier set so
+    /// the executor can run with `hazardTrackingModeUntracked` on the
+    /// unified buffer (MLX pattern).
+    fileprivate struct UnifiedRange {
+        let lo: Int       // start byte
+        let hi: Int       // end byte (exclusive)
+        let isWrite: Bool // true for write, false for read
+    }
+
     /// Per-op cached dispatch + bindings. Reading the three executable
     /// dictionaries (pipelines / dispatches / bindings) on every op is what
     /// the encode loop used to spend most of its time on.
@@ -96,6 +126,10 @@ public final class IntegratedExecutor: @unchecked Sendable {
         let threadgroupBufferCount: Int
         /// Original op ID, kept for diagnostics (`METALHLO_DEBUG_DISPATCH`).
         let opID: OpID
+        /// Byte ranges this op reads / writes inside the unified buffer.
+        /// Drives the explicit-barrier insertion when hazard tracking is
+        /// off; ignored otherwise.
+        let unifiedRanges: [UnifiedRange]
     }
 
     /// Configuration.
@@ -170,11 +204,31 @@ public final class IntegratedExecutor: @unchecked Sendable {
         self.statistics = ExecutionStatistics()
         self.constantBuffers = executable.constantBuffers
 
-        // Pre-allocate unified buffer for ALL intermediate tensors
+        // Pre-allocate unified buffer for ALL intermediate tensors.
+        // METALHLO_EXPLICIT_BARRIERS=1 opts into the MLX pattern:
+        // `hazardTrackingModeUntracked` on the unified buffer plus
+        // explicit `encoder.memoryBarrier(scope: .buffers)` emitted only
+        // at producer→consumer / WAW edges (see computeBarrierEdges).
+        // Without that flag we keep Metal's auto-hazard-tracking — safe
+        // default for any code path that still aliases unified offsets
+        // in ways the static analysis cannot see.
+        //
+        // METALHLO_PROFILE_PER_OP overrides this back to OFF: that mode
+        // opens a fresh encoder per op, and `memoryBarrier(scope:.buffers)`
+        // only orders WITHIN one encoder. With hazard tracking off, the
+        // GPU is free to interleave commands across separate encoders →
+        // RAW races. Fall back to the safe path for measurement.
         let bufferSize = max(executable.memoryPlan.totalBytes, 256)
+        let env = ProcessInfo.processInfo.environment
+        let untrackedHazards =
+            env["METALHLO_EXPLICIT_BARRIERS"] == "1" &&
+            env["METALHLO_PROFILE_PER_OP"] != "1"
+        let unifiedOpts: MTLResourceOptions = untrackedHazards
+            ? [.storageModeShared, .hazardTrackingModeUntracked]
+            : [.storageModeShared]
         guard let unifiedBuffer = device.makeBuffer(
             length: bufferSize,
-            options: .storageModeShared
+            options: unifiedOpts
         ) else {
             throw IntegratedExecutorError.bufferAllocationFailed(size: bufferSize)
         }
@@ -206,12 +260,28 @@ public final class IntegratedExecutor: @unchecked Sendable {
                   let bindings = executable.bindings[opID] else { continue }
             var resolved: [ResolvedBinding] = []
             resolved.reserveCapacity(bindings.count)
+            var ranges: [UnifiedRange] = []
             for binding in bindings {
+                // Record unified-buffer access ranges so the barrier-edge
+                // computation below can spot RAW/WAR/WAW overlaps.
+                func recordUnifiedRange(_ offset: Int) {
+                    let size = binding.size > 0 ? binding.size : 1
+                    let isWrite = (binding.access == .write || binding.access == .readWrite)
+                    let isRead = (binding.access == .read || binding.access == .readWrite)
+                    if isWrite {
+                        ranges.append(UnifiedRange(lo: offset, hi: offset + size, isWrite: true))
+                    }
+                    if isRead {
+                        ranges.append(UnifiedRange(lo: offset, hi: offset + size, isWrite: false))
+                    }
+                }
                 switch binding.source {
                 case .scalar(let value):
                     resolved.append(.scalar(value: value, index: binding.index))
                 case .unified(let offset):
-                    resolved.append(.unified(offset: offset + binding.offset, index: binding.index))
+                    let finalOff = offset + binding.offset
+                    resolved.append(.unified(offset: finalOff, index: binding.index))
+                    recordUnifiedRange(finalOff)
                 case .constant(let id):
                     guard let buf = constants[id] else { continue }
                     resolved.append(.constant(buffer: buf, offset: binding.offset, index: binding.index))
@@ -221,9 +291,13 @@ public final class IntegratedExecutor: @unchecked Sendable {
                 case .output(let name):
                     let (baseName, viewOffset) = executable.resolveViewChain(name)
                     if let off = memoryPlan.tensorOffsets[baseName] {
-                        resolved.append(.unified(offset: off + binding.offset + viewOffset, index: binding.index))
+                        let finalOff = off + binding.offset + viewOffset
+                        resolved.append(.unified(offset: finalOff, index: binding.index))
+                        recordUnifiedRange(finalOff)
                     } else if let off = memoryPlan.tensorOffsets[name] {
-                        resolved.append(.unified(offset: off + binding.offset, index: binding.index))
+                        let finalOff = off + binding.offset
+                        resolved.append(.unified(offset: finalOff, index: binding.index))
+                        recordUnifiedRange(finalOff)
                     } else {
                         // Direct output without a plan entry — fall back to
                         // the input slot the caller will provide.
@@ -239,11 +313,92 @@ public final class IntegratedExecutor: @unchecked Sendable {
                 bindings: resolved,
                 sharedMemoryBytes: executable.sharedMemorySizes[opID] ?? 0,
                 threadgroupBufferCount: executable.threadgroupBufferCounts[opID] ?? 1,
-                opID: opID
+                opID: opID,
+                unifiedRanges: ranges
             ))
         }
         self.resolvedPlanOrdered = planArr
+        self.barrierBeforeOp = Self.computeBarrierEdges(plan: planArr)
+        self.useDispatchOpts = untrackedHazards
 
+        // MLX-style residency set holding the unified buffer + all constant
+        // buffers. The Metal driver stops re-validating residency of these
+        // (large, long-lived) buffers on every dispatch. Per-execute input
+        // and output buffers are not added — they change every call and
+        // residency-set churn would defeat the purpose.
+        if untrackedHazards, #available(macOS 15, *) {
+            let desc = MTLResidencySetDescriptor()
+            desc.label = "metalhlo_executor"
+            desc.initialCapacity = 1 + self.constantBuffers.count
+            if let rs = try? device.makeResidencySet(descriptor: desc) {
+                rs.addAllocation(unifiedBuffer)
+                for (_, buf) in self.constantBuffers {
+                    rs.addAllocation(buf)
+                }
+                rs.commit()
+                commandQueue.addResidencySet(rs)
+                self.residencySet = rs
+            }
+        }
+
+        if ProcessInfo.processInfo.environment["METALHLO_DEBUG_BARRIERS"] != nil {
+            FileHandle.standardError.write(
+                "[barriers] \(self.barrierBeforeOp.count) / \(planArr.count) ops need explicit barriers\n"
+                    .data(using: .utf8)!)
+        }
+    }
+
+    /// Compute the set of op indices that need an explicit
+    /// `memoryBarrier(scope: .buffers)` BEFORE them. Conservative
+    /// producer→consumer / WAR / WAW detection: an op needs a barrier
+    /// if any of its unified-buffer byte ranges overlap with the ranges
+    /// of any prior op since the last barrier, with a hazardous
+    /// access pattern (RAW / WAR / WAW).
+    ///
+    /// We compute this once at init time so the encode hot loop just
+    /// does a `Set.contains(i)` lookup. The barrier set is a SUPERSET
+    /// of strictly necessary edges (we conservatively bucket all
+    /// pending accesses together and reset on barrier rather than
+    /// tracking per-byte) which is the same trade Metal's own hazard
+    /// tracker makes — and is correct.
+    private static func computeBarrierEdges(plan: [ResolvedOpPlan]) -> Set<Int> {
+        var result = Set<Int>()
+        var pendingWrites: [UnifiedRange] = []
+        var pendingReads: [UnifiedRange] = []
+
+        @inline(__always) func overlaps(_ a: UnifiedRange, _ b: UnifiedRange) -> Bool {
+            return a.lo < b.hi && b.lo < a.hi
+        }
+
+        for (i, op) in plan.enumerated() {
+            var conflict = false
+            for r in op.unifiedRanges {
+                if r.isWrite {
+                    // WAW or WAR
+                    for w in pendingWrites where overlaps(r, w) { conflict = true; break }
+                    if conflict { break }
+                    for rr in pendingReads where overlaps(r, rr) { conflict = true; break }
+                } else {
+                    // RAW
+                    for w in pendingWrites where overlaps(r, w) { conflict = true; break }
+                }
+                if conflict { break }
+            }
+            if conflict {
+                result.insert(i)
+                pendingWrites.removeAll(keepingCapacity: true)
+                pendingReads.removeAll(keepingCapacity: true)
+            }
+            // Record this op's accesses as pending for subsequent ops.
+            for r in op.unifiedRanges {
+                if r.isWrite {
+                    pendingWrites.append(r)
+                } else {
+                    pendingReads.append(r)
+                }
+            }
+        }
+        return result
     }
 
     // MARK: - Execution
@@ -300,16 +455,39 @@ public final class IntegratedExecutor: @unchecked Sendable {
         // fresh-per-execute for diagnostics.
         if ProcessInfo.processInfo.environment["METALHLO_FRESH_UNIFIED"] == "1" {
             let bufferSize = unifiedBuffer.length
-            if let fresh = device.makeBuffer(length: bufferSize, options: .storageModeShared) {
+            let untrackedHazards =
+                ProcessInfo.processInfo.environment["METALHLO_EXPLICIT_BARRIERS"] == "1"
+            let opts: MTLResourceOptions = untrackedHazards
+                ? [.storageModeShared, .hazardTrackingModeUntracked]
+                : [.storageModeShared]
+            if let fresh = device.makeBuffer(length: bufferSize, options: opts) {
                 fresh.label = unifiedBuffer.label
                 unifiedBuffer = fresh
             }
         }
         memset(unifiedBuffer.contents(), 0, unifiedBuffer.length)
 
-        // Create command buffer
-        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
-            throw IntegratedExecutorError.commandBufferCreationFailed
+        // Create command buffer. With `useDispatchOpts` (METALHLO_EXPLICIT_
+        // BARRIERS=1) we use `retainedReferences=false` — Metal then skips
+        // per-dispatch atomic retain/release of bound MTLResource objects
+        // (MLX device.cpp:278 — `commandBufferWithUnretainedReferences`).
+        // We're responsible for keeping the resources alive ourselves, which
+        // we already do (constantBuffers / unifiedBuffer / outputBufferPool
+        // are all stored in instance fields; input buffers are kept alive by
+        // the caller dictionary `inputs:` for the duration of execute()).
+        let commandBuffer: MTLCommandBuffer
+        if useDispatchOpts {
+            let cbDesc = MTLCommandBufferDescriptor()
+            cbDesc.retainedReferences = false
+            guard let cb = commandQueue.makeCommandBuffer(descriptor: cbDesc) else {
+                throw IntegratedExecutorError.commandBufferCreationFailed
+            }
+            commandBuffer = cb
+        } else {
+            guard let cb = commandQueue.makeCommandBuffer() else {
+                throw IntegratedExecutorError.commandBufferCreationFailed
+            }
+            commandBuffer = cb
         }
 
         if let label = config.debugLabel {
@@ -338,40 +516,116 @@ public final class IntegratedExecutor: @unchecked Sendable {
         // every step avoids the StableHLO view-chain walk and the three
         // Dictionary lookups (pipelines / dispatches / bindings) per op.
         let perOpBarrier = ProcessInfo.processInfo.environment["METALHLO_BARRIER_PER_OP"] == "1"
+        // When METALHLO_PROFILE_PER_OP is on, each op opens its own encoder
+        // — intra-encoder barriers don't cross encoder boundaries, so our
+        // explicit-barriers-with-untracked-hazards path can't guarantee
+        // ordering. Force the per-op-barrier fallback (cheap; it's just a
+        // measurement mode).
+        let useExplicitBarriers = ProcessInfo.processInfo.environment["METALHLO_EXPLICIT_BARRIERS"] == "1"
+        let barrierSet = barrierBeforeOp
         let debugDispatch = ProcessInfo.processInfo.environment["METALHLO_DEBUG_DISPATCH"] != nil
         let unified = unifiedBuffer
         let plan = resolvedPlanOrdered
         let lastIdx = plan.count - 1
         var lastPipeline: MTLComputePipelineState? = nil
+
+        // METALHLO_PROFILE_PER_OP=1 — measure each op's GPU time by giving it
+        // its own compute pass with start/end timestamp sampling. AGX GPUs
+        // don't support encoder-level `sampleCounters` at .atDispatchBoundary,
+        // so we use pass-boundary sampling (.atStageBoundary) instead. This
+        // adds encoder-creation overhead per op (~30 us), so DON'T trust
+        // absolute times — but the *relative* distribution across pipeline
+        // labels is the ground truth for "where does the GPU spend its time".
+        let profilePerOp = ProcessInfo.processInfo.environment["METALHLO_PROFILE_PER_OP"] == "1"
+        // AGX's counter sample buffer caps at 4096 samples = 2048 ops per
+        // buffer. The train_step has ~2300 ops, so split into chunks and use
+        // multiple buffers in parallel — buffer i covers ops
+        // [i*opsPerChunk, (i+1)*opsPerChunk).
+        let opsPerChunk = 1024
+        var perOpSampleBuffers: [MTLCounterSampleBuffer] = []
+        if profilePerOp && plan.count > 0,
+           device.supportsCounterSampling(.atStageBoundary),
+           let tsSet = device.counterSets?.first(where: { $0.name == MTLCommonCounterSet.timestamp.rawValue }) {
+            let numChunks = (plan.count + opsPerChunk - 1) / opsPerChunk
+            for chunk in 0..<numChunks {
+                let opsInChunk = min(opsPerChunk, plan.count - chunk * opsPerChunk)
+                let desc = MTLCounterSampleBufferDescriptor()
+                desc.counterSet = tsSet
+                desc.label = "metalhlo-per-op-timestamps-\(chunk)"
+                desc.storageMode = .shared
+                desc.sampleCount = opsInChunk * 2
+                if let buf = try? device.makeCounterSampleBuffer(descriptor: desc) {
+                    perOpSampleBuffers.append(buf)
+                } else {
+                    perOpSampleBuffers.removeAll()
+                    break
+                }
+            }
+        }
+        let perOpProfilingActive = !perOpSampleBuffers.isEmpty
+        if perOpProfilingActive {
+            // Close the long-lived encoder; we'll open one fresh pass per op.
+            encoder.endEncoding()
+        }
+
         for i in 0..<plan.count {
+            // Per-op encoder path when profiling is on — gives one sample
+            // pair per dispatch. Otherwise we keep the original single-encoder
+            // hot path (the `encoder` opened above).
+            let opEncoder: MTLComputeCommandEncoder
+            if perOpProfilingActive {
+                let chunkIdx = i / opsPerChunk
+                let localIdx = i % opsPerChunk
+                let sb = perOpSampleBuffers[chunkIdx]
+                let passDesc = MTLComputePassDescriptor()
+                passDesc.dispatchType = .serial
+                passDesc.sampleBufferAttachments[0].sampleBuffer = sb
+                passDesc.sampleBufferAttachments[0].startOfEncoderSampleIndex = localIdx * 2
+                passDesc.sampleBufferAttachments[0].endOfEncoderSampleIndex = localIdx * 2 + 1
+                guard let e = commandBuffer.makeComputeCommandEncoder(descriptor: passDesc) else {
+                    throw IntegratedExecutorError.encoderCreationFailed
+                }
+                opEncoder = e
+                lastPipeline = nil  // fresh encoder — must rebind
+            } else {
+                opEncoder = encoder
+            }
+            // Emit explicit barrier BEFORE this op when the producer→
+            // consumer analysis flagged it. Required when running with
+            // `hazardTrackingModeUntracked` on the unified buffer.
+            // Skipped when profiling (each op has its own encoder anyway)
+            // and harmlessly redundant when per-op barrier is forced.
+            if useExplicitBarriers && !perOpProfilingActive && barrierSet.contains(i) {
+                opEncoder.memoryBarrier(scope: .buffers)
+            }
             let opPlan = plan[i]
             if opPlan.pipeline !== lastPipeline {
-                encoder.setComputePipelineState(opPlan.pipeline)
+                opEncoder.setComputePipelineState(opPlan.pipeline)
                 lastPipeline = opPlan.pipeline
             }
             for binding in opPlan.bindings {
                 switch binding {
                 case .scalar(let value, let index):
                     var v = value
-                    encoder.setBytes(&v, length: MemoryLayout<UInt32>.size, index: index)
+                    opEncoder.setBytes(&v, length: MemoryLayout<UInt32>.size, index: index)
                 case .unified(let offset, let index):
-                    encoder.setBuffer(unified, offset: offset, index: index)
+                    opEncoder.setBuffer(unified, offset: offset, index: index)
                 case .constant(let buffer, let offset, let index):
-                    encoder.setBuffer(buffer, offset: offset, index: index)
+                    opEncoder.setBuffer(buffer, offset: offset, index: index)
                 case .input(let name, let extraOffset, let index):
                     guard let inputBuffer = inputs[name] else {
                         throw IntegratedExecutorError.missingInput(name)
                     }
-                    encoder.setBuffer(inputBuffer, offset: extraOffset, index: index)
+                    opEncoder.setBuffer(inputBuffer, offset: extraOffset, index: index)
                 }
             }
             if opPlan.sharedMemoryBytes > 0 {
                 if opPlan.threadgroupBufferCount == 2 {
                     let tileSize = opPlan.sharedMemoryBytes / 2
-                    encoder.setThreadgroupMemoryLength(tileSize, index: 0)
-                    encoder.setThreadgroupMemoryLength(tileSize, index: 1)
+                    opEncoder.setThreadgroupMemoryLength(tileSize, index: 0)
+                    opEncoder.setThreadgroupMemoryLength(tileSize, index: 1)
                 } else {
-                    encoder.setThreadgroupMemoryLength(opPlan.sharedMemoryBytes, index: 0)
+                    opEncoder.setThreadgroupMemoryLength(opPlan.sharedMemoryBytes, index: 0)
                 }
             }
             let dispatch = opPlan.dispatch
@@ -381,9 +635,9 @@ public final class IntegratedExecutor: @unchecked Sendable {
                     height: dispatch.gridSize.height * dispatch.threadgroupSize.height,
                     depth: dispatch.gridSize.depth * dispatch.threadgroupSize.depth
                 )
-                encoder.dispatchThreads(totalThreads, threadsPerThreadgroup: dispatch.threadgroupSize)
+                opEncoder.dispatchThreads(totalThreads, threadsPerThreadgroup: dispatch.threadgroupSize)
             } else {
-                encoder.dispatchThreadgroups(dispatch.gridSize, threadsPerThreadgroup: dispatch.threadgroupSize)
+                opEncoder.dispatchThreadgroups(dispatch.gridSize, threadsPerThreadgroup: dispatch.threadgroupSize)
             }
             if debugDispatch {
                 FileHandle.standardError.write(
@@ -391,12 +645,17 @@ public final class IntegratedExecutor: @unchecked Sendable {
                         .data(using: .utf8)!)
             }
             if perOpBarrier && i < lastIdx {
-                encoder.memoryBarrier(scope: .buffers)
+                opEncoder.memoryBarrier(scope: .buffers)
+            }
+            if perOpProfilingActive {
+                opEncoder.endEncoding()
             }
         }
         _ = kernelTimings  // not used in the fast path — kept for executeAsync caller
 
-        encoder.endEncoding()
+        if !perOpProfilingActive {
+            encoder.endEncoding()
+        }
 
         if ProcessInfo.processInfo.environment["METALHLO_DUMP_DISPATCH_SUMMARY"] != nil {
             var byPipeline: [String: (count: Int, threads: Int)] = [:]
@@ -437,6 +696,89 @@ public final class IntegratedExecutor: @unchecked Sendable {
             let gpuOnly = (commandBuffer.gpuEndTime - commandBuffer.gpuStartTime) * 1000.0
             FileHandle.standardError.write(String(format: "[gpu_time] ops=%d wall=%.2fms gpu=%.2fms\n",
                 executable.executionOrder.count, gpuTimeMs, gpuOnly).data(using: .utf8)!)
+        }
+        if perOpProfilingActive {
+            // Counter samples are GPU timestamps in implementation-defined
+            // ticks. Calibrate the tick↔seconds ratio from the command
+            // buffer's gpuStartTime/gpuEndTime — the first sample's start
+            // and the last sample's end straddle (approximately) the same
+            // wall interval. Avoids hard-coding mach_timebase_info.
+            //
+            // METALHLO_PROFILE_PER_OP_MIN=N skips the dump for programs with
+            // fewer than N ops, so init / PRNG / Adam programs don't drown
+            // out the train_step in the output.
+            let minOpsForDump = Int(ProcessInfo.processInfo.environment["METALHLO_PROFILE_PER_OP_MIN"] ?? "0") ?? 0
+            // Concatenate samples across chunks.
+            var timestamps: [UInt64] = []
+            timestamps.reserveCapacity(plan.count * 2)
+            for (chunk, buf) in perOpSampleBuffers.enumerated() {
+                let opsInChunk = min(opsPerChunk, plan.count - chunk * opsPerChunk)
+                let samples = opsInChunk * 2
+                guard let data = try? buf.resolveCounterRange(0..<samples),
+                      data.count >= samples * MemoryLayout<UInt64>.size else {
+                    timestamps.removeAll()
+                    break
+                }
+                let chunkTs: [UInt64] = data.withUnsafeBytes { raw in
+                    Array(raw.bindMemory(to: UInt64.self).prefix(samples))
+                }
+                timestamps.append(contentsOf: chunkTs)
+            }
+            if timestamps.count == plan.count * 2, plan.count >= minOpsForDump {
+                let firstStart = timestamps.first ?? 0
+                let lastEnd = timestamps.last ?? firstStart
+                let tickSpan = Double(lastEnd &- firstStart)
+                let secSpan = max(commandBuffer.gpuEndTime - commandBuffer.gpuStartTime, 1e-9)
+                let secsPerTick: Double = tickSpan > 0 ? secSpan / tickSpan : 0
+                var byKind: [String: (count: Int, totalMs: Double)] = [:]
+                for i in 0..<plan.count {
+                    var label = plan[i].pipeline.label ?? "<unlabelled>"
+                    // Metal dedups MTLComputePipelineState by source code, so
+                    // multiple matmul ops with different M/N/K but the same
+                    // generated kernel source share one pipeline (and label).
+                    // The dispatch grid encodes the shape variant (gridSize
+                    // scales with M/N/batch), so we tack it on for matmul
+                    // entries to get a per-shape breakdown.
+                    if label.hasPrefix("kernel_matmul") {
+                        // Matmul M/N/K live in scalar bindings 3/4/5 and
+                        // batchCount (if any) in 6. Reading them lets the
+                        // per-shape breakdown distinguish ops that share a
+                        // pipeline (same Metal source) but have different
+                        // contracting-dim sizes.
+                        var m: UInt32 = 0, n: UInt32 = 0, k: UInt32 = 0, b: UInt32 = 1
+                        for binding in plan[i].bindings {
+                            if case let .scalar(value, index) = binding {
+                                switch index {
+                                case 3: m = value
+                                case 4: n = value
+                                case 5: k = value
+                                case 6: b = value
+                                default: break
+                                }
+                            }
+                        }
+                        let d = plan[i].dispatch
+                        label = "kernel_matmul|M=\(m) N=\(n) K=\(k) batch=\(b)|tg=\(d.threadgroupSize.width)"
+                    }
+                    let s = timestamps[i * 2]
+                    let e = timestamps[i * 2 + 1]
+                    let ms = Double(e &- s) * secsPerTick * 1000.0
+                    let prev = byKind[label] ?? (0, 0)
+                    byKind[label] = (prev.count + 1, prev.totalMs + ms)
+                }
+                let sorted = byKind.sorted { $0.value.totalMs > $1.value.totalMs }
+                let totalMs = sorted.reduce(0.0) { $0 + $1.value.totalMs }
+                let gpuMs = (commandBuffer.gpuEndTime - commandBuffer.gpuStartTime) * 1000.0
+                var out = "[per_op] \(plan.count) ops, summed=\(String(format: "%.2f", totalMs))ms, gpu_wall=\(String(format: "%.2f", gpuMs))ms\n"
+                for (label, info) in sorted.prefix(25) {
+                    let avgUs = info.totalMs * 1000.0 / Double(info.count)
+                    let share = info.totalMs / max(totalMs, 1e-9) * 100
+                    let truncatedLabel = String(label.prefix(85))
+                    let padded = truncatedLabel.padding(toLength: 85, withPad: " ", startingAt: 0)
+                    out += "  \(padded)  n=\(String(format: "%4d", info.count))  total=\(String(format: "%7.2f", info.totalMs))ms  avg=\(String(format: "%7.2f", avgUs))us  share=\(String(format: "%5.1f", share))%\n"
+                }
+                FileHandle.standardError.write(out.data(using: .utf8)!)
+            }
         }
         if let error = commandBuffer.error {
             throw IntegratedExecutorError.executionFailed(error.localizedDescription)
@@ -738,6 +1080,11 @@ public final class IntegratedExecutor: @unchecked Sendable {
     /// Handles views - if an output is a view, extracts from the base tensor location.
     private func extractOutputs(inputs: [String: MTLBuffer]) throws -> [String: MTLBuffer] {
         var outputs: [String: MTLBuffer] = [:]
+        // Zero-copy handoff (default): allocate a FRESH owned buffer per output
+        // so the client can wrap it directly (no Data → new-buffer double-copy
+        // in buildOutputBuffers). Disabling reuse-pooling is the trade — fresh
+        // shared-buffer alloc is VM-backed and cheap vs the ~17 ms double-copy.
+        let zeroCopyOutputs = ProcessInfo.processInfo.environment["METALHLO_ZEROCOPY_OUTPUTS"] != "0"
 
         for (name, spec) in executable.outputSpecs {
             // Resolve view chain to get base tensor and offset
@@ -747,7 +1094,7 @@ public final class IntegratedExecutor: @unchecked Sendable {
             if let offset = executable.memoryPlan.tensorOffsets[baseTensorID] {
                 // Get output buffer from pool or allocate new one
                 let outputBuffer: MTLBuffer
-                if let pool = outputBufferPool, let pooled = pool.acquire(name) {
+                if !zeroCopyOutputs, let pool = outputBufferPool, let pooled = pool.acquire(name) {
                     outputBuffer = pooled
                 } else {
                     // Fallback to allocation if pool disabled or exhausted
@@ -774,7 +1121,7 @@ public final class IntegratedExecutor: @unchecked Sendable {
             } else if let offset = executable.memoryPlan.tensorOffsets[name] {
                 // Fall back to direct name lookup (non-view case)
                 let outputBuffer: MTLBuffer
-                if let pool = outputBufferPool, let pooled = pool.acquire(name) {
+                if !zeroCopyOutputs, let pool = outputBufferPool, let pooled = pool.acquire(name) {
                     outputBuffer = pooled
                 } else {
                     guard let newBuffer = device.makeBuffer(

@@ -204,6 +204,7 @@ public enum OptimizationPass: String, CaseIterable, Sendable {
 
     // Generic fusion phase
     case producerConsumerFusion = "producer-consumer-fusion"
+    case reduceFusion = "reduce-fusion"
     case siblingFusion = "sibling-fusion"
     case elementwiseChainFusion = "elementwise-chain-fusion"
 
@@ -249,7 +250,9 @@ public enum OptimizationPass: String, CaseIterable, Sendable {
             transposeCanonicalizer.rawValue,
             broadcastCanonicalizer.rawValue,
             producerConsumerFusion.rawValue,
+            reduceFusion.rawValue,
             batchNormFusion.rawValue,
+            normFusion.rawValue,
             finalDCE.rawValue,
         ])
         return passes

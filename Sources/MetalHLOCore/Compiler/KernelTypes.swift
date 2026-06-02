@@ -194,6 +194,14 @@ public struct TuningConfig: Sendable, Hashable {
     /// Outputs per simdgroup when `useGEMV` is set (e.g. 4).
     public var gemvNWrites: Int
 
+    /// MLX-style L2 swizzle for matmul dispatch. When set, the (M, N)
+    /// tile grid is launched as (tn*(1<<log), ceildiv(tm, 1<<log), batch).
+    /// The kernel decodes the swizzled launch index back to logical
+    /// (tile_m, tile_n). Improves L2 reuse across concurrent threadgroups
+    /// by clustering tiles that share rows of B (or cols of A).
+    /// nil = no swizzle (legacy behaviour).
+    public var swizzleLog: Int?
+
     public init(
         tileM: Int? = nil,
         tileN: Int? = nil,
@@ -208,7 +216,8 @@ public struct TuningConfig: Sendable, Hashable {
         useSIMDPerOutputReduction: Bool = false,
         simdPerOutputNWrites: Int = 1,
         useGEMV: Bool = false,
-        gemvNWrites: Int = 1
+        gemvNWrites: Int = 1,
+        swizzleLog: Int? = nil
     ) {
         self.tileM = tileM
         self.tileN = tileN
@@ -224,6 +233,7 @@ public struct TuningConfig: Sendable, Hashable {
         self.simdPerOutputNWrites = simdPerOutputNWrites
         self.useGEMV = useGEMV
         self.gemvNWrites = gemvNWrites
+        self.swizzleLog = swizzleLog
     }
 
     /// Default tuning for small operations.

@@ -243,6 +243,15 @@ public final class CodeGenerator: @unchecked Sendable {
 
         return ViewResult(outputID: outputInfo.id, view: reshapedView)
     }
+    // NOTE: tried extending this to fold reshape-of-compute-kernel-output by
+    // synthesizing a fresh contiguous view of the input. The view-chain
+    // resolution worked, but the memory planner doesn't know the reshape
+    // output is now a view — it still treats the input as dead after the
+    // reshape (since the reshape kernel was supposed to consume it) and
+    // aliases the input's offset to a later tensor. Loss went from
+    // 4.567244 → 4.238874. Properly fixing this requires updating the
+    // memory planner to keep view-source tensors alive across their
+    // dependent views — material refactor of MemoryPlanner.swift, deferred.
 
     // MARK: - Type Mapping
 
@@ -300,13 +309,23 @@ public final class CodeGenerator: @unchecked Sendable {
         constantIDs: Set<TensorID>,
         viewMappings: [TensorID: StridedTensorView] = [:]
     ) -> KernelSpec {
-        // Get shapes and element type
-        let inputShapes = op.inputs.compactMap { tensors[$0]?.shape }
+        // Get shapes and element type. Use `?? []` (NOT compactMap) so a
+        // missing shape keeps its index slot AND is treated as a scalar (read
+        // `inputN[0]`). Missing-shape operands are inlined scalar constants
+        // (e.g. the -inf select fill); compactMap would drop them, shifting
+        // every later operand's index and reading the scalar as `inputN[tid]`
+        // (out-of-bounds on a 1-element buffer → GPU fault).
+        let inputShapes = op.inputs.map { tensors[$0]?.shape ?? [] }
         let outputShapes = op.outputs.map { $0.shape }
         let elementType = op.outputs.first?.elementType ?? .float32
 
         // Get input element types for operations that need them (convert, gather)
         let inputElementTypes = op.inputs.compactMap { tensors[$0]?.elementType }
+        // Index-aligned variant (one entry per op.inputs slot, never dropped).
+        // The fused-elementwise chain needs this to know which externals are
+        // boolean (i1) so it can read a 1-byte `bool*` buffer and convert to a
+        // float predicate — reading a bool mask as `float` corrupts it (NaN).
+        let alignedInputTypes = op.inputs.map { tensors[$0]?.elementType ?? .float32 }
 
         // Create modified attributes with input types for source generation
         var modifiedAttributes = op.attributes
@@ -322,7 +341,8 @@ public final class CodeGenerator: @unchecked Sendable {
             inputShapes: inputShapes,
             outputShapes: outputShapes,
             attributes: modifiedAttributes,
-            elementType: elementType
+            elementType: elementType,
+            inputElementTypes: alignedInputTypes
         )
 
         // Calculate dispatch configuration. Pass modifiedAttributes so the
@@ -373,7 +393,8 @@ public final class CodeGenerator: @unchecked Sendable {
         inputShapes: [[Int]],
         outputShapes: [[Int]],
         attributes: HLOAttributes,
-        elementType: ElementType = .float32
+        elementType: ElementType = .float32,
+        inputElementTypes: [ElementType] = []
     ) -> (source: String, entryPoint: String, tuning: TuningConfig?) {
         switch type {
         case .original(let opKind):
@@ -409,8 +430,11 @@ public final class CodeGenerator: @unchecked Sendable {
         case .fusedSiLU:
             return generateSiLUSource(inputShapes: inputShapes)
 
-        case .fusedElementwise(let ops):
-            return generateElementwiseChainSource(ops, inputShapes: inputShapes, elementType: elementType)
+        case .fusedElementwise(let chain):
+            return generateElementwiseChainSource(chain, inputShapes: inputShapes, outputShape: outputShapes.first ?? [], elementType: elementType, inputElementTypes: inputElementTypes)
+
+        case .fusedReduce(let cfg):
+            return generateFusedReduceSource(cfg, inputShapes: inputShapes, elementType: elementType)
 
         case .fusedFFN(let config):
             return generateFFNSource(config, inputShapes: inputShapes)
@@ -3337,15 +3361,107 @@ public final class CodeGenerator: @unchecked Sendable {
             // fuses the output cast in-register. This is what the TF32
             // transform's output-convert fusion produces. The same gate that
             // TF32Transform uses (in MetalHLOCompiler) must mirror this.
-            let mppTgCount = (M / 128) * (N / 128) * batchSize
+            // Matmul kernel selection.
+            //
+            // For fp32: prefer an MLX-style "Steel" simdgroup_matrix kernel.
+            // MLX explicitly avoids Apple's `matmul2d` MPP primitive for
+            // fp32 because the matrix coprocessor is tuned for half/bfloat;
+            // a hand-rolled `simdgroup_float8x8` kernel with small tiles
+            // and cooperative threadgroup-memory loads beats MPP on fp32.
+            //
+            // For non-fp32 (half / bfloat16): keep the matmul2d path with
+            // either 128-tile or 64-tile variant, picked by occupancy.
+            //
+            // Both paths require the matmul itself to be untransposed; the
+            // transposed case still falls through to the basic kernel.
+            let tg128 = (M / 128) * (N / 128) * batchSize
+            let tg64  = (M / 64)  * (N / 64)  * batchSize
+            let supports = supportsMetalPerformancePrimitives()
             let inputElementType = attributes.inputElementTypes?.first ?? elementType
-            let mppEligible = supportsMetalPerformancePrimitives()
-                && M % 128 == 0 && N % 128 == 0 && mppTgCount >= 16
+            let isFp32 = elementType == .float32 && inputElementType == .float32
+            // The Steel-style fp32 kernel (generateMatMul2dSteelSource)
+            // turns out to be ~5–10× slower than `matmul2d` MPP on M5 Pro
+            // — the matrix coprocessor's fp32 path is actually competitive
+            // on Apple9-class GPUs. MLX's gate against fp32-MPP was tuned
+            // for older Apple Silicon. We keep the Steel codegen as a
+            // diagnostic option (METALHLO_FORCE_STEEL=1) but default to
+            // MPP for fp32 too. See nanogpt_5x_target_blockers.md for the
+            // per-shape numbers.
+            let disableSteel = ProcessInfo.processInfo.environment["METALHLO_FORCE_STEEL"] != "1"
+            // Steel fp32 path. Aligned only (M%64==N%64==K%16==0) for now;
+            // smaller / unaligned shapes fall through to simdgroup or basic.
+            // Need at least ~16 64-tiles to make the kernel worth it.
+            let steelEligible = isFp32 && !disableSteel
+                && !transA && !transB
+                && M % 64 == 0 && N % 64 == 0 && K % 16 == 0
+                && M >= 64 && N >= 64
+                && tg64 >= 16
+
+            // Cooperative-tensor tf32 GEMM path (METALHLO_COOP_GEMM=1).
+            // Keeps a BM×BN accumulator in registers across the whole K
+            // dimension (in-register multiply_accumulate, write C once) like
+            // MLX's gemm_nax — vs the plain op.run which lets MPP pick a small
+            // internal tileK and goes bandwidth-bound. Aligned fp32 only:
+            // M%64==N? we use a 64×128 tile, K looped in TILEK=128 chunks.
+            // tf32 cooperative-tensor GEMM is default-on (measured correct +
+            // loss-neutral on nanoGPT, faster than plain op.run). Disable with
+            // METALHLO_COOP_GEMM=0; METALHLO_EXACT_FP32=1 also disables it
+            // (it is a reduced-precision path).
+            let coopExactFp32 = ProcessInfo.processInfo.environment["METALHLO_EXACT_FP32"] == "1"
+
+            // Low-level NAX GEMM (MLX gemm_loop). MLX-grade tf32 on the matrix
+            // coprocessor. Opt-in (METALHLO_NAX_GEMM=1) while it stabilizes.
+            let naxEnabled = ProcessInfo.processInfo.environment["METALHLO_NAX_GEMM"] == "1"
+            let naxCfg = CodeGenerator.naxGemmConfig()
+            let naxEligible = naxEnabled && supports && isFp32 && !coopExactFp32
+                && batchSize == 1 && !transA && !transB
+                && M % naxCfg.bm == 0 && N % naxCfg.bn == 0 && K % naxCfg.bk == 0
+                && (M / naxCfg.bm) * (N / naxCfg.bn) >= 16
+
+            let coopEnabled = ProcessInfo.processInfo.environment["METALHLO_COOP_GEMM"] != "0"
+            let coopCfg = CodeGenerator.coopGemmConfig()
+            let coopEligible = !naxEligible && coopEnabled && supports && isFp32 && !coopExactFp32
+                && batchSize == 1 && !transA && !transB
+                && M % coopCfg.bm == 0 && N % coopCfg.bn == 0 && K % coopCfg.tilek == 0
+                && (M / coopCfg.bm) * (N / coopCfg.bn) >= 16
+
+            // matmul2d MPP path. Used for non-fp32 inputs normally; also
+            // serves as a fallback for fp32 when the Steel kernel is
+            // disabled or ineligible.
+            let mppAllowsFp32 = !steelEligible && !coopEligible
+            let mppFp32OK = !isFp32 || mppAllowsFp32
+            let use128 = supports && mppFp32OK && M % 128 == 0 && N % 128 == 0 && tg128 >= 128
+            let use64  = supports && mppFp32OK && M % 64  == 0 && N % 64  == 0 && tg64  >= 16
+                         && !use128
+            let mppEligible = use128 || use64
+            let chosenTile = use128 ? 128 : 64
+
             if ProcessInfo.processInfo.environment["METALHLO_DEBUG_MATMUL_PATH"] != nil {
-                let kernelChoice = mppEligible
-                    ? "MPP"
-                    : (!transA && !transB && M >= 32 && N >= 32 ? "simdgroup" : "basic")
-                FileHandle.standardError.write("[matmul] M=\(M) N=\(N) K=\(K) batch=\(batchSize) transA=\(transA) transB=\(transB) → \(kernelChoice)\n".data(using: .utf8)!)
+                let kernelChoice: String
+                if naxEligible {
+                    kernelChoice = "NAX"
+                } else if coopEligible {
+                    kernelChoice = "CoopTF32"
+                } else if steelEligible {
+                    kernelChoice = "Steel64"
+                } else if mppEligible {
+                    kernelChoice = "MPP\(chosenTile)"
+                } else if !transA && !transB && M >= 32 && N >= 32 {
+                    kernelChoice = "simdgroup"
+                } else {
+                    kernelChoice = "basic"
+                }
+                FileHandle.standardError.write("[matmul] M=\(M) N=\(N) K=\(K) batch=\(batchSize) fp32=\(isFp32) transA=\(transA) transB=\(transB) → \(kernelChoice) (tg128=\(tg128) tg64=\(tg64))\n".data(using: .utf8)!)
+            }
+
+            if naxEligible {
+                return generateMatMul2dNAXSource()
+            }
+            if coopEligible {
+                return generateMatMul2dMPPCoopSource()
+            }
+            if steelEligible {
+                return generateMatMul2dSteelSource(batchSize: batchSize, M: M, N: N, K: K)
             }
             if mppEligible {
                 return generateMatMul2dMPPSource(
@@ -3353,7 +3469,8 @@ public final class CodeGenerator: @unchecked Sendable {
                     inputElementType: inputElementType,
                     outputElementType: elementType,
                     transA: transA,
-                    transB: transB
+                    transB: transB,
+                    tileSize: chosenTile
                 )
             }
             // The simdgroup_matrix kernel uses a 32×32 output tile (4 simdgroups,
@@ -3553,18 +3670,223 @@ public final class CodeGenerator: @unchecked Sendable {
     /// which `MetalHLOCompiler.compileKernel` uses as a sentinel to switch the
     /// runtime compile to `MTLLanguageVersion.version4_0`. Other kernels keep
     /// the default Metal version.
+    /// Cooperative-tensor tf32 GEMM. Mirrors MLX's gemm_nax strategy: hold a
+    /// BM×BN output accumulator in registers (cooperative_tensor) across the
+    /// whole K dimension and write C exactly once, instead of letting MPP's
+    /// `op.run` over full K pick a small internal tileK and become bandwidth-
+    /// bound. Aligned fp32 only (M%64==0, N%128==0, K%128==0), no transpose,
+    /// batch 1 — the caller gates these. relaxed_precision=true (tf32).
+    /// Tile 64×128, 8 simdgroups (256 threads), K looped in 128-wide chunks.
+    /// Tile config for the cooperative-tensor GEMM, env-overridable for tuning.
+    /// Defaults match MLX's NAX choice for Pro-class devices (64×128 tile, 8
+    /// simdgroups). TILEK is the per-op.run K-block (MLX bk ≈ 256–512).
+    static func coopGemmConfig() -> (bm: Int, bn: Int, tilek: Int, nsg: Int) {
+        let env = ProcessInfo.processInfo.environment
+        let bm = Int(env["METALHLO_COOP_BM"] ?? "") ?? 64
+        let bn = Int(env["METALHLO_COOP_BN"] ?? "") ?? 128
+        let tilek = Int(env["METALHLO_COOP_TILEK"] ?? "") ?? 128
+        let nsg = Int(env["METALHLO_COOP_NSG"] ?? "") ?? 8
+        return (bm, bn, tilek, nsg)
+    }
+
+    /// Config for the low-level NAX GEMM (MLX gemm_loop). Env-overridable.
+    /// Defaults match MLX's NAX choice for Pro-class devices: BM=64, BN=128,
+    /// BK=256, WM=2, WN=4 (→ SM=SN=32, 8 simdgroups, 256 threads).
+    static func naxGemmConfig() -> (bm: Int, bn: Int, bk: Int, wm: Int, wn: Int) {
+        let env = ProcessInfo.processInfo.environment
+        let bm = Int(env["METALHLO_NAX_BM"] ?? "") ?? 64
+        let bn = Int(env["METALHLO_NAX_BN"] ?? "") ?? 128
+        let bk = Int(env["METALHLO_NAX_BK"] ?? "") ?? 256
+        let wm = Int(env["METALHLO_NAX_WM"] ?? "") ?? 2
+        let wn = Int(env["METALHLO_NAX_WN"] ?? "") ?? 4
+        return (bm, bn, bk, wm, wn)
+    }
+
+    /// MLX-grade tf32 GEMM: bundles MLX's tested `gemm_loop` (NAX cooperative-
+    /// tensor, register-blocked) and adds a thin wrapper using our buffer ABI.
+    /// Aligned fp32, no transpose, batch 1 — caller gates on M%BM==N%BN==K%BK==0.
+    /// UM/UN/UK = 16/32/16 and SK=32 are the coprocessor's natural NAX units.
+    private func generateMatMul2dNAXSource() -> (String, String, TuningConfig?) {
+        let c = CodeGenerator.naxGemmConfig()
+        let sm = c.bm / c.wm
+        let sn = c.bn / c.wn
+        let nsg = c.wm * c.wn
+        // MLX uses swizzle_log=2 for 's'/Pro devices: reshapes the launch grid
+        // so concurrently-resident threadgroups read overlapping A/B tiles →
+        // L2 reuse. The dispatcher reshapes the grid (gridWidth*=tile,
+        // gridHeight=ceil/tile); the kernel decodes (tid.x,tid.y)→logical tile.
+        let swizzleLog = Int(ProcessInfo.processInfo.environment["METALHLO_NAX_SWIZZLE"] ?? "") ?? 2
+        let tuning = TuningConfig(
+            tileM: c.bm,
+            tileN: c.bn,
+            tileK: nil,
+            blockSize: nsg * 32,
+            useSharedMemory: false,
+            useSIMDGroups: true,
+            swizzleLog: swizzleLog
+        )
+        let wrapper = """
+
+        // NAX_GEMM_KERNEL (compiler keys fast-math + Metal 4.0 on this marker)
+        using namespace metal;
+        using namespace mlx::steel;
+
+        // max_total_threads_per_threadgroup lets the compiler size the register
+        // file for exactly \(nsg * 32) threads/TG instead of the 1024 worst case —
+        // critical for this register-heavy cooperative-tensor kernel's occupancy.
+        [[kernel, max_total_threads_per_threadgroup(\(nsg * 32))]] void kernel_matmul(
+            device const float* A [[buffer(0)]],
+            device const float* B [[buffer(1)]],
+            device float* C [[buffer(2)]],
+            constant uint& M [[buffer(3)]],
+            constant uint& N [[buffer(4)]],
+            constant uint& K [[buffer(5)]],
+            uint simd_group_id [[simdgroup_index_in_threadgroup]],
+            uint3 tid [[threadgroup_position_in_grid]])
+        {
+            constexpr int BM = \(c.bm), BN = \(c.bn), BK = \(c.bk), WM = \(c.wm), WN = \(c.wn);
+            constexpr int SWIZZLE_LOG = \(swizzleLog);
+            constexpr short UM = 16, UN = 32, UK = 16, SK = 32;
+            constexpr short SM = BM / WM, SN = BN / WN;
+
+            const int tiles_n = int(N) / BN;
+            const int tiles_m = int(M) / BM;
+            // Decode swizzled launch grid → logical (tile_n, tile_m).
+            const int tid_y = (int(tid.y) << SWIZZLE_LOG) +
+                              (int(tid.x) & ((1 << SWIZZLE_LOG) - 1));
+            const int tid_x = int(tid.x) >> SWIZZLE_LOG;
+            if (tid_x >= tiles_n || tid_y >= tiles_m) { return; }
+
+            const int c_row = tid_y * BM;
+            const int c_col = tid_x * BN;
+            const int lda = int(K), ldb = int(N), ldd = int(N);
+
+            // Per-simdgroup sub-tile origin within the BM×BN block.
+            const short tm = SM * short(simd_group_id / WN);
+            const short tn = SN * short(simd_group_id % WN);
+
+            const device float* Aptr = A + (size_t)(c_row + tm) * lda;   // no transpose_a
+            const device float* Bptr = B + (size_t)(c_col + tn);         // no transpose_b
+            device float* Dptr = C + (size_t)(c_row + tm) * ldd + (c_col + tn);
+
+            const int gemm_k_iterations = int(K) / BK;
+
+            auto Dtile = gemm_loop<
+                float, SM, SN, SK, BK,
+                false, false,         // transpose_a, transpose_b
+                true, true, true,     // kAlignedM, kAlignedN, kAlignedK
+                UM, UN, UK, float>(
+                Aptr, Bptr, lda, ldb, int(K), gemm_k_iterations, SM, SN);
+
+            Dtile.store(Dptr, ldd);
+        }
+        """
+        return (NAXGemmBundle.metalSource + wrapper, "kernel_matmul", tuning)
+    }
+
+    private func generateMatMul2dMPPCoopSource() -> (String, String, TuningConfig?) {
+        let cfg = CodeGenerator.coopGemmConfig()
+        let tuning = TuningConfig(
+            tileM: cfg.bm,
+            tileN: cfg.bn,
+            tileK: nil,
+            blockSize: cfg.nsg * 32,
+            useSharedMemory: false,
+            useSIMDGroups: true
+        )
+        let source = """
+        #include <metal_stdlib>
+        #include <metal_tensor>
+        #include <metal_cooperative_tensor>
+        #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+
+        using namespace metal;
+        using namespace mpp::tensor_ops;
+
+        #define BM \(cfg.bm)
+        #define BN \(cfg.bn)
+        #define TILEK \(cfg.tilek)
+        #define NSG \(cfg.nsg)
+
+        // dextents convention is (cols, rows); cols is the faster-varying dim.
+        // A[M,K] → (K, M); B[K,N] → (N, K); C[M,N] → (N, M). No transpose.
+        kernel void kernel_matmul(
+            device float* A_ptr [[buffer(0)]],
+            device float* B_ptr [[buffer(1)]],
+            device float* C_ptr [[buffer(2)]],
+            constant uint& M [[buffer(3)]],
+            constant uint& N [[buffer(4)]],
+            constant uint& K [[buffer(5)]],
+            uint3 tgid [[threadgroup_position_in_grid]])
+        {
+            tensor<device float, dextents<int32_t, 2>, tensor_inline> A(
+                A_ptr, dextents<int32_t, 2>{int32_t(K), int32_t(M)});
+            tensor<device float, dextents<int32_t, 2>, tensor_inline> B(
+                B_ptr, dextents<int32_t, 2>{int32_t(N), int32_t(K)});
+            tensor<device float, dextents<int32_t, 2>, tensor_inline> C(
+                C_ptr, dextents<int32_t, 2>{int32_t(N), int32_t(M)});
+
+            constexpr auto desc = matmul2d_descriptor(
+                BM, BN, TILEK,
+                false, false,                        // transpose_left/right
+                true,                                // relaxed_precision (tf32)
+                matmul2d_descriptor::mode::multiply_accumulate);
+            matmul2d<desc, execution_simdgroups<NSG>> op;
+
+            const uint mRow = tgid.y * BM;
+            const uint nCol = tgid.x * BN;
+
+            // In-register accumulator (layout depends on op scope/desc). Seed
+            // its type from a representative slice, then zero it. The descriptor
+            // pins the op tile to BM×BN×TILEK, so op.run reads exactly TILEK
+            // columns from the slice origin regardless of the slice's extent.
+            auto sA = A.slice(0, mRow);
+            auto sB = B.slice(nCol, 0);
+            auto cT = op.get_destination_cooperative_tensor<decltype(sA), decltype(sB), float>();
+
+            // Zero all thread-private accumulator slots (multiply_accumulate
+            // adds onto the initial value). Writing every slot is safe; store()
+            // only emits the valid elements.
+            for (uint16_t i = 0; i < cT.get_capacity(); ++i) {
+                cT[i] = 0.0f;
+            }
+
+            // K-loop: each op.run does a BM×TILEK · TILEK×BN multiply and
+            // accumulates into the register tensor. Caller guarantees K%TILEK==0.
+            for (uint k = 0; k + TILEK <= K; k += TILEK) {
+                auto tA = A.slice(k, mRow);
+                auto tB = B.slice(nCol, k);
+                op.run(tA, tB, cT);
+            }
+
+            auto mC = C.slice(nCol, mRow);
+            cT.store(mC);
+        }
+        """
+        return (source, "kernel_matmul", tuning)
+    }
+
     private func generateMatMul2dMPPSource(
         batchSize: Int,
         inputElementType: ElementType,
         outputElementType: ElementType,
         transA: Bool = false,
-        transB: Bool = false
+        transB: Bool = false,
+        tileSize: Int = 128
     ) -> (String, String, TuningConfig?) {
+        // Tile size: BM == BN. Defaults to 128 (8 simdgroups, 256 threads).
+        // A 64-tile variant (4 simdgroups, 128 threads) is used for shapes
+        // with too few 128-tiles to fill the GPU — the matrix coprocessor's
+        // throughput per TG is unchanged, but more TGs improves occupancy
+        // on shapes like (M=1536, N=384, K=4096) where (M/128)*(N/128) = 36
+        // only covers ~0.5 of the M5 Pro's ~64 concurrent-TG capacity.
+        let numSimdgroups = (tileSize == 64) ? 4 : 8
+        let blockSize = numSimdgroups * 32
         let tuning = TuningConfig(
-            tileM: 128,
-            tileN: 128,
+            tileM: tileSize,
+            tileN: tileSize,
             tileK: nil,
-            blockSize: 256,    // 8 simdgroups × 32 lanes; consumed by calculateDispatch.
+            blockSize: blockSize,
             useSharedMemory: false,
             useSIMDGroups: true
         )
@@ -3612,6 +3934,19 @@ public final class CodeGenerator: @unchecked Sendable {
             : "B.slice(tgid.x * BN, 0)"
         let descTransposeFlags = "\(transA ? "true" : "false"), \(transB ? "true" : "false")"
 
+        // tf32 fast path. For fp32 inputs, `relaxed_precision = true` lets the
+        // matrix coprocessor round operands to tf32 (10-bit mantissa) and run
+        // the multiply at ~5× the exact-fp32 throughput — exactly what MLX does
+        // by default (matmul.cpp gate `enable_tf32() || dtype != float32`, with
+        // enable_tf32 defaulting true). On M5 Pro this takes fp32 matmul from
+        // ~3.6 TF (exact) toward ~18 TF (tf32). For fp16/bf16 inputs the
+        // mantissa is already ≤10 bits so relaxed has no effect; keep it off.
+        // Escape hatch: METALHLO_EXACT_FP32=1 forces bit-exact fp32 (rel err
+        // ~1e-6 instead of tf32's ~1e-3) at the throughput cost.
+        let exactFp32 = ProcessInfo.processInfo.environment["METALHLO_EXACT_FP32"] == "1"
+        let relaxedPrecision = (inputElementType == .float32) && !exactFp32
+        let relaxedPrecisionFlag = relaxedPrecision ? "true" : "false"
+
         let source = """
         #include <metal_stdlib>
         #include <metal_tensor>
@@ -3621,9 +3956,9 @@ public final class CodeGenerator: @unchecked Sendable {
         using namespace metal;
         using namespace mpp::tensor_ops;
 
-        #define BM 128
-        #define BN 128
-        #define NUM_SIMDGROUPS 8
+        #define BM \(tileSize)
+        #define BN \(tileSize)
+        #define NUM_SIMDGROUPS \(numSimdgroups)
 
         // MetalPerformancePrimitives matmul2d on Apple Matrix Coprocessor.
         // 4 simdgroups (128 threads) per threadgroup. dextents convention is
@@ -3672,11 +4007,11 @@ public final class CodeGenerator: @unchecked Sendable {
                 BN,                                  // n outer dim
                 static_cast<int>(dynamic_extent),    // k = pulled from operands
                 \(descTransposeFlags),                        // transpose_left, transpose_right
-                false);                              // exact precision: fp16
-                                                     // inputs already minimize
-                                                     // MAC width; relaxed has
-                                                     // no upside here and
-                                                     // marginal accuracy cost.
+                \(relaxedPrecisionFlag));             // relaxed_precision: tf32
+                                                     // for fp32 inputs (MLX
+                                                     // default), exact for
+                                                     // fp16/bf16. Override with
+                                                     // METALHLO_EXACT_FP32=1.
             matmul2d<desc, execution_simdgroups<NUM_SIMDGROUPS>> op;
 
             // Grid is dispatched as gridSize.width = N_tiles, gridSize.height = M_tiles
@@ -3686,6 +4021,284 @@ public final class CodeGenerator: @unchecked Sendable {
             auto c = C.slice(tgid.x * BN, tgid.y * BM);
 
             op.run(a, b, c);
+        }
+        """
+        return (source, "kernel_matmul", tuning)
+    }
+
+    /// MLX-style "Steel" GEMM for fp32. Hand-tuned simdgroup_matrix kernel
+    /// with cooperative threadgroup loads — much faster on Apple Silicon for
+    /// fp32 than the matrix-coprocessor `matmul2d` primitive (which is
+    /// tuned for half/bfloat). MLX gates fp32 *away* from `matmul2d` for
+    /// exactly this reason (`mlx/backend/metal/matmul.cpp:915`).
+    ///
+    /// Tile: BM=64 BN=64 BK=16 with WM=2 WN=2 simdgroups (128 threads/TG).
+    /// Each simdgroup writes a 32×32 sub-tile of output via a 4×4 grid of
+    /// `simdgroup_float8x8` accumulators. Per K-step (BK=16) the inner loop
+    /// runs 2 simdgroup_load + 4×4 simdgroup_multiply_accumulate per simdgroup.
+    /// Aligned variant only — caller gates on M%64==N%64==K%16==0.
+    /// Declare 16 named simdgroup_float8x8 accumulators (acc_0_0 … acc_3_3)
+    /// initialized to 0. Used in place of `simdgroup_float8x8 acc[4][4]` so
+    /// the Metal compiler keeps each in a register file slot rather than as
+    /// a stack alloca that gets load/stored per MMA.
+    private func steelAccDecls() -> String {
+        var lines: [String] = []
+        for i in 0..<4 {
+            for j in 0..<4 {
+                lines.append("simdgroup_float8x8 acc_\(i)_\(j) = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);")
+            }
+        }
+        return lines.joined(separator: "\n            ")
+    }
+
+    /// Generate the inner-K loop body for the Steel matmul, fully unrolled.
+    /// `#pragma clang loop unroll(full)` is silently ignored by the Metal
+    /// compiler for the simdgroup_matrix MMA loop nest (verified via offline
+    /// `xcrun metal -S`; the resulting IR contains 1 MMA call inside a 4×4
+    /// loop with a runtime-computed serpentine select, plus alloca + load/
+    /// store of the accumulator per MMA). Generating the full unroll
+    /// here in Swift produces 16 explicit MMA calls per kk iter with all
+    /// constant indices, which the compiler can register-promote.
+    private func steelInnerKK() -> String {
+        var src = ""
+        for kk in 0..<2 {                                          // BK / kFragSize = 16 / 8
+            let kkOff = kk * 8
+            src += "{ // kk = \(kkOff)\n"
+            src += "                frag_t a_te_0, a_te_1, a_te_2, a_te_3;\n"
+            for i in 0..<4 {
+                let aBase = i * 16 * 20 + kkOff                    // i * TM_STRIDE * A_LD + kk
+                src += "                a_te_\(i)[0] = As_base[\(aBase + 0)];\n"
+                src += "                a_te_\(i)[1] = As_base[\(aBase + 1)];\n"
+            }
+            src += "                frag_t b_te_0, b_te_1, b_te_2, b_te_3;\n"
+            for j in 0..<4 {
+                let bBase = j * 16 + kkOff * 68                    // j * TN_STRIDE + kk * B_LD
+                src += "                b_te_\(j)[0] = Bs_base[\(bBase + 0)];\n"
+                src += "                b_te_\(j)[1] = Bs_base[\(bBase + 1)];\n"
+            }
+            for j in 0..<4 {
+                src += "                simdgroup_float8x8 b_mat_\(j);\n"
+                src += "                reinterpret_cast<thread frag_t&>(b_mat_\(j).thread_elements()) = b_te_\(j);\n"
+            }
+            for i in 0..<4 {
+                src += "                { simdgroup_float8x8 A_mat;\n"
+                src += "                  reinterpret_cast<thread frag_t&>(A_mat.thread_elements()) = a_te_\(i);\n"
+                // Serpentine N order — alternate direction per i for register reuse.
+                let jOrder = (i & 1 == 1) ? [3, 2, 1, 0] : [0, 1, 2, 3]
+                for j in jOrder {
+                    src += "                  simdgroup_multiply_accumulate(acc_\(i)_\(j), A_mat, b_mat_\(j), acc_\(i)_\(j));\n"
+                }
+                src += "                }\n"
+            }
+            src += "            }\n"
+        }
+        return src
+    }
+
+    /// Generate the unrolled store-back loop using the named acc_i_j vars.
+    private func steelStore() -> String {
+        var src = ""
+        for i in 0..<4 {
+            for j in 0..<4 {
+                src += "{ // (i=\(i), j=\(j))\n"
+                src += "                uint row = out_base_row + \(i * 16);\n"
+                src += "                uint col = out_base_col + \(j * 16);\n"
+                src += "                frag_t te = reinterpret_cast<thread frag_t&>(acc_\(i)_\(j).thread_elements());\n"
+                src += "                C_ptr[row * N + col + 0] = te[0];\n"
+                src += "                C_ptr[row * N + col + 1] = te[1];\n"
+                src += "            }\n            "
+            }
+        }
+        return src
+    }
+
+    private func generateMatMul2dSteelSource(batchSize: Int, M: Int, N: Int, K: Int) -> (String, String, TuningConfig?) {
+        // MLX picks swizzle_log=2 for `medium` Apple GPUs (M5 Pro devc='s').
+        // Empirically swizzle hurts for our kernel: TF off the K=4096 shapes
+        // drops 5-13%, possibly because the bounds-check overhead outweighs
+        // L2 reuse with our register footprint / occupancy. Keep the code
+        // path (swizzle_log=0 → no-op) so we can re-enable per-shape later.
+        let swizzleLog = 0
+        let tuning = TuningConfig(
+            tileM: 64,
+            tileN: 64,
+            tileK: 16,
+            blockSize: 128,    // 4 simdgroups × 32 lanes
+            useSharedMemory: true,
+            useSIMDGroups: true,
+            swizzleLog: swizzleLog
+        )
+        let isBatched = batchSize > 1
+        let batchCountParam = isBatched ? "constant uint& batchCount [[buffer(6)]]," : ""
+        let batchOffsetSetup = isBatched ? """
+                if (tgid.z >= batchCount) return;
+                A_ptr += uint(tgid.z) * M * K;
+                B_ptr += uint(tgid.z) * K * N;
+                C_ptr += uint(tgid.z) * M * N;
+        """ : ""
+
+        let source = """
+        #include <metal_stdlib>
+        #include <metal_simdgroup_matrix>
+        using namespace metal;
+
+        // Faithful port of mlx::steel::BlockMMA / GEMMKernel (fp32 path).
+        //
+        // Tile: BM=64 BN=64 BK=16 with WM=2 WN=2 simdgroups (128 threads).
+        // Each simdgroup writes a 32×32 sub-tile interleaved at stride
+        // (kFragSize×WM, kFragSize×WN) = (16, 16) — i.e. 4×4 fragments
+        // sitting at positions {(tm+i*16, tn+j*16) for i,j ∈ 0..3} where
+        // (tm, tn) ∈ {(0,0),(0,8),(8,0),(8,8)} per simdgroup. This is the
+        // MLX TM_stride=kFragSize*WM pattern.
+        //
+        // The key trick vs my earlier draft: per-thread fragment loads,
+        // not `simdgroup_load`. Each thread reads its own 2 elements from
+        // padded threadgroup memory using a lane-coord offset, packs them
+        // into the per-thread half of a `simdgroup_float8x8` via
+        // `thread_elements()`, then calls `simdgroup_multiply_accumulate`.
+        // This is what MLX's `BaseMMAFrag<T,8,8>::load` does. `simdgroup_load`
+        // measured ~10× slower than per-thread loads on M5 Pro.
+        //
+        // Padding `tgp_padding = 16/sizeof(T) = 4 fp32` on the leading dim
+        // of each tile avoids 32-way bank conflicts (Apple GPU threadgroup
+        // memory has 32 banks of 4 bytes).
+        #define BM 64
+        #define BN 64
+        #define BK 16
+        #define WM 2
+        #define WN 2
+        #define A_LD 20   // BK + 4 padding
+        #define B_LD 68   // BN + 4 padding
+        // TM_stride / TN_stride from MLX BlockMMA — distance between
+        // consecutive fragments within a simdgroup, in elements.
+        #define TM_STRIDE 16  // kFragSize * WM
+        #define TN_STRIDE 16  // kFragSize * WN
+
+        // M, N, K are baked in as compile-time constants — we specialize the
+        // kernel per-shape anyway, and inlined literals let the Metal
+        // compiler constant-fold every address calc and pointer stride.
+        // Buffer-bound versions are kept (named _runtime) so the dispatch
+        // path's binding plan does not have to change; they go unused.
+        #define M_CONST \(M)
+        #define N_CONST \(N)
+        #define K_CONST \(K)
+
+        [[max_total_threads_per_threadgroup(128)]]
+        kernel void kernel_matmul(
+            device const float* A_ptr [[buffer(0)]],
+            device const float* B_ptr [[buffer(1)]],
+            device float* C_ptr [[buffer(2)]],
+            constant uint& M_runtime [[buffer(3)]],
+            constant uint& N_runtime [[buffer(4)]],
+            constant uint& K_runtime [[buffer(5)]],
+            \(batchCountParam)
+            uint3 tgid [[threadgroup_position_in_grid]],
+            uint thread_idx [[thread_index_in_threadgroup]],
+            uint simd_lane_id [[thread_index_in_simdgroup]],
+            uint simd_group_id [[simdgroup_index_in_threadgroup]])
+        {
+            (void)M_runtime; (void)N_runtime; (void)K_runtime;
+            constexpr uint M = M_CONST;
+            constexpr uint N = N_CONST;
+            constexpr uint K = K_CONST;
+            \(batchOffsetSetup)
+            threadgroup float Asub[BM * A_LD];   // 64*20 = 1280 floats
+            threadgroup float Bsub[BK * B_LD];   // 16*68 = 1088 floats
+
+            // MLX L2 swizzle (steel_gemm_fused.h:154-160). Launch grid is
+            // (tiles_n * (1<<SWIZZLE_LOG), ceildiv(tiles_m, 1<<SWIZZLE_LOG)).
+            // Decode back: 4 consecutive tgid.x values (mod SWIZZLE_TILE)
+            // share the same logical tile_n, improving B-tile reuse across
+            // simultaneously-resident threadgroups.
+            #define SWIZZLE_LOG \(swizzleLog)
+            #define SWIZZLE_TILE (1 << SWIZZLE_LOG)
+            const uint tiles_m = M / BM;
+            const uint tiles_n = N / BN;
+            const uint logical_tile_m = (tgid.y << SWIZZLE_LOG) +
+                                        (tgid.x & (SWIZZLE_TILE - 1));
+            const uint logical_tile_n = tgid.x >> SWIZZLE_LOG;
+            if (logical_tile_m >= tiles_m || logical_tile_n >= tiles_n) return;
+            uint tileM = logical_tile_m * BM;
+            uint tileN = logical_tile_n * BN;
+
+            // Cooperative load layout (MLX BlockLoader pattern).
+            // A_sub (BM×BK=64×16): TCOLS=2, TROWS=64. Each thread loads
+            // 8 cols of one row (2× float4).
+            uint A_bi = thread_idx >> 1;            // / 2
+            uint A_bj = (thread_idx & 1u) * 8u;     // 0 or 8
+            // B_sub (BK×BN=16×64): TCOLS=8, TROWS=16. Each thread loads
+            // 8 cols of one row.
+            uint B_bi = thread_idx >> 3;            // / 8
+            uint B_bj = (thread_idx & 7u) * 8u;     // 0, 8, ..., 56
+
+            // BlockMMA constructor (mma.h:488) — derive the per-thread
+            // (sm, sn) lane-coords inside an 8×8 fragment from simd_lane_id.
+            uint qid = simd_lane_id >> 2;                              // / 4
+            uint fm  = (qid & 4u) + ((simd_lane_id >> 1) & 3u);        // row 0..7
+            uint fn  = ((qid & 2u) << 1) + ((simd_lane_id & 1u) << 1); // col 0/2/4/6
+            // Per-simdgroup offset into the BM/BN tile (interleaved layout).
+            uint tm = 8u * (simd_group_id / WN);   // 0 or 8
+            uint tn = 8u * (simd_group_id % WN);   // 0 or 8
+            // Final per-thread base offsets into As, Bs.
+            uint As_off = (tm + fm) * A_LD + fn;   // row=(tm+fm), col=fn
+            uint Bs_off = fm * B_LD + (tn + fn);   // row=fm, col=(tn+fn)
+
+            typedef vec<float, 2> frag_t;
+            // 16 accumulators as INDIVIDUAL NAMED variables instead of
+            // `simdgroup_float8x8 acc[4][4]`. The Metal compiler keeps
+            // arrays-of-simdgroup_matrix as alloca + load/store-per-MMA
+            // (verified via offline `xcrun metal -S`) even when indices
+            // are loop-invariant; #pragma unroll(full) does not unroll
+            // the surrounding MMA loop on this toolchain. Individual
+            // variables force the compiler to allocate each to its own
+            // register and eliminate the inner-loop stack traffic.
+            \(steelAccDecls())
+
+            // Hoist the per-thread device pointers (MLX BlockLoader pattern).
+            // src_a, src_b are pre-offset to this thread's slice of the
+            // tile, and advance by `+BK` / `+BK*N` per outer K iteration.
+            const device float* src_a = A_ptr + (tileM + A_bi) * K + A_bj;
+            const device float* src_b = B_ptr + B_bi * N + tileN + B_bj;
+            threadgroup float* dst_a = Asub + A_bi * A_LD + A_bj;
+            threadgroup float* dst_b = Bsub + B_bi * B_LD + B_bj;
+
+            uint k_iters = K / BK;
+            for (uint k_iter = 0; k_iter < k_iters; k_iter++) {
+                // --- Cooperative threadgroup load of A and B tiles ---
+                // 8 floats per thread = 2× float4. ReadVector-equivalent
+                // (MLX loader.h:74-80, 8-element ReadVector).
+                {
+                    const device float4* src = (const device float4*)src_a;
+                    threadgroup float4* dst = (threadgroup float4*)dst_a;
+                    dst[0] = src[0];
+                    dst[1] = src[1];
+                }
+                {
+                    const device float4* src = (const device float4*)src_b;
+                    threadgroup float4* dst = (threadgroup float4*)dst_b;
+                    dst[0] = src[0];
+                    dst[1] = src[1];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                // Inner K loop, BK/kFragSize = 2 iterations, FULLY UNROLLED
+                // via Swift codegen because #pragma unroll(full) is ignored
+                // by the Metal compiler for the simdgroup_matrix loop nest.
+                threadgroup const float* As_base = Asub + As_off;
+                threadgroup const float* Bs_base = Bsub + Bs_off;
+                \(steelInnerKK())
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                // Advance device pointers (MLX BlockLoader::next pattern).
+                src_a += BK;
+                src_b += BK * N;
+            }
+
+            // Store back to device — fully unrolled per the same reasoning
+            // as the MMA loop. Uses the individually-named acc_i_j vars.
+            uint out_base_row = tileM + tm + fm;
+            uint out_base_col = tileN + tn + fn;
+            \(steelStore())
         }
         """
         return (source, "kernel_matmul", tuning)
@@ -4736,6 +5349,15 @@ public final class CodeGenerator: @unchecked Sendable {
 
     /// Generates LayerNorm source.
     private func generateLayerNormSource(_ config: NormConfig, inputShapes: [[Int]]) -> (String, String, TuningConfig?) {
+        // Bake hiddenSize + epsilon as literals so binding matches the custom
+        // call's 3 operands [input, gamma, beta] + output — no scalar buffers
+        // (the executor doesn't bind extra scalars for a fused custom_call).
+        // SIMD-per-row: one simdgroup (32 lanes) reduces one row's mean+var
+        // cooperatively, then writes the affine output. 32 simdgroups/TG.
+        let hiddenSize = inputShapes.first?.last ?? 1
+        if ProcessInfo.processInfo.environment["METALHLO_FUSE_LAYERNORM"] == "1" {
+            FileHandle.standardError.write("[ln-codegen] generateLayerNormSource called H=\(hiddenSize) inputShapes=\(inputShapes)\n".data(using: .utf8)!)
+        }
         let source = """
         #include <metal_stdlib>
         using namespace metal;
@@ -4745,37 +5367,34 @@ public final class CodeGenerator: @unchecked Sendable {
             device const float* gamma [[buffer(1)]],
             device const float* beta [[buffer(2)]],
             device float* output [[buffer(3)]],
-            constant uint& hiddenSize [[buffer(4)]],
-            constant float& epsilon [[buffer(5)]],
-            uint2 gid [[thread_position_in_grid]])
+            uint tgid [[threadgroup_position_in_grid]],
+            uint simd_lane [[thread_index_in_simdgroup]],
+            uint simd_group [[simdgroup_index_in_threadgroup]])
         {
-            uint batch = gid.y;
-            uint offset = batch * hiddenSize;
+            const uint H = \(hiddenSize)u;
+            uint row = tgid * 32u + simd_group;
+            uint offset = row * H;
 
-            // Compute mean
             float sum = 0.0f;
-            for (uint i = 0; i < hiddenSize; i++) {
-                sum += input[offset + i];
-            }
-            float mean = sum / float(hiddenSize);
+            for (uint i = simd_lane; i < H; i += 32u) { sum += input[offset + i]; }
+            sum = simd_sum(sum);
+            float mean = sum / float(H);
 
-            // Compute variance
-            float varSum = 0.0f;
-            for (uint i = 0; i < hiddenSize; i++) {
-                float diff = input[offset + i] - mean;
-                varSum += diff * diff;
+            float vs = 0.0f;
+            for (uint i = simd_lane; i < H; i += 32u) {
+                float d = input[offset + i] - mean; vs += d * d;
             }
-            float invStd = rsqrt(varSum / float(hiddenSize) + \(config.epsilon));
+            vs = simd_sum(vs);
+            float invStd = rsqrt(vs / float(H) + \(config.epsilon)f);
 
-            // Normalize and apply affine transform
-            for (uint i = gid.x; i < hiddenSize; i += \(256)) {
-                float normalized = (input[offset + i] - mean) * invStd;
-                output[offset + i] = normalized * gamma[i] + beta[i];
+            for (uint i = simd_lane; i < H; i += 32u) {
+                float n = (input[offset + i] - mean) * invStd;
+                output[offset + i] = n * gamma[i] + beta[i];
             }
         }
         """
 
-        return (source, "kernel_layer_norm", TuningConfig(blockSize: 256))
+        return (source, "kernel_layer_norm", TuningConfig(blockSize: 1024))
     }
 
     /// Generates numerically stable softmax kernel.
@@ -4988,71 +5607,219 @@ public final class CodeGenerator: @unchecked Sendable {
         return (source, "kernel_silu", nil)
     }
 
-    /// Generates elementwise chain source.
+    /// Generates the fused-elementwise chain kernel from an SSA-DAG chain.
     ///
-    /// Handles both unary and binary operations. For binary ops, consumes inputs in order.
-    /// Example: ops = [add, multiply] with inputs [a, b, c]
-    ///   x = a + b (consumes inputs 0 and 1)
-    ///   x = x * c (uses previous result and input 2)
+    /// The chain records, for each op, the source of each operand: either
+    /// an external input slot (read as `inputN[tid]` for full-shape tensors
+    /// or `inputN[0]` for scalar 1-element tensors) or the result of an
+    /// earlier chain op (already materialised as a local `vK` variable).
+    /// The kernel emits one temporary per op and writes the last op's
+    /// result to `output[tid]`.
     ///
-    /// IMPORTANT: The kernel buffer indices MUST match what buildBindings() provides:
+    /// Reshape ops are linear-index no-ops — the temp just aliases the
+    /// operand expression. broadcast_in_dim of a scalar is the same: the
+    /// scalar is loaded once via `input[0]` and propagated by re-reading
+    /// it from each consuming op.
+    ///
+    /// Buffer layout (must match `buildBindings()`):
     /// - Input buffers at indices 0..<inputShapes.count
     /// - Output buffer at index inputShapes.count
     /// - Count scalar at index inputShapes.count + 1
-    private func generateElementwiseChainSource(_ ops: [HLOOpKind], inputShapes: [[Int]], elementType: ElementType = .float32) -> (String, String, TuningConfig?) {
-        // Use the actual number of inputs passed to the operation.
-        // This MUST match op.inputs.count used by buildBindings() to ensure
-        // buffer indices are aligned between kernel signature and buffer bindings.
-        let inputCount = max(inputShapes.count, 1)
+    private func generateElementwiseChainSource(
+        _ chain: FusedElementwiseChain,
+        inputShapes: [[Int]],
+        outputShape: [Int],
+        elementType: ElementType = .float32,
+        inputElementTypes: [ElementType] = []
+    ) -> (String, String, TuningConfig?) {
+        // Declare enough inputs to cover every external operand the chain
+        // references. inputShapes can be SHORTER than the operand list when a
+        // shape is missing from analysis (op.inputs.compactMap drops nils), so
+        // sizing off inputShapes.count alone leaves a referenced `inputN`
+        // undeclared. The binding always provides all operands as buffers.
+        let maxExternal = chain.ops
+            .flatMap { $0.operands }
+            .compactMap { src -> Int? in if case .external(let s) = src { return s }; return nil }
+            .max() ?? -1
+        let inputCount = max(inputShapes.count, maxExternal + 1, 1)
         let metalType = metalTypeName(for: elementType)
 
-        // Generate kernel parameters for all inputs
-        var inputParams: [String] = []
-        for i in 0..<inputCount {
-            inputParams.append("device const \(metalType)* input\(i) [[buffer(\(i))]]")
-        }
-
-        // Output buffer comes after inputs (must match buildBindings layout)
-        let outputBufferIndex = inputCount
-
-        // Generate the operation code
-        var code = ""
-        var inputIndex = 0
-        var hasX = false
-
-        for op in ops {
-            if isBinaryOp(op) {
-                let left: String
-                let right: String
-
-                if hasX {
-                    left = "x"
-                    right = "input\(inputIndex)[tid]"
-                    inputIndex += 1
-                } else {
-                    left = "input\(inputIndex)[tid]"
-                    inputIndex += 1
-                    right = "input\(inputIndex)[tid]"
-                    inputIndex += 1
+        // Per-external buffer element type. The chain computes in `metalType`
+        // (the root's type — float for the usual case), but an external may be
+        // a DIFFERENT, narrower type whose buffer must be read at its true
+        // width before converting. Two cases bite:
+        //
+        //  • i1 (bool): a causal mask feeding a select predicate is a 1-byte
+        //    `bool` buffer. Read as `float` → corrupt (NaN).
+        //  • integers: `select(compare(int_a, int_b), float_x, float_y)` puts
+        //    integer compare operands in a float chain (HLO forbids mixed-type
+        //    arithmetic, but select/compare legitimately mix predicate/operand
+        //    types). Reading an `int` buffer as `float` reinterprets the bits.
+        //
+        // Declare each such external at its true Metal type; the existing
+        // `metalType vK = inputN[idx]` then does the correct implicit numeric
+        // conversion (bool→float 1/0, int→float). Float externals are left as
+        // `metalType` exactly as before — the common path is unchanged.
+        //
+        // Type tracking alone is insufficient for the predicate: a
+        // re-materialised inlined mask (ProducerConsumerFusion.repairDanglingRefs)
+        // can reach the chain with no recorded element type, defaulting to f32.
+        // So ALSO infer boolean-ness structurally — any external feeding a
+        // select's predicate position (through shape-only ops) is an i1 mask.
+        var predicateSlots = Set<Int>()
+        func markPredicateSource(_ src: FusedElementwiseChain.OperandSource) {
+            switch src {
+            case .external(let slot):
+                predicateSlots.insert(slot)
+            case .prior(let k):
+                guard k < chain.ops.count else { return }
+                let op = chain.ops[k]
+                // Shape-only ops forward their single operand's mask-ness.
+                if op.kind == .broadcastInDim || op.kind == .reshape || op.kind == .transpose,
+                   let first = op.operands.first {
+                    markPredicateSource(first)
                 }
-
-                code += generateBinaryOpCode(op, left: left, right: right, declareX: !hasX, metalType: metalType)
-                hasX = true
-            } else {
-                // Unary operation
-                if !hasX {
-                    code += "\(metalType) x = input\(inputIndex)[tid];\n"
-                    inputIndex += 1
-                    hasX = true
-                }
-                code += generateUnaryOpCode(op)
+                // A `.compare` prior is an in-chain float predicate (1.0/0.0),
+                // not a bool buffer — nothing to mark.
             }
         }
-
-        // If no operations, just copy input
-        if !hasX && inputCount > 0 {
-            code = "\(metalType) x = input0[tid];\n"
+        for op in chain.ops where op.kind == .select {
+            if let pred = op.operands.first { markPredicateSource(pred) }
         }
+        func slotMetalType(_ slot: Int) -> String {
+            // Structurally-detected predicate, or a recorded i1: read as bool.
+            if predicateSlots.contains(slot)
+                || (slot < inputElementTypes.count && inputElementTypes[slot] == .int1) {
+                return "bool"
+            }
+            // A recorded non-float (integer) type: read at its true width so
+            // the load converts to the chain's float type instead of
+            // reinterpreting raw bytes. Float / unknown → chain type (unchanged).
+            if slot < inputElementTypes.count {
+                let et = inputElementTypes[slot]
+                if !isFloatType(et) {
+                    return metalTypeName(for: et)
+                }
+            }
+            return metalType
+        }
+
+        var inputParams: [String] = []
+        for i in 0..<inputCount {
+            inputParams.append("device const \(slotMetalType(i))* input\(i) [[buffer(\(i))]]")
+        }
+        let outputBufferIndex = inputCount
+
+        func externalRef(_ slot: Int) -> String {
+            if slot < inputShapes.count {
+                let count = inputShapes[slot].reduce(1, *)
+                if count == 1 { return "input\(slot)[0]" }
+            }
+            return "input\(slot)[tid]"
+        }
+
+        // For chains that absorb a transpose or non-scalar broadcast:
+        // compute the permuted/broadcast source index per thread.
+        //
+        // * transpose: input_coord[d] = output_coord[perm[d]]
+        // * broadcast_in_dim: input_coord[d] = output_coord[dims[d]] if
+        //   input.shape[d] > 1 else 0 (size-1 dims fan out)
+        //
+        // In both cases tid is unflattened using the op's *own* output
+        // shape (different from the chain root's shape if a reshape
+        // follows; same total element count, different rank).
+        var preamble = ""
+        var computedIdxFor: [Int: String] = [:]
+        for (i, op) in chain.ops.enumerated() {
+            guard op.kind == .transpose || op.kind == .broadcastInDim,
+                  let dims = op.dimensions,
+                  case .external(let slot) = op.operands.first,
+                  slot < inputShapes.count else { continue }
+            var inShape = inputShapes[slot]
+            // The operand shape may be missing from analysis (inlined mask
+            // constants like %inlN_6 aren't shape-tracked). For a broadcast we
+            // can reconstruct it: operand dim d maps to output dim dims[d], so
+            // operand.shape[d] = outputShape[dims[d]] (no size-1 input dims in
+            // the patterns we fuse — the causal mask is [S,S]→[B,H,S,S]).
+            if inShape.isEmpty, op.kind == .broadcastInDim,
+               let outShape = op.outputShape, !dims.isEmpty {
+                inShape = dims.map { $0 < outShape.count ? outShape[$0] : 1 }
+            }
+            guard dims.count == inShape.count else { continue }
+
+            // input_stride[d] = product of inShape[d+1..]
+            var inStrides = [Int](repeating: 1, count: inShape.count)
+            for d in stride(from: inShape.count - 2, through: 0, by: -1) {
+                inStrides[d] = inStrides[d + 1] * inShape[d + 1]
+            }
+
+            // The op's own output shape:
+            // - transpose: derived as inShape[perm[d]]
+            // - broadcast: stored in `op.outputShape` (encoded in result type)
+            let opOutShape: [Int]
+            if op.kind == .transpose {
+                opOutShape = dims.map { inShape[$0] }
+            } else {
+                opOutShape = op.outputShape ?? []
+            }
+            guard !opOutShape.isEmpty else { continue }
+
+            var outStrides = [Int](repeating: 1, count: opOutShape.count)
+            for d in stride(from: opOutShape.count - 2, through: 0, by: -1) {
+                outStrides[d] = outStrides[d + 1] * opOutShape[d + 1]
+            }
+
+            preamble += "    // \(op.kind) at chain op \(i): in \(inShape) dims \(dims) out \(opOutShape)\n"
+            preamble += "    uint t\(i)_rem = tid;\n"
+            for d in 0..<opOutShape.count {
+                preamble += "    uint t\(i)_c\(d) = t\(i)_rem / \(outStrides[d])u;\n"
+                preamble += "    t\(i)_rem = t\(i)_rem % \(outStrides[d])u;\n"
+            }
+
+            // Build input index. For each input dim d:
+            // - transpose: contribution = output_coord[perm[d]] * inStride[d]
+            // - broadcast: if input.shape[d] == 1, contribution is 0
+            //              else                     output_coord[dims[d]] * inStride[d]
+            var terms: [String] = []
+            for d in 0..<inShape.count {
+                if op.kind == .broadcastInDim && inShape[d] == 1 {
+                    continue
+                }
+                let sourceOutDim = dims[d]
+                if inStrides[d] == 1 {
+                    terms.append("t\(i)_c\(sourceOutDim)")
+                } else {
+                    terms.append("t\(i)_c\(sourceOutDim) * \(inStrides[d])u")
+                }
+            }
+            let idxExpr = terms.isEmpty ? "0u" : terms.joined(separator: " + ")
+            preamble += "    uint t\(i)_idx = \(idxExpr);\n"
+            computedIdxFor[i] = "t\(i)_idx"
+        }
+
+        // Build per-op expressions referring to temps `v0…v_{n-1}`. Each
+        // op emits `metalType vK = <expr>;`. Unary "shape" ops (reshape)
+        // emit `vK = operand;` — the codegen-level identity. Transpose
+        // and non-scalar broadcast load via the precomputed index.
+        var body = ""
+        for (i, op) in chain.ops.enumerated() {
+            if (op.kind == .transpose || op.kind == .broadcastInDim),
+               let idx = computedIdxFor[i],
+               case .external(let slot) = op.operands.first {
+                body += "    \(metalType) v\(i) = input\(slot)[\(idx)];\n"
+                continue
+            }
+            func operandExpr(_ src: FusedElementwiseChain.OperandSource) -> String {
+                switch src {
+                case .external(let slot): return externalRef(slot)
+                case .prior(let idx):     return "v\(idx)"
+                }
+            }
+            let operands = op.operands.map(operandExpr)
+            let expr = elementwiseChainExpr(kind: op.kind, operands: operands, metalType: metalType, comparison: op.comparison)
+            body += "    \(metalType) v\(i) = \(expr);\n"
+        }
+        let resultExpr: String = chain.ops.isEmpty ? externalRef(0) : "v\(chain.ops.count - 1)"
 
         let source = """
         #include <metal_stdlib>
@@ -5065,12 +5832,177 @@ public final class CodeGenerator: @unchecked Sendable {
             uint tid [[thread_position_in_grid]])
         {
             if (tid >= count) return;
-            \(code)
-            output[tid] = x;
+        \(preamble)\(body)    output[tid] = \(resultExpr);
         }
         """
 
         return (source, "kernel_elementwise_chain", nil)
+    }
+
+    /// Generates a single-pass fused-reduce kernel: applies a pointwise chain
+    /// transform per input element, then reduces (MLX layernorm/softmax style).
+    /// Shape params (outputCount/reduceSize/innerSize) and the init value are
+    /// baked as literals, so binding is identical to fusedElementwise: chain
+    /// externals at buffers 0..M-1, output at buffer M. fp32 only; the fusion
+    /// pass guarantees a pointwise chain (no transpose/broadcast).
+    private func generateFusedReduceSource(
+        _ cfg: FusedReduceConfig,
+        inputShapes: [[Int]],
+        elementType: ElementType
+    ) -> (String, String, TuningConfig?) {
+        let metalType = "float"
+        let inputCount = max(inputShapes.count, 1)
+        let inShape = cfg.inputShape
+        let reduceDims = cfg.reduceDims.sorted()
+        let reduceSize = max(reduceDims.reduce(1) { $0 * (($1 < inShape.count) ? inShape[$1] : 1) }, 1)
+        let lastReduceDim = reduceDims.last ?? 0
+        let innerSize = (lastReduceDim + 1 < inShape.count)
+            ? inShape[(lastReduceDim + 1)...].reduce(1, *)
+            : 1
+        let outputCount = max(cfg.outputShape.reduce(1, *), 1)
+
+        // init / per-element combine / simd intrinsic / finalize per reduce kind
+        let initVal: String, combine: String, simdOp: String
+        var finalize = "v"
+        switch cfg.reductionKind {
+        case "sum":     initVal = "0.0f";        combine = "accum + val";        simdOp = "simd_sum"
+        case "mean":    initVal = "0.0f";        combine = "accum + val";        simdOp = "simd_sum"; finalize = "v / float(\(reduceSize))"
+        case "max":     initVal = "-INFINITY";   combine = "max(accum, val)";    simdOp = "simd_max"
+        case "min":     initVal = "INFINITY";    combine = "min(accum, val)";    simdOp = "simd_min"
+        case "product": initVal = "1.0f";        combine = "accum * val";        simdOp = "simd_product"
+        default:        initVal = "0.0f";        combine = "accum + val";        simdOp = "simd_sum"
+        }
+
+        var inputParams: [String] = []
+        for i in 0..<inputCount {
+            inputParams.append("device const \(metalType)* input\(i) [[buffer(\(i))]]")
+        }
+
+        // Emit the pointwise chain computing `float cv{n-1}` at element `idx`.
+        func operandExpr(_ src: FusedElementwiseChain.OperandSource, idx: String) -> String {
+            switch src {
+            case .external(let slot):
+                let count = slot < inputShapes.count ? inputShapes[slot].reduce(1, *) : 0
+                return count == 1 ? "input\(slot)[0]" : "input\(slot)[\(idx)]"
+            case .prior(let p): return "cv\(p)"
+            }
+        }
+        var chainBody = ""
+        for (i, op) in cfg.chain.ops.enumerated() {
+            let ops = op.operands.map { operandExpr($0, idx: "idx") }
+            let expr = elementwiseChainExpr(kind: op.kind, operands: ops, metalType: metalType)
+            chainBody += "                \(metalType) cv\(i) = \(expr);\n"
+        }
+        let chainResult = cfg.chain.ops.isEmpty ? "input0[idx]" : "cv\(cfg.chain.ops.count - 1)"
+
+        let outputBufferIndex = inputCount
+        // SIMD-per-output: one simdgroup (32 lanes) reduces one output; 32
+        // simdgroups per 1024-thread TG → 32 outputs/TG. Matches the fast
+        // specialized reduce variant (vs 1024-threads-per-output, which wastes
+        // threads on nanoGPT's short reduce axes).
+        let source = """
+        #include <metal_stdlib>
+        using namespace metal;
+
+        // Single-pass fused reduce (SIMD-per-output). Baked: outputCount=\(outputCount),
+        // reduceSize=\(reduceSize), innerSize=\(innerSize), kind=\(cfg.reductionKind).
+        kernel void kernel_reduce(
+            \(inputParams.joined(separator: ",\n            ")),
+            device \(metalType)* output [[buffer(\(outputBufferIndex))]],
+            uint tgid [[threadgroup_position_in_grid]],
+            uint simd_lane [[thread_index_in_simdgroup]],
+            uint simd_group [[simdgroup_index_in_threadgroup]])
+        {
+            uint outIdx = tgid * 32u + simd_group;
+            if (outIdx >= \(outputCount)u) return;
+
+            uint outerIdx = outIdx / \(innerSize)u;
+            uint innerIdx = outIdx % \(innerSize)u;
+            uint baseInputIdx = outerIdx * \(reduceSize)u * \(innerSize)u + innerIdx;
+
+            float accum = \(initVal);
+            for (uint r = simd_lane; r < \(reduceSize)u; r += 32u) {
+                uint idx = baseInputIdx + r * \(innerSize)u;
+                \(chainBody)float val = \(chainResult);
+                accum = \(combine);
+            }
+
+            accum = \(simdOp)(accum);
+            if (simd_lane == 0) {
+                float v = accum;
+                output[outIdx] = \(finalize);
+            }
+        }
+        """
+        return (source, "kernel_reduce", TuningConfig(blockSize: 1024))
+    }
+
+    /// Renders the right-hand side for a single chain op into a Metal
+    /// expression. Each operand is already a stringified expression
+    /// (`inputN[tid]`, `inputN[0]`, or a `vK` reference).
+    private func elementwiseChainExpr(kind: HLOOpKind, operands: [String], metalType: String, comparison: String? = nil) -> String {
+        // Defensive: bad chain serialization shouldn't crash codegen.
+        let lhs = operands.first ?? "0"
+        let rhs = operands.count > 1 ? operands[1] : "0"
+        switch kind {
+        // Comparison → float predicate (1.0/0.0), consumed in-register by a
+        // downstream chain `.select`. No bool buffer involved.
+        case .compare:
+            let op: String
+            // ComparisonDirection.rawValue is upper-case ("LT", "EQ", …); the
+            // serialized chain carries that raw value verbatim. Normalize so a
+            // case mismatch doesn't silently collapse every comparison to "=="
+            // (which inverts predicates feeding select → wrong branch → NaN).
+            switch comparison?.uppercased() {
+            case "EQ": op = "=="
+            case "NE": op = "!="
+            case "LT": op = "<"
+            case "LE": op = "<="
+            case "GT": op = ">"
+            case "GE": op = ">="
+            default:   op = "=="
+            }
+            return "((\(lhs) \(op) \(rhs)) ? 1.0f : 0.0f)"
+        // select(pred, onTrue, onFalse): pred is a float predicate (1.0/0.0).
+        case .select:
+            let a = operands.count > 1 ? operands[1] : "0"
+            let b = operands.count > 2 ? operands[2] : "0"
+            return "((\(lhs) != 0.0f) ? \(a) : \(b))"
+        case .clamp:
+            // clamp(lo, x, hi)
+            let x = operands.count > 1 ? operands[1] : "0"
+            let hi = operands.count > 2 ? operands[2] : "0"
+            return "clamp(\(x), \(lhs), \(hi))"
+        default:
+            break
+        }
+        switch kind {
+        case .add:       return "\(lhs) + \(rhs)"
+        case .subtract:  return "\(lhs) - \(rhs)"
+        case .multiply:  return "\(lhs) * \(rhs)"
+        case .divide:    return "\(lhs) / \(rhs)"
+        case .remainder: return "fmod(\(lhs), \(rhs))"
+        case .maximum:   return "max(\(lhs), \(rhs))"
+        case .minimum:   return "min(\(lhs), \(rhs))"
+        case .power:     return "pow(\(lhs), \(rhs))"
+        case .negate:    return "-\(lhs)"
+        case .abs:       return "abs(\(lhs))"
+        case .exponential: return "exp(\(lhs))"
+        case .log:       return "log(\(lhs))"
+        case .sqrt:      return "sqrt(\(lhs))"
+        case .rsqrt:     return "rsqrt(\(lhs))"
+        case .tanh:      return "tanh(\(lhs))"
+        case .logistic:  return "1.0f / (1.0f + exp(-\(lhs)))"
+        case .sine:      return "sin(\(lhs))"
+        case .cosine:    return "cos(\(lhs))"
+        case .floor:     return "floor(\(lhs))"
+        case .ceil:      return "ceil(\(lhs))"
+        // Reshape and scalar broadcast: pass the operand through unchanged.
+        // Reshape is a no-op in linear-index space; scalar broadcast was
+        // already lowered to `input[0]` by externalRef.
+        case .reshape, .broadcastInDim: return lhs
+        default:         return lhs
+        }
     }
 
     /// Checks if an operation is binary.
@@ -5500,8 +6432,16 @@ public final class CodeGenerator: @unchecked Sendable {
                 // kernel signals its (BM=64, BN=32) tile via tuning.tileM/tileN.
                 let tileM = tuning?.tileM ?? 32
                 let tileN = tuning?.tileN ?? 32
-                let gridWidth = (N + tileN - 1) / tileN
-                let gridHeight = (M + tileM - 1) / tileM
+                var gridWidth = (N + tileN - 1) / tileN
+                var gridHeight = (M + tileM - 1) / tileM
+                // MLX-style swizzle reshapes the launch grid so concurrent
+                // threadgroups share B-tile reads → L2 reuse. The kernel
+                // decodes (tid.x, tid.y) back into logical (tile_n, tile_m).
+                if let swl = tuning?.swizzleLog, swl > 0 {
+                    let tile = 1 << swl
+                    gridHeight = (gridHeight + tile - 1) / tile
+                    gridWidth = gridWidth * tile
+                }
                 let basicTileSize = 32
                 let useSimdgroup = isFloatType(elementType) && M % 8 == 0 && K % 8 == 0 && N % 8 == 0 && M >= 8 && K >= 8 && N >= 8
 
@@ -5706,7 +6646,7 @@ public final class CodeGenerator: @unchecked Sendable {
                 )
             }
 
-        case .fusedRMSNorm, .fusedLayerNorm, .fusedBatchNorm:
+        case .fusedRMSNorm, .fusedBatchNorm:
             if outputShape.count >= 2 {
                 let batch = outputShape.dropLast().reduce(1, *)
                 return DispatchConfig(
@@ -5714,6 +6654,24 @@ public final class CodeGenerator: @unchecked Sendable {
                     threadgroupSize: MTLSize(width: 256, height: 1, depth: 1)
                 )
             }
+
+        case .fusedLayerNorm:
+            // SIMD-per-row: 32 simdgroups/TG, one row each → 32 rows/TG.
+            if ProcessInfo.processInfo.environment["METALHLO_FUSE_LAYERNORM"] == "1" {
+                FileHandle.standardError.write("[ln-dispatch] outputShape=\(outputShape)\n".data(using: .utf8)!)
+            }
+            let lnRows: Int
+            if outputShape.count >= 2 {
+                lnRows = outputShape.dropLast().reduce(1, *)
+            } else {
+                // Fallback: rows = total / hiddenSize unknown → use totalElements/last.
+                lnRows = max(outputShape.last.map { totalElements / max($0, 1) } ?? totalElements, 1)
+            }
+            let lnTgs = (lnRows + 31) / 32
+            return DispatchConfig(
+                gridSize: MTLSize(width: max(lnTgs, 1), height: 1, depth: 1),
+                threadgroupSize: MTLSize(width: 1024, height: 1, depth: 1)
+            )
 
         case .fusedMatMulBiasAct:
             if outputShape.count >= 2 {
@@ -5730,6 +6688,16 @@ public final class CodeGenerator: @unchecked Sendable {
             // FusedElementwise kernel is NOT vectorized - it processes 1 element per thread
             // using tid directly as the element index. Do NOT use vectorized dispatch.
             return DispatchConfig.dispatch1D(elements: totalElements, threadgroupSize: 256)
+
+        case .fusedReduce:
+            // SIMD-per-output: 32 simdgroups/TG, one output each → 32 outputs/TG.
+            // totalElements = output element count (post-reduction).
+            let outs = max(totalElements, 1)
+            let tgs = (outs + 31) / 32
+            return DispatchConfig(
+                gridSize: MTLSize(width: tgs, height: 1, depth: 1),
+                threadgroupSize: MTLSize(width: 1024, height: 1, depth: 1)
+            )
 
         case .fusedGELU, .fusedSiLU:
             // GELU and SiLU kernels are NOT vectorized - they use tid directly

@@ -972,6 +972,29 @@ public final class DotGeneralLayoutCanonicalize: OptimizationPass, @unchecked Se
             let lhsNeedsTranspose = lhsCanonical != Array(0..<lhsShape.count)
             let rhsNeedsTranspose = rhsCanonical != Array(0..<rhsShape.count)
 
+            // Fold-into-matmul fast path (default; METALHLO_FOLD_DOT_TRANSPOSE=0
+            // to disable). The matmul codegen derives transA/transB natively
+            // (CodeGenerator transA/transB from contract-dim position) and the
+            // matrix coprocessor reads operands transposed for free. So for the
+            // simple case — single contracting + single remaining dim per side,
+            // batch dims as a leading prefix, no stale transpose flags — a
+            // physical transpose is pure overhead. Skip it; the codegen reads
+            // the operand transposed. (Eliminates the per-step weight transposes
+            // = ~5 ms on nanoGPT.) Complex layouts (multi-contract, non-prefix
+            // batch, spread M/N) still canonicalize below.
+            let foldDotTranspose = ProcessInfo.processInfo.environment["METALHLO_FOLD_DOT_TRANSPOSE"] != "0"
+            let batchPrefixLHS = lhsBatch == Array(0..<lhsBatch.count)
+            let batchPrefixRHS = rhsBatch == Array(0..<rhsBatch.count)
+            let codegenHandlesNatively =
+                lhsContract.count == 1 && rhsContract.count == 1 &&
+                lhsRemaining.count == 1 && rhsRemaining.count == 1 &&
+                batchPrefixLHS && batchPrefixRHS &&
+                op.attributes.lhsTranspose == nil && op.attributes.rhsTranspose == nil
+            if foldDotTranspose && (lhsNeedsTranspose || rhsNeedsTranspose) && codegenHandlesNatively {
+                newOps.append(op)   // leave dims as-is; codegen derives transA/transB
+                continue
+            }
+
             // Even when the layout is already canonical, transpose-folding may
             // have stamped lhsTranspose/rhsTranspose on the dot_general from a
             // matrix-transpose it absorbed earlier. Drop those flags here: from

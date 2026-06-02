@@ -185,10 +185,20 @@ public final class MetalHLOCompiler: @unchecked Sendable {
         } else {
             supportsFusion = false
         }
+        // TF32 transform: wrap fp32 dot ops with fp16 convert + fp32 output
+        // ONLY if the resulting matmul will go through Apple's `matmul2d`
+        // (which can fuse the output convert in-register on the matrix
+        // coprocessor). With the new Steel fp32 path, fp32 matmuls don't
+        // go through `matmul2d` at all — so the fusion gate has to remain
+        // false for fp32. Half / bfloat large enough for the MPP tile
+        // gates still get the fusion.
         let mppGate: @Sendable (Int, Int, Int, Int) -> Bool = { M, N, K, batchSize in
             guard supportsFusion else { return false }
-            let tgCount = (M / 128) * (N / 128) * batchSize
-            return M % 128 == 0 && N % 128 == 0 && tgCount >= 16
+            let tg128 = (M / 128) * (N / 128) * batchSize
+            let tg64  = (M / 64)  * (N / 64)  * batchSize
+            let use128 = M % 128 == 0 && N % 128 == 0 && tg128 >= 128
+            let use64  = M % 64  == 0 && N % 64  == 0 && tg64  >= 16 && !use128
+            return use128 || use64
         }
 
         let module = applyTF32MatmulTransformIfEnabled(parsed, fuseOutputConvert: mppGate)
@@ -349,12 +359,23 @@ public final class MetalHLOCompiler: @unchecked Sendable {
         // Kernels that include MetalPerformancePrimitives need Metal language
         // 4.0 (the matmul2d / cooperative_tensor APIs are gated on
         // __HAVE_TENSOR__, which the metalfe driver sets only for -std=metal4+).
-        // Use the include line as a sentinel so other kernels keep the default
-        // language version.
-        if spec.metalSource.contains("<MetalPerformancePrimitives/") {
+        // The Steel-style matmul also benefits from Metal 4.0 + fast-math:
+        // the matrix-coprocessor lowering of `simdgroup_multiply_accumulate`
+        // on Apple9-class GPUs requires the newer language; fast-math lets
+        // the compiler reassociate the FMA chain inside the inner kk loop.
+        // Use the include line as a sentinel so other kernels keep the default.
+        let isSteel = spec.metalSource.contains("Faithful port of mlx::steel::BlockMMA")
+        let isNAX = spec.metalSource.contains("NAX_GEMM_KERNEL")
+        if spec.metalSource.contains("<MetalPerformancePrimitives/") || isSteel {
             if #available(macOS 26.0, iOS 26.0, *) {
                 compileOptions.languageVersion = .version4_0
             }
+        }
+        // MLX compiles its NAX GEMM with fast-math; the matrix-coprocessor FMA
+        // lowering needs the reassociation it enables (otherwise the kernel
+        // runs ~3× slower). Match it for our Steel and NAX kernels.
+        if isSteel || isNAX {
+            compileOptions.fastMathEnabled = true
         }
 
         let library: MTLLibrary
@@ -375,6 +396,18 @@ public final class MetalHLOCompiler: @unchecked Sendable {
         // Create pipeline state
         let pipelineDescriptor = MTLComputePipelineDescriptor()
         pipelineDescriptor.computeFunction = function
+        // Include shape info in the matmul label so the per-op profiler
+        // (`METALHLO_PROFILE_PER_OP=1`) can break down matmul time by
+        // shape. Two matmul ops with identical M/N/K/batch share a label
+        // and aggregate; different shapes show up separately.
+        if spec.entryPoint == "kernel_matmul",
+           let aShape = spec.inputShapes.first,
+           let bShape = spec.inputShapes.dropFirst().first,
+           let outShape = spec.outputShapes.first {
+            pipelineDescriptor.label = "kernel_matmul|A=\(aShape)|B=\(bShape)|C=\(outShape)"
+        } else {
+            pipelineDescriptor.label = spec.entryPoint
+        }
 
         if spec.sharedMemorySize > 0 {
             pipelineDescriptor.threadGroupSizeIsMultipleOfThreadExecutionWidth = true
@@ -676,7 +709,7 @@ public final class MetalHLOCompiler: @unchecked Sendable {
                 kind = .dot
             case .fusedGELU, .fusedSiLU:
                 kind = .customCall
-            case .fusedElementwise:
+            case .fusedElementwise, .fusedReduce:
                 kind = .customCall
             case .fusedFFN:
                 kind = .customCall

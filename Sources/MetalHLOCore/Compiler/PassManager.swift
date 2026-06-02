@@ -185,6 +185,9 @@ public final class PassManager: @unchecked Sendable {
         register(name: "producer-consumer-fusion", phase: .genericFusion) {
             ProducerConsumerFusionPass()
         }
+        register(name: "reduce-fusion", phase: .genericFusion) {
+            ReduceFusionPass()
+        }
         register(name: "sibling-fusion", phase: .genericFusion) {
             SiblingFusionPassWrapper()
         }
@@ -501,6 +504,19 @@ final class ProducerConsumerFusionPass: OptimizationPass, @unchecked Sendable {
     // emitCustomCalls enabled since FusedOp.init(from:) maps custom_call to FusedOpType
     // and CodeGenerator can generate proper kernels for all fused operation types.
     private let fusion = ProducerConsumerFusion(maxFusionSize: 50, emitCustomCalls: true)
+
+    func run(on function: HLOFunction, analysis: AnalysisResults) -> PassResult {
+        let result = fusion.fuse(function)
+        let changed = result.operations.count != function.operations.count
+        return PassResult(function: result, changed: changed)
+    }
+}
+
+/// Wrapper for reduce fusion (opt-in: METALHLO_FUSE_REDUCE=1).
+final class ReduceFusionPass: OptimizationPass, @unchecked Sendable {
+    let name = "reduce-fusion"
+    let invalidates: Set<AnalysisType> = [.lifetimes, .patterns]
+    private let fusion = ReduceFusion()
 
     func run(on function: HLOFunction, analysis: AnalysisResults) -> PassResult {
         let result = fusion.fuse(function)
@@ -863,6 +879,10 @@ final class NormFusionPass: OptimizationPass, @unchecked Sendable {
     let invalidates: Set<AnalysisType> = [.lifetimes, .patterns]
 
     func run(on function: HLOFunction, analysis: AnalysisResults) -> PassResult {
+        // Opt-in while the fused-layernorm executor path is being built.
+        guard ProcessInfo.processInfo.environment["METALHLO_FUSE_LAYERNORM"] == "1" else {
+            return .unchanged(function)
+        }
         let normPatterns = analysis.patterns.filter { $0.type == .layerNorm || $0.type == .rmsNorm }
         if normPatterns.isEmpty {
             return .unchanged(function)
@@ -881,10 +901,10 @@ final class NormFusionPass: OptimizationPass, @unchecked Sendable {
         for pattern in normPatterns {
             guard !pattern.operationIndices.isEmpty else { continue }
 
-            let rootIdx = pattern.rootIndex
-            guard rootIdx < function.operations.count else { continue }
-
-            let rootOp = function.operations[rootIdx]
+            // Find the root by SSA name (robust) — pattern.rootIndex goes stale
+            // when the function is re-indexed between detection and this pass.
+            guard let rootName = pattern.metadata.outputTensor,
+                  let (rootOp, rootIdx) = opByResult[rootName] else { continue }
 
             // Determine the target name based on pattern type
             let targetName: String
@@ -894,42 +914,17 @@ final class NormFusionPass: OptimizationPass, @unchecked Sendable {
                 targetName = FusedRMSNormHandler.targetName
             }
 
-            // Find the input tensor (first operation's input in the pattern)
-            let firstOpIdx = pattern.operationIndices.first!
-            guard firstOpIdx < function.operations.count else { continue }
-            let firstOp = function.operations[firstOpIdx]
-            guard !firstOp.operands.isEmpty else { continue }
-            let input = firstOp.operands[0]
+            // Operands come from the detector's explicit metadata (input,
+            // gamma, beta) — the old heuristic ("last multiply/add operand")
+            // picked the wrong tensor for JAX's gamma-folded layernorm. Require
+            // all three; without them the fused kernel can't be built.
+            guard let input = pattern.metadata.inputTensor,
+                  let gamma = pattern.metadata.gammaTensor,
+                  let beta = pattern.metadata.betaTensor else { continue }
+            let operands: [TensorID] = [input, gamma, beta]
 
-            // Try to find scale/gamma and bias/beta from pattern operations
-            // These are typically the last multiplication and addition
-            var operands: [TensorID] = [input]
-
-            // For layer norm we need gamma (scale) and beta (offset)
-            // For RMS norm we just need weight (scale)
-            // Look for constant tensors used in multiplications and additions
-            for idx in pattern.operationIndices.reversed() {
-                let op = function.operations[idx]
-                if op.kind == .multiply && op.operands.count >= 2 {
-                    // Second operand is likely gamma/weight
-                    if op.operands[1] != input && !operands.contains(op.operands[1]) {
-                        operands.append(op.operands[1])
-                        break
-                    }
-                }
-            }
-
-            // For layer norm, also look for bias
-            if pattern.type == .layerNorm {
-                for idx in pattern.operationIndices.reversed() {
-                    let op = function.operations[idx]
-                    if op.kind == .add && op.operands.count >= 2 {
-                        if op.operands[1] != input && !operands.contains(op.operands[1]) {
-                            operands.append(op.operands[1])
-                            break
-                        }
-                    }
-                }
+            if ProcessInfo.processInfo.environment["METALHLO_FUSE_LAYERNORM"] == "1" {
+                FileHandle.standardError.write("[ln-fuse] rootIdx=\(rootIdx) rootKind=\(rootOp.kind) rootResult=\(rootOp.result) rootShape=\(rootOp.resultType.shape) input=\(input) gamma=\(gamma) beta=\(beta)\n".data(using: .utf8)!)
             }
 
             // Get epsilon from metadata or use default
@@ -957,22 +952,13 @@ final class NormFusionPass: OptimizationPass, @unchecked Sendable {
                 attributes: attrs
             )
 
-            // Replace the root operation
+            // Replace the root op with the fused custom_call (root found by
+            // SSA name above). We do NOT remove the layernorm's intermediate
+            // ops here: pattern.operationIndices holds DETECTION-time indices
+            // that go stale once the function is re-indexed (subscripting them
+            // crashed on the inference program). final-dce removes whichever
+            // forward ops became dead; ops still live into the backward stay.
             newOperations[rootIdx] = fusedOp
-
-            // Mark intermediate operations for removal, but only if their results
-            // aren't used by operations outside the pattern
-            let patternIndexSet = Set(pattern.operationIndices)
-            for idx in pattern.operationIndices where idx != rootIdx {
-                let result = function.operations[idx].result
-                let hasExternalUse = function.operations.enumerated().contains { (i, otherOp) in
-                    !patternIndexSet.contains(i) && otherOp.operands.contains(result)
-                }
-                let isReturnValue = function.returnValues.contains(result)
-                if !hasExternalUse && !isReturnValue {
-                    opsToRemove.insert(idx)
-                }
-            }
             changed = true
         }
 

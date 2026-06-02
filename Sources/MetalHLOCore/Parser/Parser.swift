@@ -587,7 +587,10 @@ public final class Parser {
                     advance()
                 }
             } else if kind == .scatter {
-                let (dimNumbers, attrComputationKind) = try parseScatterAttributes()
+                // The outer `{ … }` attribute block is consumed here (matched at
+                // the top of this branch and expected closed just below), so the
+                // scatter attribute parser must stop at — not swallow — its `}`.
+                let (dimNumbers, attrComputationKind) = try parseScatterAttributes(stopAtOuterBrace: true)
                 attributes.scatterDimensionNumbers = dimNumbers
                 // Only overwrite computation kind if the attribute block had one;
                 // otherwise preserve what the region parsing already set.
@@ -2501,12 +2504,19 @@ public final class Parser {
         )
     }
 
-    private func parseScatterAttributes() throws -> (ScatterDimensionNumbers?, ScatterComputationKind?) {
+    private func parseScatterAttributes(stopAtOuterBrace: Bool = false) throws -> (ScatterDimensionNumbers?, ScatterComputationKind?) {
         // Parse scatter attributes in inline format:
         // update_window_dims = [...], inserted_window_dims = [...],
         // scatter_dims_to_operand_dims = [...], index_vector_dim = N,
         // input_batching_dims = [...], scatter_indices_batching_dims = [...],
         // computation = add/max/min/mul
+        //
+        // `stopAtOuterBrace`: when the dimension numbers sit inside a caller-owned
+        // attribute block — `"stablehlo.scatter"(...) ({region}) { <here> } : sig`,
+        // the generic-form path consumes that outer `{`/`}` itself — this parser
+        // must NOT consume the closing `}`. Without this it eats the block's `}`
+        // and the caller then over-runs the type signature and the func body,
+        // surfacing as a spurious "expected colon, got '}'" at the module close.
 
         var updateWindowDims: [Int] = []
         var insertedWindowDims: [Int] = []
@@ -2515,6 +2525,10 @@ public final class Parser {
         var inputBatchingDims: [Int] = []
         var scatterIndicesBatchingDims: [Int] = []
         var computationKind: ScatterComputationKind? = nil
+        // Depth of brace-wrapped dimension numbers (the `{attrs}` regex-conversion
+        // form) opened inside this parser; their `}` is ours to consume, the
+        // caller-owned outer block's `}` is not.
+        var innerBraceDepth = 0
 
         while !check(.colon) && !check(.eof) && !check(.leftParen) {
             // Handle #stablehlo.scatter<...> wrapper format:
@@ -2533,6 +2547,7 @@ public final class Parser {
                     skipNewlines()
                 } else if check(.leftBrace) {
                     advance() // skip {
+                    innerBraceDepth += 1
                     skipNewlines()
                 }
                 continue
@@ -2545,8 +2560,26 @@ public final class Parser {
                 _ = match(.comma)
                 skipNewlines()
                 continue
-            } else if check(.rightAngle) || check(.rightBrace) {
-                // End of #stablehlo.scatter<...> or {...} block
+            } else if check(.rightBrace) {
+                // A `}` closing a brace-wrapped dimension-number block is ours.
+                // A `}` we did not open is the caller's outer attribute block —
+                // stop and leave it for the caller to consume.
+                if innerBraceDepth > 0 {
+                    innerBraceDepth -= 1
+                    advance()
+                    _ = match(.comma)
+                    skipNewlines()
+                    continue
+                }
+                if stopAtOuterBrace {
+                    break
+                }
+                advance()
+                _ = match(.comma)
+                skipNewlines()
+                continue
+            } else if check(.rightAngle) {
+                // End of #stablehlo.scatter<...> angle-bracket block.
                 advance()
                 _ = match(.comma)
                 skipNewlines()

@@ -206,6 +206,16 @@ public struct PatternMetadata: Sendable {
     /// relative to the input rank.
     public var axis: Int?
 
+    /// Explicit operand tensors for norm fusion (avoids the brittle heuristic
+    /// extraction in NormFusionPass — JAX folds gamma into the rsqrt scale, so
+    /// scanning for "the last multiply" picks the wrong tensor).
+    public var inputTensor: TensorID?
+    public var gammaTensor: TensorID?
+    public var betaTensor: TensorID?
+    /// SSA name of the pattern's root (output) op. Robust to index shifts —
+    /// the integer rootIndex goes stale across passes.
+    public var outputTensor: TensorID?
+
     public init(
         numHeads: Int? = nil,
         headDim: Int? = nil,
@@ -213,8 +223,13 @@ public struct PatternMetadata: Sendable {
         causalMask: Bool? = nil,
         activation: String? = nil,
         epsilon: Float? = nil,
-        axis: Int? = nil
+        axis: Int? = nil,
+        inputTensor: TensorID? = nil,
+        gammaTensor: TensorID? = nil,
+        betaTensor: TensorID? = nil,
+        outputTensor: TensorID? = nil
     ) {
+        self.outputTensor = outputTensor
         self.numHeads = numHeads
         self.headDim = headDim
         self.hiddenDim = hiddenDim
@@ -222,6 +237,9 @@ public struct PatternMetadata: Sendable {
         self.activation = activation
         self.epsilon = epsilon
         self.axis = axis
+        self.inputTensor = inputTensor
+        self.gammaTensor = gammaTensor
+        self.betaTensor = betaTensor
     }
 }
 
@@ -260,7 +278,22 @@ public enum FusedOpType: Sendable, Hashable {
     case fusedSiLU
 
     /// Chain of fused elementwise operations.
-    case fusedElementwise([HLOOpKind])
+    ///
+    /// Carries a `FusedElementwiseChain` that records, for each chain op,
+    /// exactly where its operands come from — an earlier chain result or a
+    /// specific external input slot. The codegen walks the chain and emits
+    /// one temporary per op, so the kernel can express an arbitrary DAG of
+    /// elementwise + scalar broadcast + reshape (not just a strict left-to-
+    /// right linear chain). That's what unlocks fusing the bulk of nanoGPT-
+    /// class workloads' elementwise GPU time.
+    case fusedElementwise(FusedElementwiseChain)
+
+    /// Fused reduce: a pointwise transform chain applied per input element,
+    /// then reduced. Captures the MLX single-pass layernorm/softmax pattern
+    /// (e.g. `reduce(sum, multiply(x, x))`). The chain's externals are the
+    /// op's operands; reduce metadata (kind, dims, pre-reduction shape) is
+    /// baked into the kernel so binding stays identical to fusedElementwise.
+    case fusedReduce(FusedReduceConfig)
 
     /// Fused FFN block.
     case fusedFFN(FFNConfig)
@@ -273,6 +306,84 @@ public enum FusedOpType: Sendable, Hashable {
 
     /// Fused softmax (numerically stable: exp(x - max) / sum(exp(x - max))).
     case fusedSoftmax(axis: Int)
+}
+
+/// SSA-style description of a fused elementwise chain.
+///
+/// Each op declares where its operands come from: either an external input
+/// (an entry in the customCall's `inputs` array) or an earlier op's result
+/// within the same chain. The codegen then emits one `float v_k = ...;`
+/// per op and writes the last op's result to `output[tid]`.
+///
+/// Scalar inputs are detected from the external input's shape at codegen
+/// time (element count == 1 ⇒ read `input[0]`, otherwise `input[tid]`).
+/// Reshape ops are no-ops in linear-index space and emit `float v_k = src;`.
+public struct FusedElementwiseChain: Sendable, Hashable {
+    public let ops: [Op]
+
+    public init(ops: [Op]) { self.ops = ops }
+
+    public struct Op: Sendable, Hashable {
+        public let kind: HLOOpKind
+        public let operands: [OperandSource]
+        /// For `.transpose`: the input→output dim permutation (output dim
+        /// i comes from input dim `dimensions[i]`).
+        /// For `.broadcastInDim`: `broadcast_dimensions` — input dim d
+        /// maps to output dim `dimensions[d]`. Other output dims are
+        /// "broadcast" (input has size 1 there or no corresponding dim).
+        public let dimensions: [Int]?
+        /// For `.broadcastInDim`: the broadcast's output shape. Required
+        /// because the output shape is encoded in the result type and not
+        /// derivable from input shape + dimensions alone (size-1 input dims
+        /// can fan out to any output size). For other ops where the output
+        /// shape can be derived from the inputs, this is nil.
+        public let outputShape: [Int]?
+        /// For `.compare`: the comparison direction raw value (eq/ne/lt/le/gt/ge).
+        /// The chain emits `(a OP b) ? 1.0f : 0.0f` in-register, so a downstream
+        /// in-chain `.select` reads it as a float predicate (no bool buffer).
+        public let comparison: String?
+        public init(kind: HLOOpKind,
+                    operands: [OperandSource],
+                    dimensions: [Int]? = nil,
+                    outputShape: [Int]? = nil,
+                    comparison: String? = nil) {
+            self.kind = kind
+            self.operands = operands
+            self.dimensions = dimensions
+            self.outputShape = outputShape
+            self.comparison = comparison
+        }
+    }
+
+    public enum OperandSource: Sendable, Hashable {
+        /// The customCall's `inputs[idx]` — read as `inputIdx[tid]` for
+        /// full-shape tensors or `inputIdx[0]` for scalar (1-element) inputs.
+        case external(Int)
+        /// The result produced by an earlier op in the chain at index `idx`.
+        case prior(Int)
+    }
+}
+
+/// Configuration for a fused reduce (pointwise transform chain + reduction).
+public struct FusedReduceConfig: Sendable, Hashable {
+    /// Pointwise transform applied per input element (no transpose/broadcast).
+    public let chain: FusedElementwiseChain
+    /// Reduction kind as a raw string ("sum","max","min","mean","product").
+    public let reductionKind: String
+    /// Reduce dimensions (into the pre-reduction input shape).
+    public let reduceDims: [Int]
+    /// Pre-reduction input shape (= the chain's per-element output shape).
+    public let inputShape: [Int]
+    /// Output (post-reduction) shape.
+    public let outputShape: [Int]
+    public init(chain: FusedElementwiseChain, reductionKind: String,
+                reduceDims: [Int], inputShape: [Int], outputShape: [Int]) {
+        self.chain = chain
+        self.reductionKind = reductionKind
+        self.reduceDims = reduceDims
+        self.inputShape = inputShape
+        self.outputShape = outputShape
+    }
 }
 
 /// Configuration for fused attention.
@@ -528,16 +639,73 @@ public struct FusedOp: Sendable {
             ))
 
         case "fused_elementwise":
-            // Parse the elementwise chain from config
-            // Support both "ops" and "operations" keys for compatibility
+            // The producer-consumer-fusion pass serializes the chain as
+            //   {"chain": [
+            //     {"k": "<HLOOpKind raw>", "o": [["e", idx] | ["p", idx], ...]},
+            //     ...
+            //   ]}
+            // where "e" tags an external input slot and "p" tags a prior
+            // chain-op result. The shape is intentionally compact so the
+            // backend config stays short for long chains.
+            if let chainArr = config["chain"] as? [[String: Any]] {
+                var ops: [FusedElementwiseChain.Op] = []
+                ops.reserveCapacity(chainArr.count)
+                for opDict in chainArr {
+                    guard let kindStr = opDict["k"] as? String,
+                          let kind = HLOOpKind(rawValue: kindStr),
+                          let operandsArr = opDict["o"] as? [[Any]] else {
+                        return .original(.customCall)
+                    }
+                    var operands: [FusedElementwiseChain.OperandSource] = []
+                    operands.reserveCapacity(operandsArr.count)
+                    for src in operandsArr {
+                        guard src.count == 2, let tag = src[0] as? String,
+                              let idx = (src[1] as? Int) ?? (src[1] as? NSNumber).map({ $0.intValue })
+                        else { return .original(.customCall) }
+                        switch tag {
+                        case "e": operands.append(.external(idx))
+                        case "p": operands.append(.prior(idx))
+                        default:  return .original(.customCall)
+                        }
+                    }
+                    let dimensions: [Int]? = (opDict["t"] as? [Any])?.compactMap {
+                        ($0 as? Int) ?? ($0 as? NSNumber).map { $0.intValue }
+                    }
+                    let outputShape: [Int]? = (opDict["s"] as? [Any])?.compactMap {
+                        ($0 as? Int) ?? ($0 as? NSNumber).map { $0.intValue }
+                    }
+                    let comparison = opDict["c"] as? String
+                    ops.append(FusedElementwiseChain.Op(kind: kind, operands: operands, dimensions: dimensions, outputShape: outputShape, comparison: comparison))
+                }
+                if !ops.isEmpty {
+                    return .fusedElementwise(FusedElementwiseChain(ops: ops))
+                }
+            }
+            // Legacy: just a list of op kinds → reconstruct a strict linear
+            // chain (op[i] consumes prior(i-1) + external(i), op[0] consumes
+            // external(0) + external(1) for binary, external(0) for unary).
             let opsArray: [String]? = (config["ops"] as? [String]) ?? (config["operations"] as? [String])
             if let ops = opsArray {
                 let opKinds = ops.compactMap { HLOOpKind(rawValue: $0) }
                 if !opKinds.isEmpty {
-                    return .fusedElementwise(opKinds)
+                    return .fusedElementwise(legacyLinearChain(from: opKinds))
                 }
             }
             return .original(.customCall)
+
+        case "fused_reduce":
+            // {"chain": [...same as fused_elementwise...], "rk": "sum",
+            //  "rd": [dims], "is": [inputShape], "os": [outputShape]}
+            guard let chain = parseChain(config["chain"]),
+                  let rk = config["rk"] as? String,
+                  let rd = intArray(config["rd"]),
+                  let ishape = intArray(config["is"]),
+                  let oshape = intArray(config["os"]) else {
+                return .original(.customCall)
+            }
+            return .fusedReduce(FusedReduceConfig(
+                chain: chain, reductionKind: rk,
+                reduceDims: rd, inputShape: ishape, outputShape: oshape))
 
         case FusedRoPEHandler.targetName:
             let baseFreq = (config["base_freq"] as? NSNumber)?.floatValue ?? 10000.0
@@ -573,8 +741,9 @@ public struct FusedOp: Sendable {
             ))
 
         case "fused_residual_chain":
-            // Residual chains are essentially elementwise adds
-            return .fusedElementwise([.add])
+            // Residual chains are essentially elementwise adds.
+            // Reconstruct as a single-op linear chain: op[0] = add(external(0), external(1)).
+            return .fusedElementwise(legacyLinearChain(from: [.add]))
 
         case FusedSoftmaxHandler.targetName:
             let axis = (config["axis"] as? Int) ?? -1
@@ -597,6 +766,81 @@ public struct FusedOp: Sendable {
             // Unknown custom call, keep as original
             return .original(.customCall)
         }
+    }
+
+    /// Reconstructs a strict-linear-chain `FusedElementwiseChain` from the
+    /// legacy `[HLOOpKind]` serialization. Each binary op consumes the prior
+    /// result (if any) on the left and a fresh external on the right; each
+    /// unary consumes either the prior result or a fresh external when no
+    /// prior result exists. Matches the original codegen's input-walking
+    /// semantics so older serialized executables still load.
+    /// Parses a `{"chain": [...]}` value (the SSA-style op list shared by
+    /// fused_elementwise and fused_reduce) into a FusedElementwiseChain.
+    private static func parseChain(_ value: Any?) -> FusedElementwiseChain? {
+        guard let chainArr = value as? [[String: Any]] else { return nil }
+        var ops: [FusedElementwiseChain.Op] = []
+        ops.reserveCapacity(chainArr.count)
+        for opDict in chainArr {
+            guard let kindStr = opDict["k"] as? String,
+                  let kind = HLOOpKind(rawValue: kindStr),
+                  let operandsArr = opDict["o"] as? [[Any]] else { return nil }
+            var operands: [FusedElementwiseChain.OperandSource] = []
+            for src in operandsArr {
+                guard src.count == 2, let tag = src[0] as? String,
+                      let idx = (src[1] as? Int) ?? (src[1] as? NSNumber).map({ $0.intValue })
+                else { return nil }
+                switch tag {
+                case "e": operands.append(.external(idx))
+                case "p": operands.append(.prior(idx))
+                default:  return nil
+                }
+            }
+            let dims = intArray(opDict["t"])
+            let outShape = intArray(opDict["s"])
+            let comparison = opDict["c"] as? String
+            ops.append(FusedElementwiseChain.Op(kind: kind, operands: operands, dimensions: dims, outputShape: outShape, comparison: comparison))
+        }
+        return ops.isEmpty ? nil : FusedElementwiseChain(ops: ops)
+    }
+
+    /// Parses a JSON array of ints (tolerating NSNumber boxing).
+    private static func intArray(_ value: Any?) -> [Int]? {
+        guard let arr = value as? [Any] else { return nil }
+        return arr.compactMap { ($0 as? Int) ?? ($0 as? NSNumber).map { $0.intValue } }
+    }
+
+    private static func legacyLinearChain(from kinds: [HLOOpKind]) -> FusedElementwiseChain {
+        var ops: [FusedElementwiseChain.Op] = []
+        ops.reserveCapacity(kinds.count)
+        var nextExternal = 0
+        for (i, kind) in kinds.enumerated() {
+            let isBinary: Bool
+            switch kind {
+            case .add, .subtract, .multiply, .divide, .remainder, .maximum, .minimum, .power,
+                 .and, .or, .xor, .shiftLeft, .shiftRightArithmetic, .shiftRightLogical:
+                isBinary = true
+            default:
+                isBinary = false
+            }
+            var operands: [FusedElementwiseChain.OperandSource] = []
+            if isBinary {
+                if i == 0 {
+                    operands.append(.external(nextExternal)); nextExternal += 1
+                    operands.append(.external(nextExternal)); nextExternal += 1
+                } else {
+                    operands.append(.prior(i - 1))
+                    operands.append(.external(nextExternal)); nextExternal += 1
+                }
+            } else {
+                if i == 0 {
+                    operands.append(.external(nextExternal)); nextExternal += 1
+                } else {
+                    operands.append(.prior(i - 1))
+                }
+            }
+            ops.append(FusedElementwiseChain.Op(kind: kind, operands: operands))
+        }
+        return FusedElementwiseChain(ops: ops)
     }
 
     /// Primary output tensor ID.
