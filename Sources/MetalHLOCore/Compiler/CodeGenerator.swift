@@ -5776,16 +5776,26 @@ public final class CodeGenerator: @unchecked Sendable {
                 preamble += "    t\(i)_rem = t\(i)_rem % \(outStrides[d])u;\n"
             }
 
-            // Build input index. For each input dim d:
-            // - transpose: contribution = output_coord[perm[d]] * inStride[d]
-            // - broadcast: if input.shape[d] == 1, contribution is 0
-            //              else                     output_coord[dims[d]] * inStride[d]
+            // For each input dim d, which OUTPUT-coordinate axis supplies it:
+            // - broadcast_in_dim: input dim d maps to output dim dims[d], so
+            //   input_coord[d] = output_coord[dims[d]] (size-1 dims fan out).
+            // - transpose: output[k] = input[perm[k]] (perm = dims), so
+            //   input_coord[d] = output_coord[perm⁻¹[d]] — the INVERSE
+            //   permutation. Using dims[d] directly is only correct when perm
+            //   is an involution (e.g. (0,2,1,3)); rotations like (3,0,1,2,4)
+            //   need the inverse, otherwise the data is permuted the wrong way.
+            var sourceDim = dims
+            if op.kind == .transpose {
+                var inv = [Int](repeating: 0, count: dims.count)
+                for (k, p) in dims.enumerated() where p < inv.count { inv[p] = k }
+                sourceDim = inv
+            }
             var terms: [String] = []
             for d in 0..<inShape.count {
                 if op.kind == .broadcastInDim && inShape[d] == 1 {
                     continue
                 }
-                let sourceOutDim = dims[d]
+                let sourceOutDim = sourceDim[d]
                 if inStrides[d] == 1 {
                     terms.append("t\(i)_c\(sourceOutDim)")
                 } else {

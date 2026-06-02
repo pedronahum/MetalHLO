@@ -77,4 +77,40 @@ struct ElementwiseChainTypeTests {
         // If LT collapsed to EQ, the predicate would be all-false → [4,2,8,6].
         #expect(result == [1, 2, 3, 6], "LT direction not honored: \(result)")
     }
+
+    // A transpose fused into an elementwise chain reads its source via a
+    // per-thread computed index. That index must use the INVERSE permutation;
+    // using the forward perm only happens to work for involutions (e.g.
+    // (0,2,1)). This uses a rotation (perm [2,0,1], inverse [1,2,0]) so a
+    // forward-vs-inverse mistake produces wrong values. Surfaced via
+    // jax.nn.dot_product_attention's forward + gradient being wrong.
+    @Test("Transpose fused in elementwise chain uses inverse permutation")
+    func transposeChainInversePerm() async throws {
+        let mlir = """
+        module @transpose_chain_test {
+          func.func @main(%x: tensor<2x3x4xf32>) -> (tensor<4x2x3xf32>) {
+            %t = stablehlo.transpose %x, dims = [2, 0, 1] : (tensor<2x3x4xf32>) -> tensor<4x2x3xf32>
+            %n = stablehlo.negate %t : tensor<4x2x3xf32>
+            return %n : tensor<4x2x3xf32>
+          }
+        }
+        """
+
+        let client = try Client.create()
+        let executable = try client.compile(mlir, config: CompilationConfig(optimizationLevel: .O2))
+
+        // x[i,j,k] = i*12 + j*4 + k, shape [2,3,4].
+        let xin = (0..<24).map { Float($0) }
+        let x = try client.createBuffer(xin, shape: [2, 3, 4], elementType: .float32)
+
+        let outputs = try executable.execute([x])
+        let result = try outputs[0].toFloatArray()
+
+        // Reference: out[a,b,c] = -x[b,c,a], shape [4,2,3] (perm [2,0,1]).
+        var expected = [Float](repeating: 0, count: 24)
+        for a in 0..<4 { for b in 0..<2 { for c in 0..<3 {
+            expected[a * 6 + b * 3 + c] = -xin[b * 12 + c * 4 + a]
+        }}}
+        #expect(result == expected, "transpose perm wrong (forward instead of inverse): \(result)")
+    }
 }

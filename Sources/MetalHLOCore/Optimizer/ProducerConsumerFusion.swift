@@ -225,7 +225,24 @@ public final class ProducerConsumerFusion: @unchecked Sendable {
         let unsafeSelect = orderedOps.contains { op in
             op.kind == .select && (op.operands.isEmpty || !regionResultSet.contains(op.operands[0]))
         }
-        let canEmitAsCustomCall = emitCustomCalls && orderedOps.count > 1 && allElementwise && !unsafeSelect
+        // Safety for fused transpose / non-scalar broadcastInDim: the chain
+        // codegen reads these via a per-thread COMPUTED INDEX into the source,
+        // which only works when the source is an EXTERNAL buffer (a fresh
+        // input the kernel can re-index freely). When the operand is a prior
+        // chain result the codegen has no way to re-index it — that value was
+        // computed for the chain's OUTPUT coordinate, not the transposed /
+        // broadcast input coordinate — so it silently passes the prior through
+        // unchanged (identity), which is wrong for any non-trivial permutation
+        // or fan-out (e.g. `transpose(exp(x))`, `broadcast(exp(x))` → garbage).
+        // Reshape is exempt: it's the identity in linear-index space, so the
+        // passthrough is correct. If a transpose/broadcast has an in-region
+        // operand, don't emit this region as a fused chain.
+        let unsafeShapeOp = orderedOps.contains { op in
+            (op.kind == .transpose || op.kind == .broadcastInDim)
+                && !op.operands.isEmpty && regionResultSet.contains(op.operands[0])
+        }
+        let canEmitAsCustomCall = emitCustomCalls && orderedOps.count > 1
+            && allElementwise && !unsafeSelect && !unsafeShapeOp
 
         // Mark this region's ops as assigned so the outer loop doesn't
         // revisit them. There's ONE exception: when the region will emit

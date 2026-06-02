@@ -40,7 +40,6 @@ MetalHLO is a fully-functional JAX backend for Apple Silicon. **130 tests across
 
 ### Known limitations
 
-- **MHA value-kernel grad**: 7 of 8 grad components are exact; one component drifts ~0.11. Doesn't reproduce when the chain is extracted in isolation — open investigation.
 - **Multi-step CNN training**: step 0 matches CPU exactly; subsequent steps drift up to ~0.1 absolute. Test absorbs with `rtol=1e-1`. Cross-process variance was reduced by routing conv-grad and pool-backward off MPSGraph's autotuned kernels onto deterministic primitives; residual is in MPSGraph's internal small-op fusion.
 - **Sharding** (`pjit` with mesh, `shard_map`, `nn.partitioning`): not supported. MetalHLO is single-device.
 - **Quantization, `nn.custom_vjp`**: not tested.
@@ -947,16 +946,6 @@ scatter %operand, %indices, %updates                      // Default: replaces v
 Gather and scatter parse batching dimension attributes (`operand_batching_dims`, `start_indices_batching_dims` for gather; `input_batching_dims`, `scatter_indices_batching_dims` for scatter). The implementation includes a transpose-gather/scatter-transpose pattern for arbitrary batch dimension positions. Best tested with batch dimensions at leading positions; complex non-leading configurations may require additional work.
 
 ### Known Issues Under Investigation
-
-**Scatter region parsing:**
-The StableHLO `scatter` operation requires an inline region body to specify the update computation (e.g., identity/replace or add/accumulate). The MLIR uses a generic form with a region followed by an attribute dictionary:
-```mlir
-%1 = "stablehlo.scatter"(%input, %indices, %updates) ({
-  ^bb0(%arg0: tensor<f32>, %arg1: tensor<f32>):
-    stablehlo.return %arg1 : tensor<f32>
-}) { scatter_dimension_numbers = ... }
-```
-The parser does not currently handle this `({ ... })` region syntax. We are working on extending the parser to support generic-form operations with region bodies.
 
 **Large `stablehlo.while` loops (`jax.lax.scan`):**
 Programs that use `jax.lax.scan` with large iteration counts (e.g., 20,000 time steps in a simulation) compile to `stablehlo.while` loops. MetalHLO handles these in two ways:
