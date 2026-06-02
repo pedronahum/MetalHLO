@@ -432,6 +432,53 @@ struct AnalyzerTests {
         #expect(geluPatterns.count == 1)
     }
 
+    // The tanh-approx GELU JAX/XLA actually emits: every scalar constant is
+    // `broadcast_in_dim`-wrapped, and the factors are grouped as
+    // x * (0.5 * (1 + tanh(0.7978·(x + 0.044715·x³)))) — NOT the flat
+    // 0.5 * x * (1+tanh) the old matcher assumed. This is exactly nanoGPT's MLP.
+    @Test("Pattern detection finds JAX-lowered tanh GELU (broadcast-wrapped consts)")
+    func patternDetectionGELUJaxLowered() {
+        let shape = TensorType(shape: [16, 256, 1536], elementType: .float32)
+        let scalar = TensorType(shape: [], elementType: .float32)
+        let x = HLOArgument(name: "x", type: shape)
+
+        func bin(_ r: String, _ k: HLOOpKind, _ a: String, _ b: String) -> HLOOperation {
+            HLOOperation(result: r, kind: k, operands: [a, b], resultType: shape, attributes: HLOAttributes())
+        }
+        func constB(_ cname: String, _ bname: String, _ v: Double) -> [HLOOperation] {
+            var ca = HLOAttributes(); ca.constantValue = .scalar(v)
+            var ba = HLOAttributes(); ba.dimensions = []
+            return [
+                HLOOperation(result: cname, kind: .constant, operands: [], resultType: scalar, attributes: ca),
+                HLOOperation(result: bname, kind: .broadcastInDim, operands: [cname], resultType: shape, attributes: ba)
+            ]
+        }
+
+        var ops: [HLOOperation] = []
+        ops.append(bin("xx", .multiply, "x", "x"))        // x²
+        ops.append(bin("xxx", .multiply, "xx", "x"))       // x³ = x²·x
+        ops += constB("c_coef", "c_coef_b", 0.044715)
+        ops.append(bin("cubic", .multiply, "c_coef_b", "xxx"))   // 0.044715·x³
+        ops.append(bin("poly", .add, "x", "cubic"))             // x + 0.044715·x³
+        ops += constB("c_sqrt", "c_sqrt_b", 0.7978845608028654)
+        ops.append(bin("inner", .multiply, "c_sqrt_b", "poly"))
+        ops.append(HLOOperation(result: "t", kind: .tanh, operands: ["inner"], resultType: shape, attributes: HLOAttributes()))
+        ops += constB("c_one", "c_one_b", 1.0)
+        ops.append(bin("opt", .add, "c_one_b", "t"))            // 1 + tanh
+        ops += constB("c_half", "c_half_b", 0.5)
+        ops.append(bin("halfterm", .multiply, "c_half_b", "opt"))  // 0.5·(1+tanh)
+        ops.append(bin("gelu", .multiply, "x", "halfterm"))        // x·(0.5·(1+tanh))  ← root
+
+        let function = HLOFunction(
+            name: "gelu", inputs: [x],
+            outputTypes: [shape], operations: ops, returnValues: ["gelu"]
+        )
+        let shapes = analyzer.inferShapes(function)
+        let patterns = analyzer.detectPatterns(function, shapes: shapes)
+        let geluPatterns = patterns.filter { $0.type == .gelu }
+        #expect(geluPatterns.count == 1, "Expected JAX-lowered GELU to be detected, got \(geluPatterns.count)")
+    }
+
     @Test("Pattern detection finds SiLU pattern")
     func patternDetectionSiLU() {
         let input = HLOArgument(name: "x", type: TensorType(shape: [1, 512, 768], elementType: .float32))

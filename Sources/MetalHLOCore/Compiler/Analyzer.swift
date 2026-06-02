@@ -402,6 +402,12 @@ public final class Analyzer: @unchecked Sendable {
         patterns.append(contentsOf: detectConvBiasActPatterns(function, definingOps: definingOps, existing: patterns))
         patterns.append(contentsOf: detectSoftmaxPatterns(function, definingOps: definingOps, shapes: shapes, existing: patterns))
 
+        if ProcessInfo.processInfo.environment["METALHLO_DEBUG_PATTERNS"] == "1", !patterns.isEmpty {
+            var counts: [String: Int] = [:]
+            for p in patterns { counts["\(p.type)", default: 0] += 1 }
+            FileHandle.standardError.write("[patterns] fn=\(function.name) ops=\(function.operations.count) \(counts.sorted { $0.key < $1.key })\n".data(using: .utf8)!)
+        }
+
         return patterns
     }
 
@@ -1202,64 +1208,109 @@ public final class Analyzer: @unchecked Sendable {
         guard rootOp.kind == .multiply else { return nil }
 
         var matchedIndices: Set<Int> = [rootIndex]
-        var inputTensorID: TensorID?
 
-        // Try to find GELU pattern starting from the root multiply
-        // We need to find: 0.5 constant, x input, and (1 + tanh(...)) expression
-
-        // Check both orderings of multiply operands
-        for (i, operand) in rootOp.operands.enumerated() {
-            let otherOperand = rootOp.operands[1 - i]
-
-            // Case 1: This operand is 0.5 constant, other is x * (1 + tanh(...))
-            if let constVal = getConstantValue(operand, definingOps: definingOps),
-               abs(constVal - Self.geluHalf) < Self.geluTolerance {
-                // Mark constant as matched
-                if let constDef = definingOps[operand] {
-                    matchedIndices.insert(constDef.index)
-                }
-
-                // Other operand should be x * (1 + tanh(...))
-                if let xTimesTanhResult = detectXTimesTanhPlusOne(
-                    operand: otherOperand,
-                    definingOps: definingOps,
-                    matchedIndices: &matchedIndices
-                ) {
-                    inputTensorID = xTimesTanhResult.inputX
-                    return createGELUPattern(
-                        rootIndex: rootIndex,
-                        matchedIndices: matchedIndices,
-                        inputTensorID: inputTensorID
-                    )
-                }
+        // tanh-approx GELU is  c · x · (1 + tanh(poly(x)))  where c = 0.5, but
+        // JAX/XLA group the multiplicative factors arbitrarily — nanoGPT emits
+        // `x · (0.5 · (1 + tanh(…)))`, not the `0.5 · (x · (1 + tanh))` the old
+        // matcher assumed. Be grouping-agnostic: flatten the product of the
+        // root into its leaf factors, then classify them.
+        var factors: [TensorID] = []
+        func collectFactors(_ id: TensorID, depth: Int) {
+            if depth < 16, let def = definingOps[id], def.op.kind == .multiply,
+               def.op.operands.count == 2 {
+                matchedIndices.insert(def.index)
+                collectFactors(def.op.operands[0], depth: depth + 1)
+                collectFactors(def.op.operands[1], depth: depth + 1)
+            } else {
+                factors.append(id)
             }
+        }
+        for operand in rootOp.operands { collectFactors(operand, depth: 0) }
 
-            // Case 2: This operand is x * (1 + tanh(...)), need to find 0.5 elsewhere
-            if let mulDef = definingOps[operand],
-               mulDef.op.kind == .multiply {
-                // Check if this is the x * (1 + tanh(...)) part
-                if let xTimesTanhResult = detectXTimesTanhPlusOne(
-                    operand: operand,
-                    definingOps: definingOps,
-                    matchedIndices: &matchedIndices
-                ) {
-                    // Other operand should be 0.5 or involve 0.5
-                    if let constVal = getConstantValue(otherOperand, definingOps: definingOps),
-                       abs(constVal - Self.geluHalf) < Self.geluTolerance {
-                        if let constDef = definingOps[otherOperand] {
-                            matchedIndices.insert(constDef.index)
-                        }
-                        inputTensorID = xTimesTanhResult.inputX
-                        return createGELUPattern(
-                            rootIndex: rootIndex,
-                            matchedIndices: matchedIndices,
-                            inputTensorID: inputTensorID
-                        )
-                    }
-                }
+        // Classify each leaf factor: a scalar constant (their product must be
+        // 0.5), the `(1 + tanh(poly))` add, or the input x.
+        var constProduct = 1.0
+        var sawConst = false
+        var tanhAddFactor: TensorID?
+        var xCandidates: [TensorID] = []
+        for f in factors {
+            if let c = getConstantValue(f, definingOps: definingOps) {
+                constProduct *= c
+                sawConst = true
+                if let d = definingOps[f] { matchedIndices.insert(d.index) }
+            } else if tanhAddFactor == nil,
+                      let d = definingOps[f], d.op.kind == .add,
+                      isOnePlusTanh(d.op, definingOps: definingOps) {
+                tanhAddFactor = f
+            } else {
+                xCandidates.append(f)
             }
         }
 
+        guard sawConst, abs(constProduct - Self.geluHalf) < Self.geluTolerance,
+              let tanhAdd = tanhAddFactor, definingOps[tanhAdd] != nil,
+              xCandidates.count == 1, let x = xCandidates.first else {
+            return nil
+        }
+
+        // Validate the (1 + tanh(poly)) factor and that its polynomial is in x.
+        guard let addDef = definingOps[tanhAdd] else { return nil }
+        matchedIndices.insert(addDef.index)
+        guard let inputX = onePlusTanhInput(addDef.op, definingOps: definingOps,
+                                            matchedIndices: &matchedIndices,
+                                            candidateX: x),
+              inputX == x else {
+            return nil
+        }
+
+        return createGELUPattern(
+            rootIndex: rootIndex,
+            matchedIndices: matchedIndices,
+            inputTensorID: x
+        )
+    }
+
+    /// Cheap structural probe: is `addOp` of the form `1 + tanh(…)`? (No
+    /// polynomial validation — that needs the resolved x, done later.)
+    private func isOnePlusTanh(
+        _ addOp: HLOOperation,
+        definingOps: [TensorID: (op: HLOOperation, index: Int)]
+    ) -> Bool {
+        guard addOp.kind == .add, addOp.operands.count == 2 else { return false }
+        for (i, operand) in addOp.operands.enumerated() {
+            let other = addOp.operands[1 - i]
+            if let c = getConstantValue(operand, definingOps: definingOps),
+               abs(c - 1.0) < Self.geluTolerance,
+               let tanhDef = definingOps[other], tanhDef.op.kind == .tanh {
+                return true
+            }
+        }
+        return false
+    }
+
+    private func onePlusTanhInput(
+        _ addOp: HLOOperation,
+        definingOps: [TensorID: (op: HLOOperation, index: Int)],
+        matchedIndices: inout Set<Int>,
+        candidateX: TensorID?
+    ) -> TensorID? {
+        guard addOp.kind == .add, addOp.operands.count == 2 else { return nil }
+        for (i, operand) in addOp.operands.enumerated() {
+            let other = addOp.operands[1 - i]
+            guard let c = getConstantValue(operand, definingOps: definingOps),
+                  abs(c - 1.0) < Self.geluTolerance else { continue }
+            guard let tanhDef = definingOps[other], tanhDef.op.kind == .tanh else { continue }
+            if let d = definingOps[operand] { matchedIndices.insert(d.index) }
+            matchedIndices.insert(tanhDef.index)
+            // The polynomial inside tanh anchors x. Pass candidateX when we
+            // have one; otherwise let the polynomial detector discover it.
+            return detectTanhPolynomialInput(
+                tanhOp: tanhDef.op,
+                definingOps: definingOps,
+                matchedIndices: &matchedIndices,
+                candidateX: candidateX ?? other
+            )
+        }
         return nil
     }
 
@@ -1536,10 +1587,24 @@ public final class Analyzer: @unchecked Sendable {
     }
 
     /// Extracts constant value from a tensor ID (handles both direct constants and constant ops)
-    private func getConstantValue(_ tensorID: TensorID, definingOps: [TensorID: (op: HLOOperation, index: Int)]) -> Double? {
-        guard let def = definingOps[tensorID],
-              def.op.kind == .constant,
-              let constVal = def.op.attributes.constantValue else {
+    private func getConstantValue(_ tensorID: TensorID, definingOps: [TensorID: (op: HLOOperation, index: Int)], depth: Int = 0) -> Double? {
+        guard depth < 8, let def = definingOps[tensorID] else { return nil }
+
+        // JAX lowers a scalar literal then `broadcast_in_dim`s it to the
+        // tensor shape before using it (e.g. the 0.5 / 1.0 / 0.7978… constants
+        // in GELU). Walk through value-preserving shape ops to the underlying
+        // constant so pattern detectors see the literal, not the broadcast.
+        switch def.op.kind {
+        case .broadcastInDim, .reshape, .convert:
+            guard let src = def.op.operands.first else { return nil }
+            return getConstantValue(src, definingOps: definingOps, depth: depth + 1)
+        case .constant:
+            break
+        default:
+            return nil
+        }
+
+        guard let constVal = def.op.attributes.constantValue else {
             return nil
         }
 
