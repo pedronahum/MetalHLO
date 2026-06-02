@@ -5643,6 +5643,16 @@ public final class CodeGenerator: @unchecked Sendable {
             .max() ?? -1
         let inputCount = max(inputShapes.count, maxExternal + 1, 1)
         let metalType = metalTypeName(for: elementType)
+        // Per-thread temporaries' type. Normally the chain's output type, but a
+        // BOOLEAN-result chain must compute in float: such chains mix integer
+        // index math with a boolean result — e.g. the causal-mask tril:
+        // iota → add → compare(GE) → select : i1. With `bool` temps the integer
+        // `add` is truncated to 0/1 and corrupts the mask (the compare/select
+        // already emit float 1.0/0.0). Float keeps that arithmetic exact
+        // (values ≪ 2^24); the final store narrows back to the bool output.
+        // Do NOT widen integer chains to float — they may use integer
+        // divide/modulo (index unflattening), whose semantics differ in float.
+        let computeType = (metalType == "bool") ? "float" : metalType
 
         // Per-external buffer element type. The chain computes in `metalType`
         // (the root's type — float for the usual case), but an external may be
@@ -5816,7 +5826,7 @@ public final class CodeGenerator: @unchecked Sendable {
             if (op.kind == .transpose || op.kind == .broadcastInDim),
                let idx = computedIdxFor[i],
                case .external(let slot) = op.operands.first {
-                body += "    \(metalType) v\(i) = input\(slot)[\(idx)];\n"
+                body += "    \(computeType) v\(i) = input\(slot)[\(idx)];\n"
                 continue
             }
             func operandExpr(_ src: FusedElementwiseChain.OperandSource) -> String {
@@ -5826,8 +5836,8 @@ public final class CodeGenerator: @unchecked Sendable {
                 }
             }
             let operands = op.operands.map(operandExpr)
-            let expr = elementwiseChainExpr(kind: op.kind, operands: operands, metalType: metalType, comparison: op.comparison)
-            body += "    \(metalType) v\(i) = \(expr);\n"
+            let expr = elementwiseChainExpr(kind: op.kind, operands: operands, metalType: computeType, comparison: op.comparison)
+            body += "    \(computeType) v\(i) = \(expr);\n"
         }
         let resultExpr: String = chain.ops.isEmpty ? externalRef(0) : "v\(chain.ops.count - 1)"
 
