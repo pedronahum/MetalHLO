@@ -390,7 +390,15 @@ MetalHLO provides four optimization levels that control the aggressiveness of th
 | **O0** | No optimization | Debugging, fastest compilation |
 | **O1** | Basic optimization | Quick iteration during development |
 | **O2** | Standard optimization (default) | Production with balanced compile time |
-| **O3** | Aggressive optimization | Maximum runtime performance |
+| **O3** | Aggressive optimization — **experimental, under repair** | Not for use yet (see below) |
+
+> **⚠️ O3 is currently disabled and under active development.** Its pattern-fusion
+> stack (GELU/attention/FFN fusion, cross-layer fusion) has known correctness and
+> stability bugs — a fused-attention kernel that drops the causal mask, a fusedGELU
+> binding crash, and an incomplete cross-layer residual fusion. **Requesting `-O3`
+> transparently falls back to `-O2`** (with a one-time warning) so you always get a
+> correct compile. Setting `METALHLO_ALLOW_O3=1` forces the real O3 for developers
+> working on these fixes — it may crash or miscompile. Use **O2** for production.
 
 ### What Each Level Does
 

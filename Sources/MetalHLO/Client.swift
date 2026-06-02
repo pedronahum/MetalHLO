@@ -21,6 +21,14 @@ public final class Client: @unchecked Sendable {
 
     // MARK: - Properties
 
+    /// Emits the "-O3 under repair, falling back to -O2" warning exactly once
+    /// per process (a static `let` initializer is run at most once, thread-safe).
+    private static let o3FallbackWarningOnce: Bool = {
+        FileHandle.standardError.write(Data(
+            "[MetalHLO] warning: -O3 is experimental and under active repair; using -O2 instead. Set METALHLO_ALLOW_O3=1 to force -O3 (may crash or miscompile).\n".utf8))
+        return true
+    }()
+
     private let executor: MetalExecutor
 
     /// The underlying Metal device.
@@ -152,6 +160,21 @@ public final class Client: @unchecked Sendable {
             return try compileHeterogeneous(mlir, config: config)
         }
 
+        // ─── O3 is UNDER REPAIR and gated off for users ──────────────────
+        // -O3 (aggressivePasses) enables the pattern-fusion stack — but those
+        // passes currently hit broken/incomplete code: a cross-layer
+        // residual fusion that crashed the compiler, a fusedGelu custom_call
+        // with a binding failure, and a fused-attention kernel that drops the
+        // causal mask (wrong results). Until those are fixed, treat -O3 as -O2
+        // so users get a correct (if unfused) compile. Developers working on
+        // the fix opt in with METALHLO_ALLOW_O3=1.
+        var optLevel = config.optimizationLevel
+        if optLevel == .O3,
+           ProcessInfo.processInfo.environment["METALHLO_ALLOW_O3"] != "1" {
+            _ = Client.o3FallbackWarningOnce
+            optLevel = .O2
+        }
+
         // Map optimization level to appropriate pass set if user hasn't specified
         let effectiveEnabledPasses: Set<String>?
         if let userPasses = config.enabledPasses {
@@ -159,7 +182,7 @@ public final class Client: @unchecked Sendable {
             effectiveEnabledPasses = userPasses
         } else {
             // Map optimization level to pass set
-            switch config.optimizationLevel {
+            switch optLevel {
             case .O0:
                 effectiveEnabledPasses = Set()  // No passes
             case .O1:
@@ -178,7 +201,7 @@ public final class Client: @unchecked Sendable {
         )
 
         let compilerConfig = MetalHLOCompiler.Config(
-            optimizationLevel: config.optimizationLevel.toCompilerLevel(),
+            optimizationLevel: optLevel.toCompilerLevel(),
             enableCaching: config.enableCaching,
             generateDebugInfo: config.generateDebugInfo,
             passManagerConfig: passManagerConfig
