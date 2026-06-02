@@ -643,7 +643,7 @@ public final class Analyzer: @unchecked Sendable {
         // where softmaxOpIdx is the *root* of the softmax (the `divide`).
         // Optionally peels off a `multiply(scores, scale)` between the QK
         // matmul and the subtract — that's the scaling factor `1/sqrt(d)`.
-        func walkExpandedSoftmax(_ rootInput: TensorID) -> (qk: (op: HLOOperation, index: Int), softmaxRootIdx: Int)? {
+        func walkExpandedSoftmax(_ rootInput: TensorID) -> (qk: (op: HLOOperation, index: Int), softmaxRootIdx: Int, masked: Bool)? {
             guard let divDef = definingOps[rootInput],
                   divDef.op.kind == .divide,
                   divDef.op.operands.count == 2,
@@ -653,25 +653,32 @@ public final class Analyzer: @unchecked Sendable {
                   subDef.op.kind == .subtract,
                   subDef.op.operands.count == 2 else { return nil }
 
-            // Walk through the numerator's pre-shift value back to a matmul,
-            // peeling an optional broadcast and an optional scaling multiply.
+            // Walk the numerator's pre-shift value back to the Q·Kᵀ matmul,
+            // peeling the ops that sit between it and the softmax:
+            //  - scaling (multiply / divide by 1/√d), broadcasts, reshapes;
+            //  - the causal-mask `select(mask, scores, -inf)` — follow the
+            //    on-true (scores) branch and flag that a mask is present so the
+            //    fusion doesn't silently drop it.
             var cur = subDef.op.operands[0]
+            var masked = false
             var hops = 0
-            while hops < 4 {
+            while hops < 8 {
                 guard let def = definingOps[cur] else { return nil }
                 if def.op.kind == .dot || def.op.kind == .dotGeneral {
-                    return (qk: def, softmaxRootIdx: divDef.index)
+                    return (qk: def, softmaxRootIdx: divDef.index, masked: masked)
                 }
-                if def.op.kind == .multiply || def.op.kind == .broadcastInDim {
-                    // Pick the operand most likely to lead to the matmul:
-                    // for multiply(scores, scale_bc) the scores side is the
-                    // one whose own definer is a dot (or another multiply).
-                    if def.op.operands.isEmpty { return nil }
-                    cur = def.op.operands[0]
-                    hops += 1
-                    continue
+                switch def.op.kind {
+                case .multiply, .broadcastInDim, .divide, .reshape, .convert:
+                    guard !def.op.operands.isEmpty else { return nil }
+                    cur = def.op.operands[0]   // scores / numerator side
+                case .select:
+                    guard def.op.operands.count >= 2 else { return nil }
+                    masked = true
+                    cur = def.op.operands[1]   // select(mask, scores, fill) → scores
+                default:
+                    return nil
                 }
-                return nil
+                hops += 1
             }
             return nil
         }
@@ -683,6 +690,7 @@ public final class Analyzer: @unchecked Sendable {
 
             var softmaxRootIdx: Int? = nil
             var qkMatmulDef: (op: HLOOperation, index: Int)? = nil
+            var masked = false
 
             // Variant 1: softmax encoded as a single `customCall("softmax")`.
             if let cdef = definingOps[op.operands[0]],
@@ -697,9 +705,10 @@ public final class Analyzer: @unchecked Sendable {
             // Variant 2: numerically-stable softmax expanded into
             // divide / exp / subtract / reduce_max / multiply chain.
             if softmaxRootIdx == nil {
-                if let (qk, smRoot) = walkExpandedSoftmax(op.operands[0]) {
+                if let (qk, smRoot, sawMask) = walkExpandedSoftmax(op.operands[0]) {
                     qkMatmulDef = qk
                     softmaxRootIdx = smRoot
+                    masked = sawMask
                 }
             }
 
@@ -710,6 +719,9 @@ public final class Analyzer: @unchecked Sendable {
 
             // Extract configuration from shapes
             var metadata = PatternMetadata()
+            // Record whether a causal mask sits inside the softmax — a fused
+            // attention kernel MUST apply it; dropping it silently miscomputes.
+            metadata.causalMask = masked
             if let qShape = shapes[qk.op.operands[0]] {
                 if qShape.count >= 3 {
                     metadata.numHeads = qShape[qShape.count - 3]

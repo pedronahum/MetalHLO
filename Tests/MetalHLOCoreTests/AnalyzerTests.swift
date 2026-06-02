@@ -479,6 +479,53 @@ struct AnalyzerTests {
         #expect(geluPatterns.count == 1, "Expected JAX-lowered GELU to be detected, got \(geluPatterns.count)")
     }
 
+    // nanoGPT causal attention: Q·Kᵀ → /√d → select(mask, scores, -inf) →
+    // numerically-stable softmax → ·V. The detector must walk THROUGH the
+    // causal-mask select (and the scaling divide) to reach the QK matmul, and
+    // record causalMask=true so a fused kernel applies the mask.
+    @Test("Pattern detection finds masked (causal) attention")
+    func patternDetectionMaskedAttention() {
+        let s4 = TensorType(shape: [1, 2, 4, 4], elementType: .float32)
+        let i1 = TensorType(shape: [1, 2, 4, 4], elementType: .int1)
+        let scalar = TensorType(shape: [], elementType: .float32)
+        let q = HLOArgument(name: "q", type: s4)
+        let k = HLOArgument(name: "k", type: s4)
+        let v = HLOArgument(name: "v", type: s4)
+
+        func op(_ r: String, _ kind: HLOOpKind, _ ins: [String], _ t: TensorType = s4) -> HLOOperation {
+            HLOOperation(result: r, kind: kind, operands: ins, resultType: t, attributes: HLOAttributes())
+        }
+        func constB(_ c: String, _ b: String, _ val: Double, _ bt: TensorType) -> [HLOOperation] {
+            var ca = HLOAttributes(); ca.constantValue = .scalar(val)
+            var ba = HLOAttributes(); ba.dimensions = []
+            return [HLOOperation(result: c, kind: .constant, operands: [], resultType: scalar, attributes: ca),
+                    HLOOperation(result: b, kind: .broadcastInDim, operands: [c], resultType: bt, attributes: ba)]
+        }
+
+        var ops: [HLOOperation] = []
+        ops.append(op("scores", .dotGeneral, ["q", "k"]))      // Q·Kᵀ
+        ops += constB("sc", "sc_b", 8.0, s4)
+        ops.append(op("scaled", .divide, ["scores", "sc_b"]))   // /√d
+        ops += constB("mc", "mask_b", 1.0, i1)                   // causal mask (i1)
+        ops += constB("ninf", "ninf_b", -1e30, s4)
+        ops.append(op("masked", .select, ["mask_b", "scaled", "ninf_b"]))  // mask
+        ops += constB("zero", "denom_b", 1.0, s4)               // stand-in max/sum broadcast
+        ops.append(op("sub", .subtract, ["masked", "denom_b"]))
+        ops.append(op("e", .exponential, ["sub"]))
+        ops.append(op("sm", .divide, ["e", "denom_b"]))         // softmax output
+        ops.append(op("out", .dotGeneral, ["sm", "v"]))         // ·V
+
+        let function = HLOFunction(
+            name: "attn", inputs: [q, k, v],
+            outputTypes: [s4], operations: ops, returnValues: ["out"]
+        )
+        let shapes = analyzer.inferShapes(function)
+        let patterns = analyzer.detectPatterns(function, shapes: shapes)
+        let attn = patterns.filter { $0.type == .attention }
+        #expect(attn.count == 1, "Expected 1 masked-attention pattern, got \(attn.count)")
+        #expect(attn.first?.metadata.causalMask == true, "Causal mask should be recorded")
+    }
+
     @Test("Pattern detection finds SiLU pattern")
     func patternDetectionSiLU() {
         let input = HLOArgument(name: "x", type: TensorType(shape: [1, 512, 768], elementType: .float32))
