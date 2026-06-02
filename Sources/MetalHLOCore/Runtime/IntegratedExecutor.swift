@@ -568,6 +568,15 @@ public final class IntegratedExecutor: @unchecked Sendable {
             encoder.endEncoding()
         }
 
+        // A mid-loop throw (e.g. a missing input/constant binding from a
+        // miscompiled op) must NOT leave a live command encoder: Metal aborts
+        // the whole process ("encoder released without endEncoding") when an
+        // unended encoder is deallocated. Track the currently-open encoder and
+        // end it on every exit path so the error propagates as a clean Swift
+        // throw instead of a SIGABRT.
+        var openEncoder: MTLComputeCommandEncoder? = perOpProfilingActive ? nil : encoder
+        defer { openEncoder?.endEncoding() }
+
         for i in 0..<plan.count {
             // Per-op encoder path when profiling is on — gives one sample
             // pair per dispatch. Otherwise we keep the original single-encoder
@@ -586,6 +595,7 @@ public final class IntegratedExecutor: @unchecked Sendable {
                     throw IntegratedExecutorError.encoderCreationFailed
                 }
                 opEncoder = e
+                openEncoder = e
                 lastPipeline = nil  // fresh encoder — must rebind
             } else {
                 opEncoder = encoder
@@ -649,12 +659,14 @@ public final class IntegratedExecutor: @unchecked Sendable {
             }
             if perOpProfilingActive {
                 opEncoder.endEncoding()
+                openEncoder = nil
             }
         }
         _ = kernelTimings  // not used in the fast path — kept for executeAsync caller
 
         if !perOpProfilingActive {
             encoder.endEncoding()
+            openEncoder = nil
         }
 
         if ProcessInfo.processInfo.environment["METALHLO_DUMP_DISPATCH_SUMMARY"] != nil {
