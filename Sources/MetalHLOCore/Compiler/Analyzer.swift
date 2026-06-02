@@ -1641,6 +1641,12 @@ public final class Analyzer: @unchecked Sendable {
     ) -> DetectedPattern {
         var metadata = PatternMetadata()
         metadata.activation = "gelu_approximate"
+        // Record the actual GELU input `x` (the value the tanh polynomial is
+        // a function of). The fusion pass needs this to build fusedGelu(x);
+        // without it, it falls back to a fragile "first matched op's operand"
+        // heuristic that can pick an intermediate the pass then removes,
+        // orphaning the operand into a mid-encode missingInput crash.
+        metadata.inputTensor = inputTensorID
 
         return DetectedPattern(
             type: .gelu,

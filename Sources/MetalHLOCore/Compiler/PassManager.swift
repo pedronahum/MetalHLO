@@ -1126,7 +1126,6 @@ final class GELUFusionPass: OptimizationPass, @unchecked Sendable {
         }
 
         var newOperations = function.operations
-        var opsToRemove = Set<Int>()
         var changed = false
 
         for pattern in geluPatterns {
@@ -1137,12 +1136,30 @@ final class GELUFusionPass: OptimizationPass, @unchecked Sendable {
 
             let rootOp = function.operations[rootIdx]
 
-            // Find the input to the GELU pattern (first operation's input)
-            let firstOpIdx = pattern.operationIndices.first!
-            guard firstOpIdx < function.operations.count else { continue }
-            let firstOp = function.operations[firstOpIdx]
-            guard !firstOp.operands.isEmpty else { continue }
-            let input = firstOp.operands[0]
+            // The GELU input `x` is recorded by the detector (createGELUPattern).
+            // The old "first matched op's operand[0]" heuristic is unreliable —
+            // the lowest-indexed matched op may be a constant/broadcast or an
+            // intermediate this pass removes, orphaning the operand → a
+            // mid-encode missingInput crash at -O3.
+            guard let input = pattern.metadata.inputTensor else { continue }
+
+            // Only fuse a PURE-FORWARD gelu. Replacing the forward gelu output
+            // with a fusedGelu custom_call is autodiff-unaware: in a jointly
+            // traced forward+backward (training) graph the gelu's intermediates
+            // (x², x³, tanh, 1+tanh, …) are reused by the backward, so rewriting
+            // the forward leaves the gradient inconsistent (wrong by ~0.1) — and
+            // since those intermediates must stay for the backward, fusion saves
+            // nothing anyway. Detect that case by a multi-use intermediate (a
+            // non-root matched op consumed outside the pattern) and skip.
+            let patternSet = Set(pattern.operationIndices)
+            let intermediatesAreShared = pattern.operationIndices.contains { idx in
+                guard idx != rootIdx, idx < function.operations.count else { return false }
+                let result = function.operations[idx].result
+                return function.operations.enumerated().contains { (i, other) in
+                    !patternSet.contains(i) && other.operands.contains(result)
+                }
+            }
+            if intermediatesAreShared { continue }
 
             // Determine if approximate GELU
             let isApproximate = pattern.metadata.activation?.contains("approximate") ?? true
@@ -1166,22 +1183,17 @@ final class GELUFusionPass: OptimizationPass, @unchecked Sendable {
                 attributes: attrs
             )
 
-            // Replace the root operation with the fused one
+            // Replace the root op with fusedGelu(x). Do NOT try to delete the
+            // matched intermediates here: a sound removal must check that EVERY
+            // user of an intermediate is itself being removed, which is a
+            // fixpoint computation. The old "no use outside the pattern"
+            // heuristic was wrong — an intermediate %A used only by a KEPT
+            // multi-use op %B (kept because the backward pass also reads it)
+            // would be removed, orphaning %B into a mid-encode missingInput
+            // crash. Rewriting just the root makes the now-dead forward
+            // intermediates collectable by the final-dce pass that runs after
+            // this, while the ones the backward still needs are preserved.
             newOperations[rootIdx] = fusedOp
-
-            // Mark intermediate operations for removal, but only if their results
-            // aren't used by operations outside the pattern
-            let patternIndexSet = Set(pattern.operationIndices)
-            for idx in pattern.operationIndices where idx != rootIdx {
-                let result = function.operations[idx].result
-                let hasExternalUse = function.operations.enumerated().contains { (i, otherOp) in
-                    !patternIndexSet.contains(i) && otherOp.operands.contains(result)
-                }
-                let isReturnValue = function.returnValues.contains(result)
-                if !hasExternalUse && !isReturnValue {
-                    opsToRemove.insert(idx)
-                }
-            }
             changed = true
         }
 
@@ -1189,16 +1201,11 @@ final class GELUFusionPass: OptimizationPass, @unchecked Sendable {
             return .unchanged(function)
         }
 
-        // Filter out removed operations
-        let filteredOps = newOperations.enumerated()
-            .filter { !opsToRemove.contains($0.offset) }
-            .map { $0.element }
-
         let newFunction = HLOFunction(
             name: function.name,
             inputs: function.inputs,
             outputTypes: function.outputTypes,
-            operations: filteredOps,
+            operations: newOperations,
             returnValues: function.returnValues
         )
 
@@ -1206,7 +1213,6 @@ final class GELUFusionPass: OptimizationPass, @unchecked Sendable {
             function: newFunction,
             changed: true,
             stats: [
-                "operationsRemoved": opsToRemove.count,
                 "operationsFused": geluPatterns.count
             ]
         )
