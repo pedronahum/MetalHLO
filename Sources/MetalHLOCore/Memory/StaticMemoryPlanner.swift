@@ -188,11 +188,17 @@ public final class StaticMemoryPlanner: @unchecked Sendable {
             orderedLifetimes = lifetimes
         }
 
+        // 2b. Keep view-source tensors alive across their views.
+        // The code generator folds a reshape of a contiguous source into a
+        // zero-copy view aliasing the source's slab slot; the source must
+        // therefore outlive the view's readers (see tryGenerateReshapeView).
+        let viewSafeLifetimes = extendViewSourceLiveness(function, orderedLifetimes)
+
         // 3. Build interference graph
-        let interference = buildInterferenceGraph(orderedLifetimes)
+        let interference = buildInterferenceGraph(viewSafeLifetimes)
 
         // 4. Filter out inputs and constants - they come from external buffers, not the unified buffer
-        let intermediateLifetimes = orderedLifetimes.filter { !$0.value.isInput && !$0.value.isConstant }
+        let intermediateLifetimes = viewSafeLifetimes.filter { !$0.value.isInput && !$0.value.isConstant }
 
         // 5. Assign offsets.
         //
@@ -241,7 +247,7 @@ public final class StaticMemoryPlanner: @unchecked Sendable {
             }
         }
         // 5. Identify sharing groups
-        let groups = findSharingGroups(offsets, interference: interference, lifetimes: orderedLifetimes)
+        let groups = findSharingGroups(offsets, interference: interference, lifetimes: viewSafeLifetimes)
 
         return MemoryPlan(
             totalBytes: align(totalSize, to: config.pageAlignment),
@@ -287,6 +293,53 @@ public final class StaticMemoryPlanner: @unchecked Sendable {
         }
 
         return lifetimes
+    }
+
+    /// Extends the lifetime of any tensor feeding a `reshape` to cover the
+    /// reshape result's last use.
+    ///
+    /// The code generator folds a reshape of a contiguous source (a compute
+    /// kernel output or a function input) into a zero-copy view that aliases the
+    /// source's slab slot (`tryGenerateReshapeView`). The source must stay live
+    /// for as long as the view is read; otherwise the offset assigner — seeing
+    /// the source "die" at the reshape op — would reuse its slot for a later
+    /// tensor and silently corrupt the view (the documented prior regression:
+    /// loss 4.567 → 4.239). Extending the source's lifetime makes the
+    /// interference graph keep the slot reserved.
+    ///
+    /// Reshapes are processed by result-creation time, latest first, so the
+    /// extension propagates through chains (reshape-of-reshape): a later view's
+    /// readers extend its immediate source, which in turn extends the base.
+    /// Extending a source whose reshape does NOT fold to a view (none today, but
+    /// future copy-reshapes) is harmless — it only reserves the slot longer.
+    ///
+    /// Internal (not private) so the mechanism can be unit-tested directly.
+    func extendViewSourceLiveness(
+        _ function: HLOFunction,
+        _ lifetimes: [TensorID: ScheduledTensorLifetime]
+    ) -> [TensorID: ScheduledTensorLifetime] {
+        var reshapes: [(source: TensorID, result: TensorID)] = []
+        for op in function.operations where op.kind == .reshape {
+            guard let source = op.operands.first else { continue }
+            reshapes.append((source: source, result: op.result))
+        }
+        guard !reshapes.isEmpty else { return lifetimes }
+
+        var out = lifetimes
+        reshapes.sort { (out[$0.result]?.createdAt ?? 0) > (out[$1.result]?.createdAt ?? 0) }
+        for (source, result) in reshapes {
+            guard let src = out[source], let res = out[result] else { continue }
+            guard res.lastUsedAt > src.lastUsedAt else { continue }
+            out[source] = ScheduledTensorLifetime(
+                createdAt: src.createdAt,
+                lastUsedAt: res.lastUsedAt,
+                byteSize: src.byteSize,
+                isInput: src.isInput,
+                isOutput: src.isOutput,
+                isConstant: src.isConstant
+            )
+        }
+        return out
     }
 
     /// Computes lifetimes with a specific execution order.

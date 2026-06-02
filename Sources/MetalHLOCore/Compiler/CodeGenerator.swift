@@ -130,7 +130,8 @@ public final class CodeGenerator: @unchecked Sendable {
             if let viewResult = tryGenerateViewOperation(
                 op: op,
                 tensors: module.tensors,
-                viewMappings: viewMappings
+                viewMappings: viewMappings,
+                constantIDs: constantIDs
             ) {
                 // This is a view operation - store the view mapping
                 viewMappings[viewResult.outputID] = viewResult.view
@@ -183,7 +184,8 @@ public final class CodeGenerator: @unchecked Sendable {
     private func tryGenerateViewOperation(
         op: FusedOp,
         tensors: [TensorID: TensorInfo],
-        viewMappings: [TensorID: StridedTensorView]
+        viewMappings: [TensorID: StridedTensorView],
+        constantIDs: Set<TensorID>
     ) -> ViewResult? {
         guard case .original(let opKind) = op.type else {
             return nil
@@ -192,7 +194,10 @@ public final class CodeGenerator: @unchecked Sendable {
         switch opKind {
         // Reshape is safe as a view - maintains contiguous layout
         case .reshape:
-            return tryGenerateReshapeView(op: op, tensors: tensors, viewMappings: viewMappings)
+            return tryGenerateReshapeView(
+                op: op, tensors: tensors, viewMappings: viewMappings,
+                constantIDs: constantIDs
+            )
 
         // Transpose requires strided access patterns in downstream kernels
         // For now, keep as a kernel until strided kernel generation is implemented
@@ -224,34 +229,59 @@ public final class CodeGenerator: @unchecked Sendable {
     }
 
     /// Attempts to convert a reshape to a view.
+    ///
+    /// Two cases:
+    ///   1. Input is already a view (a prior reshape/slice in the chain) — reshape
+    ///      the existing strided view; only valid while it stays contiguous.
+    ///   2. Input is a *base* tensor (a compute-kernel output or a function input).
+    ///      Kernels always write their output contiguously into the memory slab,
+    ///      and inputs are contiguous, so a reshape of either is a pure relabel:
+    ///      emit a fresh contiguous view over the base. This eliminates the
+    ///      reshape COPY kernel for the common reshape-of-compute-output case.
+    ///
+    /// Constants are excluded — they live in separate constant buffers, not the
+    /// slab, so the executor's offset lookup (memoryPlan.tensorOffsets) can't
+    /// resolve a view whose base is a constant.
+    ///
+    /// The companion correctness requirement lives in StaticMemoryPlanner: the
+    /// base tensor's lifetime must be extended to cover the view's readers, or
+    /// the planner would reuse the base's slot after the reshape op and corrupt
+    /// the view (see extendViewSourceLiveness).
     private func tryGenerateReshapeView(
         op: FusedOp,
         tensors: [TensorID: TensorInfo],
-        viewMappings: [TensorID: StridedTensorView]
+        viewMappings: [TensorID: StridedTensorView],
+        constantIDs: Set<TensorID>
     ) -> ViewResult? {
         guard let inputID = op.inputs.first,
-              let inputView = viewMappings[inputID],
               let outputInfo = op.outputs.first else {
             return nil
         }
 
-        // Try to reshape without copy
-        guard let reshapedView = inputView.reshaped(to: outputInfo.shape) else {
-            // Reshape requires copy (input is non-contiguous)
-            return nil
+        // Case 1: input is itself a view — reshape the existing view.
+        if let inputView = viewMappings[inputID] {
+            guard let reshapedView = inputView.reshaped(to: outputInfo.shape) else {
+                // Reshape requires copy (view is non-contiguous, e.g. transposed).
+                return nil
+            }
+            return ViewResult(outputID: outputInfo.id, view: reshapedView)
         }
 
-        return ViewResult(outputID: outputInfo.id, view: reshapedView)
+        // Case 2: input is a base tensor. Constants are not slab-resident — skip.
+        if constantIDs.contains(inputID) {
+            return nil
+        }
+        // Element type comes from the input's TensorInfo (reshape preserves it).
+        guard let elementType = tensors[inputID]?.elementType else {
+            return nil
+        }
+        let baseView = StridedTensorView.contiguous(
+            tensorID: inputID,
+            shape: outputInfo.shape,
+            elementType: elementType
+        )
+        return ViewResult(outputID: outputInfo.id, view: baseView)
     }
-    // NOTE: tried extending this to fold reshape-of-compute-kernel-output by
-    // synthesizing a fresh contiguous view of the input. The view-chain
-    // resolution worked, but the memory planner doesn't know the reshape
-    // output is now a view — it still treats the input as dead after the
-    // reshape (since the reshape kernel was supposed to consume it) and
-    // aliases the input's offset to a later tensor. Loss went from
-    // 4.567244 → 4.238874. Properly fixing this requires updating the
-    // memory planner to keep view-source tensors alive across their
-    // dependent views — material refactor of MemoryPlanner.swift, deferred.
 
     // MARK: - Type Mapping
 
