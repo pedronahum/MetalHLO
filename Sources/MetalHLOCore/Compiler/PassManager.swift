@@ -618,7 +618,6 @@ final class AttentionFusionPass: OptimizationPass, @unchecked Sendable {
         }
 
         var newOperations = function.operations
-        var opsToRemove = Set<Int>()
         var changed = false
 
         for pattern in attentionPatterns {
@@ -632,6 +631,24 @@ final class AttentionFusionPass: OptimizationPass, @unchecked Sendable {
             guard qkMatmulIdx < function.operations.count,
                   softmaxIdx < function.operations.count,
                   rootIdx < function.operations.count else { continue }
+
+            // Only fuse a PURE-FORWARD attention. Like gelu-fusion, replacing
+            // the forward attention output with a fused custom_call is
+            // autodiff-unaware: in a jointly traced forward+backward (training)
+            // graph the Q·Kᵀ and softmax outputs are reused by the backward, so
+            // rewriting the forward leaves the gradient inconsistent — and since
+            // they must stay for the backward, fusion saves nothing there.
+            // Detect that case (an intermediate consumed outside the pattern)
+            // and skip; pure-forward (inference) attention still fuses.
+            let patternSet: Set<Int> = [qkMatmulIdx, softmaxIdx, rootIdx]
+            let intermediatesAreShared = [qkMatmulIdx, softmaxIdx].contains { idx in
+                let result = function.operations[idx].result
+                return function.returnValues.contains(result)
+                    || function.operations.enumerated().contains { (i, other) in
+                        !patternSet.contains(i) && other.operands.contains(result)
+                    }
+            }
+            if intermediatesAreShared { continue }
 
             let qkMatmul = function.operations[qkMatmulIdx]
             let rootOp = function.operations[rootIdx]
@@ -653,12 +670,17 @@ final class AttentionFusionPass: OptimizationPass, @unchecked Sendable {
                 scale = 1.0
             }
 
-            // Build backend config JSON
-            let configDict: [String: Any] = [
+            // Build backend config JSON. is_causal MUST be carried so the
+            // lowering applies the causal mask; num_heads/head_dim are needed by
+            // the Metal codegen path's per-head stride (defaults to 1 head and
+            // mis-strides multi-head attention otherwise).
+            var configDict: [String: Any] = [
                 "scale": scale,
                 "is_causal": pattern.metadata.causalMask ?? false,
-                "has_mask": false
+                "has_mask": false,
             ]
+            if let h = pattern.metadata.numHeads { configDict["num_heads"] = h }
+            if let d = pattern.metadata.headDim { configDict["head_dim"] = d }
             let backendConfig = (try? JSONSerialization.data(withJSONObject: configDict))
                 .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
 
@@ -676,22 +698,10 @@ final class AttentionFusionPass: OptimizationPass, @unchecked Sendable {
                 attributes: attrs
             )
 
-            // Replace the root operation with the fused one
+            // Replace the root op; leave the (now single-use) Q·Kᵀ/softmax ops
+            // for final-dce to collect. Do NOT delete them here — the old
+            // "no external use" removal could orphan a kept op.
             newOperations[rootIdx] = fusedOp
-
-            // Mark intermediate operations for removal, but only if their results
-            // aren't used by operations outside the pattern
-            let patternIndexSet: Set<Int> = [qkMatmulIdx, softmaxIdx, rootIdx]
-            for idx in [qkMatmulIdx, softmaxIdx] {
-                let result = function.operations[idx].result
-                let hasExternalUse = function.operations.enumerated().contains { (i, otherOp) in
-                    !patternIndexSet.contains(i) && otherOp.operands.contains(result)
-                }
-                let isReturnValue = function.returnValues.contains(result)
-                if !hasExternalUse && !isReturnValue {
-                    opsToRemove.insert(idx)
-                }
-            }
             changed = true
         }
 
@@ -699,26 +709,18 @@ final class AttentionFusionPass: OptimizationPass, @unchecked Sendable {
             return .unchanged(function)
         }
 
-        // Filter out removed operations
-        let filteredOps = newOperations.enumerated()
-            .filter { !opsToRemove.contains($0.offset) }
-            .map { $0.element }
-
         let newFunction = HLOFunction(
             name: function.name,
             inputs: function.inputs,
             outputTypes: function.outputTypes,
-            operations: filteredOps,
+            operations: newOperations,
             returnValues: function.returnValues
         )
 
         return PassResult(
             function: newFunction,
             changed: true,
-            stats: [
-                "operationsRemoved": opsToRemove.count,
-                "operationsFused": attentionPatterns.count
-            ]
+            stats: ["operationsFused": attentionPatterns.count]
         )
     }
 }
