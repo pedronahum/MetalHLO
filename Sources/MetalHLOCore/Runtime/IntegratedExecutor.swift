@@ -1091,77 +1091,105 @@ public final class IntegratedExecutor: @unchecked Sendable {
     /// Extracts output buffers from the unified buffer.
     /// Handles views - if an output is a view, extracts from the base tensor location.
     private func extractOutputs(inputs: [String: MTLBuffer]) throws -> [String: MTLBuffer] {
-        var outputs: [String: MTLBuffer] = [:]
         // Zero-copy handoff (default): allocate a FRESH owned buffer per output
         // so the client can wrap it directly (no Data → new-buffer double-copy
         // in buildOutputBuffers). Disabling reuse-pooling is the trade — fresh
         // shared-buffer alloc is VM-backed and cheap vs the ~17 ms double-copy.
         let zeroCopyOutputs = ProcessInfo.processInfo.environment["METALHLO_ZEROCOPY_OUTPUTS"] != "0"
 
-        for (name, spec) in executable.outputSpecs {
-            // Resolve view chain to get base tensor and offset
+        // Resolve each output to a copy source (slab offset) or an in-place
+        // input passthrough. Read-only against the executable/memory plan, so it
+        // is safe to do per-output work concurrently below.
+        enum OutputPlan {
+            case copy(srcOffset: Int, size: Int, label: String)
+            case passthrough(MTLBuffer)
+        }
+        let entries = Array(executable.outputSpecs)
+        var plans: [OutputPlan?] = Array(repeating: nil, count: entries.count)
+        for (i, entry) in entries.enumerated() {
+            let (name, spec) = entry
             let (baseTensorID, viewOffset) = executable.resolveViewChain(name)
-
-            // First try base tensor's offset (for views)
             if let offset = executable.memoryPlan.tensorOffsets[baseTensorID] {
-                // Get output buffer from pool or allocate new one
-                let outputBuffer: MTLBuffer
-                if !zeroCopyOutputs, let pool = outputBufferPool, let pooled = pool.acquire(name) {
-                    outputBuffer = pooled
-                } else {
-                    // Fallback to allocation if pool disabled or exhausted
-                    guard let newBuffer = device.makeBuffer(
-                        length: spec.byteSize,
-                        options: .storageModeShared
-                    ) else {
-                        throw IntegratedExecutorError.bufferAllocationFailed(size: spec.byteSize)
-                    }
-                    if let label = config.debugLabel {
-                        newBuffer.label = "\(label)_output_\(name)"
-                    }
-                    outputBuffer = newBuffer
-                }
-
-                // Copy data from unified buffer (including view offset)
-                memcpy(
-                    outputBuffer.contents(),
-                    unifiedBuffer.contents().advanced(by: offset + viewOffset),
-                    spec.byteSize
-                )
-
-                outputs[name] = outputBuffer
+                plans[i] = .copy(srcOffset: offset + viewOffset, size: spec.byteSize, label: name)
             } else if let offset = executable.memoryPlan.tensorOffsets[name] {
-                // Fall back to direct name lookup (non-view case)
-                let outputBuffer: MTLBuffer
-                if !zeroCopyOutputs, let pool = outputBufferPool, let pooled = pool.acquire(name) {
-                    outputBuffer = pooled
-                } else {
-                    guard let newBuffer = device.makeBuffer(
-                        length: spec.byteSize,
-                        options: .storageModeShared
-                    ) else {
-                        throw IntegratedExecutorError.bufferAllocationFailed(size: spec.byteSize)
-                    }
-                    if let label = config.debugLabel {
-                        newBuffer.label = "\(label)_output_\(name)"
-                    }
-                    outputBuffer = newBuffer
-                }
-
-                memcpy(
-                    outputBuffer.contents(),
-                    unifiedBuffer.contents().advanced(by: offset),
-                    spec.byteSize
-                )
-
-                outputs[name] = outputBuffer
+                plans[i] = .copy(srcOffset: offset, size: spec.byteSize, label: name)
             } else if let inputBuffer = inputs[name] {
-                // Output was written directly to input buffer (in-place)
-                outputs[name] = inputBuffer
+                // Output was written directly to input buffer (in-place).
+                plans[i] = .passthrough(inputBuffer)
             }
         }
 
+        // The 162-output handoff on a training step memcpy's ~130 MB out of the
+        // reused slab into fresh per-output buffers — the slab is memset+reused
+        // next step, so the copy can't be skipped without persistent output
+        // buffers. The copies are independent (disjoint destinations), and
+        // device.makeBuffer / memcpy are thread-safe, so run them concurrently.
+        // The pooled path (opt-in, METALHLO_ZEROCOPY_OUTPUTS=0) shares a
+        // non-thread-safe pool, so it stays serial.
+        let unifiedPtr = unifiedBuffer.contents()
+        let allocFailed = ManagedAtomicFlag()
+
+        // Resolves one output to its buffer. Pure per-index work (fresh alloc +
+        // memcpy, or in-place passthrough); returns the buffer so the caller
+        // writes it through a disjoint pointer slot — never mutates a shared
+        // Swift array from multiple threads.
+        func materialize(_ i: Int, pooled: Bool) -> MTLBuffer? {
+            switch plans[i] {
+            case .none:
+                return nil
+            case .passthrough(let buffer):
+                return buffer
+            case .copy(let srcOffset, let size, let label):
+                let outputBuffer: MTLBuffer
+                if pooled, let pool = outputBufferPool, let acquired = pool.acquire(label) {
+                    outputBuffer = acquired
+                } else {
+                    guard let newBuffer = device.makeBuffer(length: size, options: .storageModeShared) else {
+                        allocFailed.set()
+                        return nil
+                    }
+                    if let dbg = config.debugLabel { newBuffer.label = "\(dbg)_output_\(label)" }
+                    outputBuffer = newBuffer
+                }
+                memcpy(outputBuffer.contents(), unifiedPtr.advanced(by: srcOffset), size)
+                return outputBuffer
+            }
+        }
+
+        let results = [MTLBuffer?](unsafeUninitializedCapacity: entries.count) { buf, count in
+            count = entries.count
+            let base = buf.baseAddress!
+            if zeroCopyOutputs && entries.count > 1 {
+                // Each slot is initialized exactly once by one thread; disjoint
+                // pointer initialization is safe under concurrency.
+                DispatchQueue.concurrentPerform(iterations: entries.count) { i in
+                    (base + i).initialize(to: materialize(i, pooled: false))
+                }
+            } else {
+                for i in 0..<entries.count {
+                    (base + i).initialize(to: materialize(i, pooled: !zeroCopyOutputs))
+                }
+            }
+        }
+
+        if allocFailed.isSet {
+            throw IntegratedExecutorError.bufferAllocationFailed(size: 0)
+        }
+
+        var outputs: [String: MTLBuffer] = [:]
+        outputs.reserveCapacity(entries.count)
+        for (i, entry) in entries.enumerated() where results[i] != nil {
+            outputs[entry.0] = results[i]
+        }
         return outputs
+    }
+
+    /// Minimal lock-guarded flag for signalling a failure out of concurrentPerform.
+    private final class ManagedAtomicFlag: @unchecked Sendable {
+        private var flag = false
+        private let lock = NSLock()
+        func set() { lock.lock(); flag = true; lock.unlock() }
+        var isSet: Bool { lock.lock(); defer { lock.unlock() }; return flag }
     }
 
     /// Releases output buffers back to the pool for reuse.
