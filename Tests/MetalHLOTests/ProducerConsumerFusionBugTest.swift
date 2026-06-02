@@ -103,9 +103,11 @@ struct ProducerConsumerFusionBugFixTests {
         #expect(result.operations.count == 1, "Should be fused into single custom_call")
     }
 
-    /// Test that mixed regions (elementwise + reshape) are NOT fused as custom_call
-    @Test("Mixed regions with reshape should not be fused")
-    func mixedRegionsNotFused() throws {
+    /// reshape IS fusible into an elementwise chain: it is the identity in
+    /// linear-index space, so the chain codegen passes it through unchanged.
+    /// A `reshape → add` region therefore collapses to a single custom_call.
+    @Test("Reshape fuses into an elementwise chain")
+    func reshapeFusesIntoChain() throws {
         // Create a function that mixes reshape with elementwise ops
         let function = HLOFunction(
             name: "test",
@@ -135,9 +137,10 @@ struct ProducerConsumerFusionBugFixTests {
         let fusion = ProducerConsumerFusion(maxFusionSize: 50, emitCustomCalls: true)
         let result = fusion.fuse(function)
 
-        // The result should NOT contain a custom_call operation
-        // because the region includes reshape which is not elementwise
+        // reshape is the linear-index identity, so the region IS emitted as a
+        // single fused custom_call (reshape passed through, add applied).
         let hasCustomCall = result.operations.contains { $0.kind == HLOOpKind.customCall }
-        #expect(!hasCustomCall, "Mixed region with reshape should NOT be emitted as custom_call")
+        #expect(hasCustomCall, "reshape → add should fuse into a custom_call")
+        #expect(result.operations.count == 1, "Should collapse to a single fused op")
     }
 }

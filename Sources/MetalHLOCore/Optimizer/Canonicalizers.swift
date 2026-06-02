@@ -792,50 +792,89 @@ public final class TransposeMatmulFoldingPass: OptimizationPass, @unchecked Send
 
         var indicesToRemove: Set<Int> = []
 
+        // Swap any reference to position rank-2 with rank-1 (and vice versa)
+        // in a dimension list — the inverse of folding a last-two-dim matrix
+        // transpose into the dot's dimension numbers.
+        func swapLastTwo(_ dims: [Int], rank: Int) -> [Int] {
+            guard rank >= 2 else { return dims }
+            let a = rank - 2, b = rank - 1
+            return dims.map { $0 == a ? b : ($0 == b ? a : $0) }
+        }
+
         for (index, op) in operations.enumerated() {
             // Look for dot or dotGeneral operations
             guard op.kind == .dot || op.kind == .dotGeneral else { continue }
 
-            // Check if LHS or RHS comes from a transpose
+            // Check if LHS or RHS comes from a single-use matrix transpose.
             var newOperands = op.operands
             var newAttributes = op.attributes
             var didFold = false
 
-            // Check LHS (operand 0)
-            if let lhsDef = definingOps[op.operands[0]],
-               lhsDef.op.kind == .transpose,
-               useCount[lhsDef.op.result] == 1 {
-                // Check if this is a simple 2D transpose (swap last two dims)
-                if let perm = lhsDef.op.attributes.dimensions,
-                   isMatrixTranspose(perm) {
-                    // Fold: use original input and set transA flag
-                    newOperands[0] = lhsDef.op.operands[0]
-                    newAttributes.lhsTranspose = true
-                    indicesToRemove.insert(lhsDef.index)
-                    didFold = true
-                }
-            }
+            let lhsFold: (input: TensorID, rank: Int, removeIdx: Int)? = {
+                guard let def = definingOps[op.operands[0]], def.op.kind == .transpose,
+                      useCount[def.op.result] == 1,
+                      let perm = def.op.attributes.dimensions, isMatrixTranspose(perm)
+                else { return nil }
+                return (def.op.operands[0], perm.count, def.index)
+            }()
+            let rhsFold: (input: TensorID, rank: Int, removeIdx: Int)? = {
+                guard let def = definingOps[op.operands[1]], def.op.kind == .transpose,
+                      useCount[def.op.result] == 1,
+                      let perm = def.op.attributes.dimensions, isMatrixTranspose(perm)
+                else { return nil }
+                return (def.op.operands[0], perm.count, def.index)
+            }()
 
-            // Check RHS (operand 1)
-            if let rhsDef = definingOps[op.operands[1]],
-               rhsDef.op.kind == .transpose,
-               useCount[rhsDef.op.result] == 1 {
-                // Check if this is a simple 2D transpose (swap last two dims)
-                if let perm = rhsDef.op.attributes.dimensions,
-                   isMatrixTranspose(perm) {
-                    // Fold: use original input and set transB flag
-                    newOperands[1] = rhsDef.op.operands[0]
-                    newAttributes.rhsTranspose = true
-                    indicesToRemove.insert(rhsDef.index)
-                    didFold = true
+            // Fold by REWRITING the dimension numbers (swap the contract/batch
+            // dim references for the transposed side), NOT by stamping an
+            // lhsTranspose/rhsTranspose flag. The flag is a second, redundant
+            // representation that downstream layout-canonicalization clears
+            // without compensating — leaving dim numbers that index into the
+            // pre-transpose shape, which silently miscomputes the matmul (e.g.
+            // transpose(A)@B at O3). Baking the swap into the dims keeps the
+            // dot self-consistent regardless of later passes. Needs explicit
+            // dotDimensionNumbers; a plain `.dot` (implicit 2D) is the simple
+            // square/rect matmul case, default contract = [1]×[0].
+            if lhsFold != nil || rhsFold != nil {
+                let dd = op.attributes.dotDimensionNumbers ?? DotDimensionNumbers(
+                    lhsBatchingDimensions: [],
+                    rhsBatchingDimensions: [],
+                    lhsContractingDimensions: [1],
+                    rhsContractingDimensions: [0]
+                )
+                var lhsC = dd.lhsContractingDimensions
+                var lhsB = dd.lhsBatchingDimensions
+                var rhsC = dd.rhsContractingDimensions
+                var rhsB = dd.rhsBatchingDimensions
+                if let f = lhsFold {
+                    newOperands[0] = f.input
+                    lhsC = swapLastTwo(lhsC, rank: f.rank)
+                    lhsB = swapLastTwo(lhsB, rank: f.rank)
+                    indicesToRemove.insert(f.removeIdx)
                 }
+                if let f = rhsFold {
+                    newOperands[1] = f.input
+                    rhsC = swapLastTwo(rhsC, rank: f.rank)
+                    rhsB = swapLastTwo(rhsB, rank: f.rank)
+                    indicesToRemove.insert(f.removeIdx)
+                }
+                newAttributes.dotDimensionNumbers = DotDimensionNumbers(
+                    lhsBatchingDimensions: lhsB,
+                    rhsBatchingDimensions: rhsB,
+                    lhsContractingDimensions: lhsC,
+                    rhsContractingDimensions: rhsC
+                )
+                newAttributes.lhsTranspose = nil
+                newAttributes.rhsTranspose = nil
+                didFold = true
             }
 
             if didFold {
-                // Create new operation with folded transposes
+                // Emit as dotGeneral — the fold encodes the layout in explicit
+                // dimension numbers, which only dotGeneral carries.
                 let newOp = HLOOperation(
                     result: op.result,
-                    kind: op.kind,
+                    kind: .dotGeneral,
                     operands: newOperands,
                     resultType: op.resultType,
                     attributes: newAttributes
