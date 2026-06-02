@@ -159,7 +159,9 @@ struct CrossLayerFusionTests {
         let config = CrossLayerFusionPass.Config()
 
         #expect(config.enableBlockFusion == true)
-        #expect(config.enableResidualChainFusion == true)
+        // Off by default: the residual-chain fusion is incomplete (no kernel
+        // handler) and uses stale indices — it crashed/hung O3. See Config.
+        #expect(config.enableResidualChainFusion == false)
         #expect(config.enableKVCacheOptimization == true)
         #expect(config.enableMultiLayerPipelining == false)
         #expect(config.pipelineDepth == 2)

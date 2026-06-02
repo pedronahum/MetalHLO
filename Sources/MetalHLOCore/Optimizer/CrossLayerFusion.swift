@@ -134,8 +134,15 @@ public final class CrossLayerFusionPass: @unchecked Sendable {
         /// Enable transformer block fusion.
         public var enableBlockFusion: Bool = true
 
-        /// Enable residual chain optimization.
-        public var enableResidualChainFusion: Bool = true
+        /// Enable residual chain optimization. OFF: this fusion is incomplete
+        /// and unsafe — it emits `fused_residual_chain` custom_calls that have
+        /// NO kernel handler (so execution fails with a dangling encoder), and
+        /// it applies matches computed on the original op order to a function
+        /// that earlier fusions have already shrunk, so the indices go stale
+        /// (out of range → crash, or fusing the wrong ops). This was the O3
+        /// hang/crash on nanoGPT. Re-enable only once a real kernel exists and
+        /// matches are recomputed (or applied high-index-first).
+        public var enableResidualChainFusion: Bool = false
 
         /// Enable KV cache optimization.
         public var enableKVCacheOptimization: Bool = true
@@ -571,14 +578,19 @@ public final class CrossLayerFusionPass: @unchecked Sendable {
     }
 
     private func fuseResidualChain(_ match: CrossLayerMatch, in function: HLOFunction) -> HLOFunction {
-        // Combine consecutive residual adds
+        // Combine consecutive residual adds.
         guard match.operationIndices.count >= 2 else { return function }
 
+        // Defensive: matches are computed on the original op order, but earlier
+        // fusions in this pass may have already shrunk `function`, so an index
+        // can be stale / out of range. Skip rather than crash. (The residual
+        // chain fusion is disabled by default — see Config — but keep the guard
+        // so re-enabling it can't reintroduce the out-of-bounds.)
+        guard match.operationIndices.allSatisfy({ $0 >= 0 && $0 < function.operations.count }) else {
+            return function
+        }
         let ops = match.operationIndices.map { function.operations[$0] }
-
-        // Create fused residual operation
         let fusedOp = createFusedResidualOp(operations: ops)
-
         return replaceOperations(match.operationIndices, with: fusedOp, in: function)
     }
 
