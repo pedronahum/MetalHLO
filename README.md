@@ -1261,6 +1261,38 @@ Per-category JSON and Markdown reports are written to the directory passed via `
 - **Run-to-run variance.** Quick mode (3 warmup, 10 measurements) keeps total wall time around 30 seconds across all 7 categories but introduces ±10–15% noise on benchmarks under 1ms. The headline numbers (MAT-DOT-005, MLP-INF-005) are stable across repeated runs; small-shape numbers fluctuate.
 - **MLX is the ceiling, not the universal target.** MLX is a hand-tuned numerical library; matching it on every shape isn't the goal. MetalHLO's reason to exist is the optimizer + heterogeneous fusion that MLX doesn't have. The matmul work documented here is specifically about closing the kernel-throughput gap so the optimizer can compose with kernels that aren't slower than the alternatives users would otherwise reach for.
 
+#### End-to-End Training Gap (nanoGPT) — Investigation Status
+
+The microbenchmarks above are forward-only (inference), where pattern fusion is free to fold FFN / attention / LayerNorm into single kernels. The harder, ongoing target is a full **training step** — a 6-layer / 384-dim / 6-head nanoGPT (batch 16, seq 256, ~10.8 M params, char-level tinyshakespeare; `Examples/Benchmarks/nanogpt`) — where the reverse-mode autograd graph changes what fusion can do.
+
+**Where we stand (M5 Pro):** **74.4 ms/step vs MLX 59.5 ms (1.25×)**, down from 82.5 ms. The loss matches JAX CPU exactly at every step throughout.
+
+**Step composition.** GPU-busy is ~60.8 ms; the rest is host overhead (the per-step output handoff copy, command-buffer encode, PJRT / `.item()` sync). The pivotal fact: **GPU-busy alone already ≈ MLX's *entire* 59.5 ms step.** So the tractable headroom was the host overhead, not the GPU-side glue.
+
+**Landed (all loss-neutral):**
+- **Reshape-as-view** — a reshape of a contiguous source (a kernel output or input) aliases that buffer instead of running a copy kernel, with the memory planner keeping the source live across the view's readers. Eliminated ~95 kernels/step.
+- **Parallel output handoff** — the 162-output (~130 MB) copy out of the reused intermediate slab now runs concurrently instead of serially.
+- **Pipelined command buffers** — the ~900-kernel encode is split across command buffers committed incrementally, so the GPU runs chunk *k* while the CPU encodes chunk *k+1*.
+
+**Investigated, found bounded by reverse-mode autodiff** — three glue levers each profiled to a dead end:
+- **Rematerialization** — this MLP is ReLU (no expensive forward intermediate like a GELU `tanh(x³)` worth recomputing), and roughly half the standalone glue is *terminal gradient outputs* (return values, unfusable by anything).
+- **Transpose-into-matmul** — the simple `transA/transB` cases are already absorbed natively by the matmul path; the survivors are 4-D attention head-permutations that would need a strided-operand matmul kernel (unverified hardware surface, ~3 ms ceiling).
+- **Chain / reduce fusion** — the valuable same-shape chain merges are already done by producer-consumer fusion; the remaining chain boundaries are either *multi-use* (a forward value also consumed by the backward pass) or broadcast-shape-changes of a tiny reduced tensor (negligible traffic saved, adds recompute).
+
+The common root is structural: **reverse-mode AD materializes forward activations for the backward pass, making them multi-use** — which both breaks elementwise chains at every branch and makes forward pattern fusion (FFN / attention / LayerNorm) unsafe on the training graph, unlike the inference microbenchmarks above. With GPU-busy already at MLX's step time and matmul (~40 % of GPU) at the TF32 / matrix-coprocessor limit, the residual gap is systemic rather than a single missing optimization. nanoGPT runs at the default optimization level (the gpu-only codegen path), not -O3.
+
+**Reproduce / profile:**
+
+```bash
+# steady-state ms/step + final loss (compare against the JAX CPU baseline)
+python Examples/Benchmarks/nanogpt/main.py --backend metalhlo --steps 30 --skip-inference
+python Examples/Benchmarks/nanogpt/main.py --backend cpu       --steps 30 --skip-inference
+
+METALHLO_PROFILE_GPU=1    ...   # GPU-busy vs wall-clock per step
+METALHLO_PROFILE_PER_OP=1 ...   # per-kernel-type GPU share
+METALHLO_PIPELINE_CHUNK=0 ...   # disable encode pipelining (single command buffer)
+```
+
 ### Backend Win Summary
 
 Overall wins across all 67 passing benchmarks:
