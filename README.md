@@ -18,7 +18,7 @@ MetalHLO is a fully-functional JAX backend for Apple Silicon. **130 tests across
 | `jax.checkpoint` / `jax.remat`, `jax.lax.optimization_barrier` | [OptimizationBarrierTest.swift](Tests/MetalHLOCoreTests/OptimizationBarrierTest.swift) |
 | `jax.lax.top_k`, `jnp.argmax` / `argmin` (in-`jit`), `jnp.cumsum` / `cumprod` / `cummax` / `cumlogsumexp`, `jnp.arctan2`, `jax.lax.reduce_precision`, `jnp.searchsorted` | [Tests/MetalHLOCoreTests](Tests/MetalHLOCoreTests) |
 | `jax.lax.switch` (multi-branch), `jax.lax.cond` | [CaseSwitchTest.swift](Tests/MetalHLOCoreTests/CaseSwitchTest.swift) |
-| `jax.scipy.linalg.cholesky` / `solve_triangular` (routed from JAX's LAPACK FFI), `jax.lax.lgamma` / `digamma` / `erf` | [LapackRoutingTest.swift](Tests/MetalHLOCoreTests/LapackRoutingTest.swift) |
+| `jax.scipy.linalg.cholesky` / `solve_triangular`, `jnp.linalg.svd` / `qr` / `eigh` (routed from JAX's LAPACK FFI to Accelerate), `jax.lax.lgamma` / `digamma` / `erf` | [LapackRoutingTest.swift](Tests/MetalHLOCoreTests/LapackRoutingTest.swift) |
 | `jax.random` — bit-exact threefry2x32 (`bits`/`uniform` match JAX CPU exactly) | [ThreefryRngTest.swift](Tests/MetalHLOCoreTests/ThreefryRngTest.swift) |
 | `jax.debug.print` / `jax.debug.callback` (side-effect-only host callbacks) | [HostCallbackTest.swift](Tests/MetalHLOCoreTests/HostCallbackTest.swift) |
 
@@ -47,8 +47,7 @@ MetalHLO is a fully-functional JAX backend for Apple Silicon. **130 tests across
 ### Known limitations
 
 - **`jax.random.normal`**: the underlying threefry2x32 *bits* match JAX bit-for-bit (so `jax.random.bits`/`uniform` are exact), but `normal` diverges by ~2.4e-7 from the downstream `ndtri` inverse-CDF rounding in fp32 — not the RNG itself.
-- **`jnp.linalg.svd` / `qr` / `eigh`**: not implemented — these lower to LAPACK FFI `custom_call`s (`@lapack_sgesdd_ffi`, `@lapack_sgeqrf_ffi`, `@lapack_ssyevd_ffi`) with no native equivalent yet. (`cholesky` and `solve_triangular` *are* supported.) `triangular_solve` with `left_side=false` (`x·A=b`) is also not yet implemented.
-- **`jnp.unique`**: not supported — its deep nested-call lowering (`lexsort` + `cumsum` + masking helpers kept as separate functions) exposes a limitation in cross-function operand remapping; fails rather than returning wrong values.
+- **`jnp.sort` / `argsort` / `lexsort` / `jnp.unique`**: not yet supported end-to-end. JAX's `sort` lowering (a comparator-region sort with a `dimension : i64` annotation) isn't parsed on the fast codegen path, and that path has no stable-sort kernel that returns the permutation indices these ops need (MPSGraph's single-key `sort` returns values only). They fail with a clear error rather than wrong results. (`top_k` and `searchsorted`, which need only partial/looked-up order, *are* supported.) `triangular_solve` with `left_side=false` (`x·A=b`) is also not yet implemented.
 - **Sharding** (`pjit` with mesh, `shard_map`, `nn.partitioning`): not supported — MetalHLO is single-device. Multi-device SPMD modules (`num_partitions`/`num_replicas > 1`) now fail loudly at parse time rather than silently running unpartitioned; single-device meshes pass through.
 - **Host callbacks**: `jax.debug.print` / `jax.debug.callback` work (the side effect is dropped, numerics are exact); `pure_callback` / `io_callback` are unsupported (they feed host values back into the graph and need round-trip infrastructure) and fail loudly.
 - **Multi-step CNN training**: step 0 matches CPU exactly; subsequent steps may drift up to ~0.1 absolute (test absorbs with `rtol=1e-1`). Residual is in MPSGraph's internal small-op fusion. (The RNG path is now JAX-bit-exact, removing one prior source of divergence.)
@@ -521,7 +520,7 @@ MetalHLO's optimization pipeline runs in phases, inspired by XLA's approach:
 | **Reduction** | reduce (sum, max, min, mean), reduce_window, argmax/argmin, cumulative_sum (cumsum/cumprod/cummax/cumlogsumexp) |
 | **Normalization** | batch_norm_inference, batch_norm_training, batch_norm_grad |
 | **FFT** | fft (FFT, IFFT, RFFT, IRFFT) |
-| **Sorting** | sort, top_k (values + indices), searchsorted |
+| **Sorting** | sort (single-key, MPSGraph path), top_k (values + indices), searchsorted |
 | **Special Functions** | erf, lgamma, digamma (chlo composites, legalized to stablehlo) |
 | **Comparison** | compare (EQ, NE, LT, LE, GT, GE), select, clamp |
 | **Indexing** | slice, pad, concatenate, gather, scatter |
@@ -533,15 +532,18 @@ MetalHLO's optimization pipeline runs in phases, inspired by XLA's approach:
 | **Select/Scatter** | select_and_scatter |
 | **Custom Calls** | fused_scaled_dot_product_attention, fused_depth_attention, fused_layer_norm, fused_rms_norm, fused_matmul_bias_activation, fused_softmax, fused_gelu, fused_rope |
 
-### Linear Algebra (implemented on the MPSGraph path)
+### Linear Algebra
 
-| Operation | Notes |
-|-----------|-------|
-| `triangular_solve` | Forward/back substitution in MPSGraph ops (`left_side=true`) |
-| `cholesky` | Cholesky–Banachiewicz recurrence in MPSGraph ops; honors `lower` |
-| `map` | Element-wise region inlined over broadcast inputs |
+| Operation | Backend | Notes |
+|-----------|---------|-------|
+| `triangular_solve` | MPSGraph | Forward/back substitution (`left_side=true`) |
+| `cholesky` | MPSGraph | Cholesky–Banachiewicz recurrence; honors `lower` |
+| `svd` | Accelerate (host) | `@lapack_sgesdd_ffi` → host `sgesdd`; full/thin |
+| `qr` | Accelerate (host) | `@lapack_sgeqrf_ffi` + `@lapack_sorgqr_ffi` → host; reduced/complete |
+| `eigh` | Accelerate (host) | `@lapack_ssyevd_ffi` → host `ssyevd`; honors UPLO |
+| `map` | MPSGraph | Element-wise region inlined over broadcast inputs |
 
-`cholesky` and `triangular_solve` are reachable end-to-end from JAX: `jax.scipy.linalg.cholesky` / `solve_triangular` lower (on CPU) to LAPACK FFI `custom_call`s (`@lapack_spotrf_ffi` / `@lapack_strsm_ffi`), which the parser decodes (uplo/side/trans/diag) and routes to these native implementations. `svd`, `qr`, and `eigh` (their `@lapack_sgesdd_ffi` / `@lapack_sgeqrf_ffi` / `@lapack_ssyevd_ffi` custom_calls) are not yet implemented (see [Known limitations](#known-limitations)).
+The full dense `jnp.linalg` / `jax.scipy.linalg` surface is reachable end-to-end from JAX. JAX-on-CPU lowers these to LAPACK FFI `custom_call`s; the parser decodes each (uplo/side/trans/diag) and routes it either to a native MPSGraph implementation (`cholesky`, `triangular_solve`) or to the real LAPACK in Apple's Accelerate framework run host-side over the shared unified-memory buffers (`svd`, `qr`, `eigh`) — the same library JAX-CPU itself calls. Verified against JAX CPU by reconstruction (`U·diag(S)·Vᵀ`, `Q·R`, `v·diag(w)·vᵀ`).
 
 ### Excluded by Design (14 ops)
 
