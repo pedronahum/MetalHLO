@@ -209,6 +209,13 @@ public enum HLOOpKind: String, CaseIterable, Sendable {
     /// StableHLO slice/select wrapper masks it to R).
     case qr
 
+    /// Symmetric/Hermitian eigendecomposition (A = v·diag(w)·vᵀ). Routed from the
+    /// `@lapack_ssyevd_ffi` custom_call and executed host-side via Accelerate
+    /// LAPACK. An `.eigh` op carries a component tag in `tupleIndex`: 0 = w
+    /// (eigenvalues, ascending), 1 = v (eigenvectors, one per column). The `lower`
+    /// attribute records the UPLO triangle the routine reads.
+    case eigh
+
     // MARK: - Normalization Operations (3 ops)
 
     /// Batch normalization for inference.
@@ -494,7 +501,7 @@ extension HLOOpKind {
              .not, .clz, .convert, .reshape, .transpose, .broadcastInDim,
              .iota, .tan, .logistic, .isFinite, .reverse, .fft, .sort,
              .expm1, .log1p, .cbrt, .roundNearestAfz, .roundNearestEven,
-             .popcnt, .real, .imag, .cholesky, .svd, .qr, .bitcastConvert, .reducePrecision,
+             .popcnt, .real, .imag, .cholesky, .svd, .qr, .eigh, .bitcastConvert, .reducePrecision,
              .topKValues, .topKIndices, .reduceArg:
             return .exactly(1)
 

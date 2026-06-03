@@ -357,4 +357,130 @@ struct LinalgMPSTests {
         let R = try outputs[1].toFloatArray()
         checkQR(A: aData, m: 4, n: 3, Q: Q, R: R, qCols: 4)
     }
+
+    // Verifies an eigh result: eigenvalues w match the reference (ascending) and
+    // the reconstruction v·diag(w)·vᵀ ≈ A. Eigenvector signs are convention-
+    // dependent, so we never compare raw eigenvectors — only w and the
+    // reconstruction. A is symmetric N×N, w is length N, v is N×N (columns are
+    // eigenvectors, row-major).
+    private func checkEigh(
+        A: [Float], n: Int, w: [Float], v: [Float], expectedW: [Float]
+    ) {
+        #expect(w.count == n, "w has \(w.count) elems, want \(n)")
+        #expect(v.count == n * n, "v has \(v.count) elems, want \(n * n)")
+
+        // Eigenvalues ascending and matching the reference.
+        for i in 0..<(n - 1) {
+            #expect(w[i] <= w[i + 1] + 1e-4, "eigenvalues not ascending at \(i): \(w)")
+        }
+        for i in 0..<n {
+            #expect(abs(w[i] - expectedW[i]) < 1e-3,
+                    "eigh w[\(i)] got \(w[i]), want \(expectedW[i])")
+        }
+
+        // Reconstruct A = v·diag(w)·vᵀ  (v column = eigenvector, row-major).
+        for i in 0..<n {
+            for j in 0..<n {
+                var acc: Float = 0
+                for k in 0..<n { acc += v[i * n + k] * w[k] * v[j * n + k] }
+                #expect(abs(acc - A[i * n + j]) < 1e-3,
+                        "eigh recon[\(i),\(j)] got \(acc), want \(A[i * n + j])")
+            }
+        }
+    }
+
+    // Symmetric eigendecomposition of a 3×3 matrix, lowered exactly as JAX-CPU
+    // emits it: the matrix is symmetrized ((A + Aᵀ)/2) then passed to a single
+    // @lapack_ssyevd_ffi custom_call (mode 86 = 'V', uplo 76 = 'L') wrapped in the
+    // info-check select chain. Routed to native .eigh ops and executed host-side
+    // via Accelerate LAPACK. Verified by w (ascending) + reconstruction.
+    @Test("eigh of a symmetric 3x3 matrix (host LAPACK)")
+    func eighSym3x3() throws {
+        let client = try Client.create()
+        let mlir = """
+        module @jit_eigh {
+          func.func public @main(%arg0: tensor<3x3xf32>) -> (tensor<3xf32>, tensor<3x3xf32>) {
+            %t = stablehlo.transpose %arg0, dims = [1, 0] : (tensor<3x3xf32>) -> tensor<3x3xf32>
+            %s = stablehlo.add %arg0, %t : tensor<3x3xf32>
+            %two = stablehlo.constant dense<2.000000e+00> : tensor<f32>
+            %twob = stablehlo.broadcast_in_dim %two, dims = [] : (tensor<f32>) -> tensor<3x3xf32>
+            %a = stablehlo.divide %s, %twob : tensor<3x3xf32>
+            %0:3 = stablehlo.custom_call @lapack_ssyevd_ffi(%a) {backend_config = "", mhlo.backend_config = {mode = 86 : ui8, uplo = 76 : ui8}, operand_layouts = [dense<[0, 1]> : tensor<2xindex>], result_layouts = [dense<[0, 1]> : tensor<2xindex>, dense<0> : tensor<1xindex>, dense<> : tensor<0xindex>]} : (tensor<3x3xf32>) -> (tensor<3x3xf32>, tensor<3xf32>, tensor<i32>)
+            %c = stablehlo.constant dense<0> : tensor<i32>
+            %1 = stablehlo.broadcast_in_dim %c, dims = [] : (tensor<i32>) -> tensor<i32>
+            %2 = stablehlo.compare EQ, %0#2, %1, SIGNED : (tensor<i32>, tensor<i32>) -> tensor<i1>
+            %3 = stablehlo.broadcast_in_dim %2, dims = [] : (tensor<i1>) -> tensor<1x1xi1>
+            %cst = stablehlo.constant dense<0x7FC00000> : tensor<f32>
+            %4 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<3x3xf32>
+            %5 = stablehlo.broadcast_in_dim %3, dims = [0, 1] : (tensor<1x1xi1>) -> tensor<3x3xi1>
+            %6 = stablehlo.select %5, %0#0, %4 : tensor<3x3xi1>, tensor<3x3xf32>
+            %7 = stablehlo.broadcast_in_dim %2, dims = [] : (tensor<i1>) -> tensor<1xi1>
+            %cst_0 = stablehlo.constant dense<0x7FC00000> : tensor<f32>
+            %8 = stablehlo.broadcast_in_dim %cst_0, dims = [] : (tensor<f32>) -> tensor<3xf32>
+            %9 = stablehlo.broadcast_in_dim %7, dims = [0] : (tensor<1xi1>) -> tensor<3xi1>
+            %10 = stablehlo.select %9, %0#1, %8 : tensor<3xi1>, tensor<3xf32>
+            return %10, %6 : tensor<3xf32>, tensor<3x3xf32>
+          }
+        }
+        """
+        let executable = try client.compile(mlir)
+        // Symmetric A (3×3): diag(2,3,4) + small off-diagonal coupling.
+        //   A = [[2,1,0],[1,3,1],[0,1,4]]
+        let aData: [Float] = [2, 1, 0, 1, 3, 1, 0, 1, 4]
+        let a = try client.createBuffer(aData, shape: [3, 3], elementType: .float32)
+        let outputs = try executable.execute([a])
+        let w = try outputs[0].toFloatArray()   // 3
+        let v = try outputs[1].toFloatArray()   // 3×3
+        // Reference eigenvalues (NumPy/LAPACK, ascending) for the matrix above.
+        let expectedW: [Float] = [1.2679492, 3.0, 4.732051]
+        checkEigh(A: aData, n: 3, w: w, v: v, expectedW: expectedW)
+    }
+
+    // Symmetric eigendecomposition of a 4×4 matrix, upper triangle (uplo 85 = 'U').
+    // Same lowering shape as the 3×3 case at N = 4.
+    @Test("eigh of a symmetric 4x4 matrix, upper (host LAPACK)")
+    func eighSym4x4Upper() throws {
+        let client = try Client.create()
+        let mlir = """
+        module @jit_eigh {
+          func.func public @main(%arg0: tensor<4x4xf32>) -> (tensor<4xf32>, tensor<4x4xf32>) {
+            %t = stablehlo.transpose %arg0, dims = [1, 0] : (tensor<4x4xf32>) -> tensor<4x4xf32>
+            %s = stablehlo.add %arg0, %t : tensor<4x4xf32>
+            %two = stablehlo.constant dense<2.000000e+00> : tensor<f32>
+            %twob = stablehlo.broadcast_in_dim %two, dims = [] : (tensor<f32>) -> tensor<4x4xf32>
+            %a = stablehlo.divide %s, %twob : tensor<4x4xf32>
+            %0:3 = stablehlo.custom_call @lapack_ssyevd_ffi(%a) {backend_config = "", mhlo.backend_config = {mode = 86 : ui8, uplo = 85 : ui8}, operand_layouts = [dense<[0, 1]> : tensor<2xindex>], result_layouts = [dense<[0, 1]> : tensor<2xindex>, dense<0> : tensor<1xindex>, dense<> : tensor<0xindex>]} : (tensor<4x4xf32>) -> (tensor<4x4xf32>, tensor<4xf32>, tensor<i32>)
+            %c = stablehlo.constant dense<0> : tensor<i32>
+            %1 = stablehlo.broadcast_in_dim %c, dims = [] : (tensor<i32>) -> tensor<i32>
+            %2 = stablehlo.compare EQ, %0#2, %1, SIGNED : (tensor<i32>, tensor<i32>) -> tensor<i1>
+            %3 = stablehlo.broadcast_in_dim %2, dims = [] : (tensor<i1>) -> tensor<1x1xi1>
+            %cst = stablehlo.constant dense<0x7FC00000> : tensor<f32>
+            %4 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<4x4xf32>
+            %5 = stablehlo.broadcast_in_dim %3, dims = [0, 1] : (tensor<1x1xi1>) -> tensor<4x4xi1>
+            %6 = stablehlo.select %5, %0#0, %4 : tensor<4x4xi1>, tensor<4x4xf32>
+            %7 = stablehlo.broadcast_in_dim %2, dims = [] : (tensor<i1>) -> tensor<1xi1>
+            %cst_0 = stablehlo.constant dense<0x7FC00000> : tensor<f32>
+            %8 = stablehlo.broadcast_in_dim %cst_0, dims = [] : (tensor<f32>) -> tensor<4xf32>
+            %9 = stablehlo.broadcast_in_dim %7, dims = [0] : (tensor<1xi1>) -> tensor<4xi1>
+            %10 = stablehlo.select %9, %0#1, %8 : tensor<4xi1>, tensor<4xf32>
+            return %10, %6 : tensor<4xf32>, tensor<4x4xf32>
+          }
+        }
+        """
+        let executable = try client.compile(mlir)
+        // Symmetric tridiagonal A (4×4): diag 2..5 with unit off-diagonal coupling.
+        let aData: [Float] = [
+            2, 1, 0, 0,
+            1, 3, 1, 0,
+            0, 1, 4, 1,
+            0, 0, 1, 5,
+        ]
+        let a = try client.createBuffer(aData, shape: [4, 4], elementType: .float32)
+        let outputs = try executable.execute([a])
+        let w = try outputs[0].toFloatArray()
+        let v = try outputs[1].toFloatArray()
+        // Reference eigenvalues (LAPACK, ascending).
+        let expectedW: [Float] = [1.2547188, 2.8227172, 4.177283, 5.745281]
+        checkEigh(A: aData, n: 4, w: w, v: v, expectedW: expectedW)
+    }
 }

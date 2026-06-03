@@ -63,6 +63,16 @@ public final class MPSGraphCompiler {
             return try buildHostLinalgGraph(function: function, hostQrShortcut: qrShortcut)
         }
 
+        // Detect host-eigh shortcut: a `jnp.linalg.eigh` function lowers to one
+        // `@lapack_ssyevd_ffi` custom_call (routed to native `.eigh` ops by the
+        // parser) wrapped in an info-check that is a no-op when info == 0. MPSGraph
+        // has no symmetric-eigendecomposition kernel, so the whole function — w and
+        // v — is computed host-side via Accelerate LAPACK against the shared
+        // unified-memory input buffer.
+        if let eighShortcut = Self.detectHostEighShortcut(function: function) {
+            return try buildHostLinalgGraph(function: function, hostEighShortcut: eighShortcut)
+        }
+
         // Detect Flash Attention shortcut: if the function is a single SDPA op with
         // direct function inputs, we can bypass MPSGraph at execution time and run
         // FlashAttentionTiledKernel directly against the input MTLBuffers.
@@ -256,9 +266,11 @@ public final class MPSGraphCompiler {
         function: HLOFunction,
         inputIndex: Int? = nil,
         hostSvdShortcut: HostSvdShortcut? = nil,
-        hostQrShortcut: HostQrShortcut? = nil
+        hostQrShortcut: HostQrShortcut? = nil,
+        hostEighShortcut: HostEighShortcut? = nil
     ) throws -> CompiledGraph {
-        let matrixIndex = inputIndex ?? hostQrShortcut?.inputIndex ?? 0
+        let matrixIndex = inputIndex ?? hostQrShortcut?.inputIndex
+            ?? hostEighShortcut?.inputIndex ?? 0
         var inputTensors: [MPSGraphTensor] = []
         for input in function.inputs {
             let placeholder = graph.placeholder(
@@ -301,6 +313,7 @@ public final class MPSGraphCompiler {
         )
         compiled.hostSvdShortcut = hostSvdShortcut
         compiled.hostQrShortcut = hostQrShortcut
+        compiled.hostEighShortcut = hostEighShortcut
         return compiled
     }
 
@@ -382,6 +395,102 @@ public final class MPSGraphCompiler {
             rows: rows,
             cols: cols,
             qColumns: qCols,
+            outputComponents: outputComponents
+        )
+    }
+
+    /// Detects whether the function is a `jnp.linalg.eigh` decomposition that can
+    /// be executed host-side via Accelerate LAPACK.
+    ///
+    /// Conditions (mirroring the SVD detector):
+    /// - The body contains `.eigh` ops (parser-routed from `@lapack_ssyevd_ffi`).
+    /// - All `.eigh` ops read the same single direct function input (matrix A,
+    ///   already symmetrized by the `(A + Aᵀ)/2` lowering preamble — but we read
+    ///   the raw function input and symmetrize again host-side for robustness).
+    /// - Every function return value traces back — through the info-check
+    ///   select/broadcast wrapper — to one of the `.eigh` results, so the program
+    ///   output is exactly (w, v) in some order.
+    private static func detectHostEighShortcut(function: HLOFunction) -> HostEighShortcut? {
+        let eighOps = function.operations.filter { $0.kind == .eigh }
+        guard !eighOps.isEmpty else { return nil }
+
+        // All eigh components must read the same operand.
+        guard let eighInput = eighOps.first?.operands.first,
+              eighOps.allSatisfy({ $0.operands.first == eighInput })
+        else { return nil }
+
+        // Producer index for tracing values back to a function input.
+        var producer: [String: HLOOperation] = [:]
+        for op in function.operations { producer[op.result] = op }
+        let inputNames = function.inputs.map { $0.name }
+
+        // The eigh operand is the symmetrized matrix `(A + Aᵀ)/2`, not the raw
+        // function input. Trace it back through that symmetrize preamble
+        // (transpose / add / divide / broadcast / multiply / convert) to the
+        // underlying function input A; the host executor re-symmetrizes A itself,
+        // so we only need the input index and shape.
+        func traceToInput(_ name: String, depth: Int = 0) -> Int? {
+            if depth > 64 { return nil }
+            if let idx = inputNames.firstIndex(of: name) { return idx }
+            guard let op = producer[name] else { return nil }
+            switch op.kind {
+            case .transpose, .add, .divide, .multiply, .broadcastInDim, .convert, .subtract:
+                for operand in op.operands {
+                    if let idx = traceToInput(operand, depth: depth + 1) { return idx }
+                }
+                return nil
+            default:
+                return nil
+            }
+        }
+        guard let inputIndex = traceToInput(eighInput) else { return nil }
+
+        // Input matrix shape (N×N).
+        let inShape = function.inputs[inputIndex].type.shape
+        guard inShape.count == 2, inShape[0] == inShape[1] else { return nil }
+        let n = inShape[0]
+
+        // UPLO triangle the routine reads (decoded from the backend_config `uplo`
+        // byte onto `.lower`). The lowering symmetrizes A first, so the values are
+        // independent of this; we honor it anyway when reading the triangle.
+        let lower = eighOps.first?.attributes.lower ?? true
+
+        // Map each `.eigh` result name → its component (0 = w, 1 = v).
+        var eighResultComponent: [String: Int] = [:]
+        for op in eighOps { eighResultComponent[op.result] = op.attributes.tupleIndex ?? 0 }
+
+        // Trace a value back through the info-check wrapper (select / broadcast /
+        // convert / reshape / transpose — all identity on the value path here) to
+        // the eigh component it ultimately carries.
+        func componentFor(_ name: String, depth: Int = 0) -> Int? {
+            if depth > 64 { return nil }
+            if let comp = eighResultComponent[name] { return comp }
+            guard let op = producer[name] else { return nil }
+            switch op.kind {
+            case .select:
+                // select(pred, on_true=value, on_false=NaN-fill): the real value is
+                // on_true (operand index 1).
+                guard op.operands.count >= 2 else { return nil }
+                return componentFor(op.operands[1], depth: depth + 1)
+            case .broadcastInDim, .convert, .reshape, .transpose:
+                guard let first = op.operands.first else { return nil }
+                return componentFor(first, depth: depth + 1)
+            default:
+                return nil
+            }
+        }
+
+        var outputComponents: [Int] = []
+        for ret in function.returnValues {
+            guard let comp = componentFor(ret) else { return nil }
+            outputComponents.append(comp)
+        }
+        guard !outputComponents.isEmpty else { return nil }
+
+        return HostEighShortcut(
+            inputIndex: inputIndex,
+            n: n,
+            lower: lower,
             outputComponents: outputComponents
         )
     }
@@ -657,6 +766,13 @@ public final class MPSGraphCompiler {
             // match the expected shape. Fail loudly rather than emit wrong math.
             throw CompilationError.unsupportedOperation(
                 "qr reached MPSGraph compile — expected host-QR shortcut to handle the whole function")
+        case .eigh:
+            // eigh runs host-side via the hostEighShortcut path; the whole function
+            // is detected and bypassed before the graph is built, so reaching the
+            // MPSGraph compiler here means the surrounding info-check wrapper did not
+            // match the expected shape. Fail loudly rather than emit wrong math.
+            throw CompilationError.unsupportedOperation(
+                "eigh reached MPSGraph compile — expected host-eigh shortcut to handle the whole function")
 
         // Normalization
         case .batchNormInference:
@@ -5389,6 +5505,10 @@ public struct CompiledGraph: @unchecked Sendable {
     /// If non-nil, the function is a `jnp.linalg.qr` decomposition executed
     /// host-side via Accelerate LAPACK. MetalExecutor bypasses MPSGraph entirely.
     public var hostQrShortcut: HostQrShortcut? = nil
+
+    /// If non-nil, the function is a `jnp.linalg.eigh` decomposition executed
+    /// host-side via Accelerate LAPACK. MetalExecutor bypasses MPSGraph entirely.
+    public var hostEighShortcut: HostEighShortcut? = nil
 }
 
 // MARK: - HostSvdShortcut
@@ -5438,6 +5558,32 @@ public struct HostQrShortcut: Sendable {
     public let qColumns: Int
     /// Output ordering: for each function return value, which QR component
     /// (0 = Q, 1 = R) it carries. Lets the executor emit outputs in the exact
+    /// order the program returns them.
+    public let outputComponents: [Int]
+}
+
+// MARK: - HostEighShortcut
+
+/// Metadata for executing a `jnp.linalg.eigh` function host-side via Accelerate
+/// LAPACK (`ssyevd`), bypassing MPSGraph (which has no symmetric-eigendecomposition
+/// kernel).
+///
+/// JAX lowers `jnp.linalg.eigh(A)` to a single `@lapack_ssyevd_ffi(A)` custom_call
+/// (routed to native `.eigh` ops by the parser) wrapped in an info-check select
+/// chain that is a no-op for the well-conditioned symmetric inputs LAPACK succeeds
+/// on. The whole function reduces to: read A, run the eigendecomposition, return
+/// w (eigenvalues, ascending) and v (eigenvectors, one per column).
+public struct HostEighShortcut: Sendable {
+    /// Index into the executor's input array for the matrix A.
+    public let inputIndex: Int
+    /// Order of the square matrix A (N×N).
+    public let n: Int
+    /// UPLO triangle the routine reads: `true` = lower, `false` = upper. The
+    /// lowering symmetrizes A first so the values are independent of this; it is
+    /// honored when forming the symmetric work matrix host-side.
+    public let lower: Bool
+    /// Output ordering: for each function return value, which eigh component
+    /// (0 = w, 1 = v) it carries. Lets the executor emit outputs in the exact
     /// order the program returns them.
     public let outputComponents: [Int]
 }

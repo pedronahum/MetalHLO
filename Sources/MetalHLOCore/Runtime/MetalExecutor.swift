@@ -217,6 +217,11 @@ public final class MetalExecutor: @unchecked Sendable {
             return try executeHostQr(shortcut: qr, inputs: inputs)
         }
 
+        // Host path: jnp.linalg.eigh executed via Accelerate LAPACK (ssyevd).
+        if let eigh = compiled.hostEighShortcut {
+            return try executeHostEigh(shortcut: eigh, inputs: inputs)
+        }
+
         // Fast path: embedded attention split — pre MPSGraph → Flash Attention → post MPSGraph.
         if let split = compiled.embeddedAttentionSplit {
             if let result = try? executeEmbeddedAttentionSplit(split: split, inputs: inputs) {
@@ -645,6 +650,97 @@ public final class MetalExecutor: @unchecked Sendable {
             case 1: outputs.append(rStorage)   // R
             default:
                 throw ExecutorError.generalError("Host QR: unknown output component \(comp)")
+            }
+        }
+
+        let end = CFAbsoluteTimeGetCurrent()
+        let timing = ExecutionTiming(encodeTime: 0, gpuTime: end - start, totalTime: end - start)
+        return (outputs, timing)
+    }
+
+    /// Executes a `jnp.linalg.eigh` symmetric eigendecomposition host-side via
+    /// Accelerate LAPACK (`ssyevd`, `jobz = 'V'`), mirroring how JAX-CPU itself
+    /// lowers eigh.
+    ///
+    /// A = v·diag(w)·vᵀ with A an N×N symmetric matrix. `ssyevd` returns the
+    /// eigenvalues `w` in ascending order and the orthonormal eigenvectors as the
+    /// columns of the (overwritten) `a` buffer.
+    ///
+    /// Marshalling: StableHLO is row-major, LAPACK column-major. The input is
+    /// symmetric (the lowering computes `(A + Aᵀ)/2` before the custom_call), so we
+    /// additionally symmetrize host-side for robustness, then the row-major bytes
+    /// read as column-major are the same symmetric matrix. `ssyevd` writes the
+    /// eigenvectors as columns in column-major order; transposing that buffer to
+    /// row-major yields JAX's `v` (one eigenvector per column, row-major).
+    private func executeHostEigh(
+        shortcut: HostEighShortcut,
+        inputs: [BufferStorage]
+    ) throws -> ([BufferStorage], ExecutionTiming) {
+        let start = CFAbsoluteTimeGetCurrent()
+
+        guard shortcut.inputIndex < inputs.count else {
+            throw ExecutorError.inputMismatch(expected: shortcut.inputIndex + 1, got: inputs.count)
+        }
+        let input = inputs[shortcut.inputIndex]
+        let N = shortcut.n
+
+        // Read the row-major input and build a symmetric column-major work buffer.
+        // For a symmetric matrix the row-major and column-major layouts coincide,
+        // so a[i + j*N] = (src[i*N+j] + src[j*N+i]) / 2 is both the symmetrized
+        // value and the correct column-major placement.
+        var a = [Float](repeating: 0, count: N * N)
+        input.withUnsafeBytes { raw in
+            let src = raw.bindMemory(to: Float.self)
+            for i in 0..<N {
+                for j in 0..<N {
+                    a[i + j * N] = 0.5 * (src[i * N + j] + src[j * N + i])
+                }
+            }
+        }
+
+        var jobz = Int8(UInt8(ascii: "V"))           // compute eigenvalues + eigenvectors
+        var uplo = Int8(UInt8(ascii: shortcut.lower ? "L" : "U"))
+        var ln = __CLPK_integer(N)
+        var lda = __CLPK_integer(N)
+        var w = [Float](repeating: 0, count: N)
+        var info = __CLPK_integer(0)
+
+        // Workspace query (lwork = liwork = -1) then the real factorization.
+        var wkopt = Float(0)
+        var iwkopt = __CLPK_integer(0)
+        var lwork = __CLPK_integer(-1)
+        var liwork = __CLPK_integer(-1)
+        ssyevd_(&jobz, &uplo, &ln, &a, &lda, &w, &wkopt, &lwork, &iwkopt, &liwork, &info)
+        lwork = __CLPK_integer(wkopt)
+        liwork = iwkopt
+        var work = [Float](repeating: 0, count: Int(max(1, lwork)))
+        var iwork = [__CLPK_integer](repeating: 0, count: Int(max(1, liwork)))
+        ssyevd_(&jobz, &uplo, &ln, &a, &lda, &w, &work, &lwork, &iwork, &liwork, &info)
+
+        guard info == 0 else {
+            throw ExecutorError.generalError("LAPACK ssyevd failed with info=\(info)")
+        }
+
+        // Transpose the column-major eigenvector matrix to row-major: JAX's `v`
+        // has one eigenvector per column, so v[row, col] = a_colmajor[row + col*N].
+        var v = [Float](repeating: 0, count: N * N)
+        for row in 0..<N {
+            for col in 0..<N {
+                v[row * N + col] = a[row + col * N]
+            }
+        }
+
+        let wStorage = BufferStorage(floatData: w, shape: [N], device: device)
+        let vStorage = BufferStorage(floatData: v, shape: [N, N], device: device)
+
+        // Emit outputs in the exact order the function returns them.
+        var outputs: [BufferStorage] = []
+        for comp in shortcut.outputComponents {
+            switch comp {
+            case 0: outputs.append(wStorage)   // eigenvalues (ascending)
+            case 1: outputs.append(vStorage)   // eigenvectors (columns)
+            default:
+                throw ExecutorError.generalError("Host eigh: unknown output component \(comp)")
             }
         }
 

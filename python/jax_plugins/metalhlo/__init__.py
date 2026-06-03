@@ -90,6 +90,10 @@ def _register_linalg_lowerings():
     each with a CPU-only lowering; `qr_p` itself has no platform lowering. Copying
     those two CPU entries makes a jit'd qr emit the LAPACK FFI custom_calls the
     Swift compiler routes to host-side Accelerate LAPACK.
+
+    jnp.linalg.eigh lowers `eigh_p` to `@lapack_ssyevd_ffi`; copying its CPU entry
+    makes a jit'd eigh emit that custom_call, which the Swift compiler routes to
+    host-side Accelerate LAPACK (ssyevd).
     """
     try:
         from jax._src.interpreters import mlir
@@ -99,7 +103,7 @@ def _register_linalg_lowerings():
 
     cpu_table = mlir._platform_specific_lowerings.get("cpu", {})
     metal_table = mlir._platform_specific_lowerings["metalhlo"]
-    for prim_name in ("svd_p", "geqrf_p", "householder_product_p"):
+    for prim_name in ("svd_p", "geqrf_p", "householder_product_p", "eigh_p"):
         prim = getattr(lax_linalg, prim_name, None)
         if prim is None:
             continue

@@ -1801,6 +1801,11 @@ func pjrt_client_compile(
             || mlirSource.contains("lapack_dgeqrf")
             || mlirSource.contains("lapack_sorgqr")
             || mlirSource.contains("lapack_dorgqr")
+            // jnp.linalg.eigh lowers to @lapack_ssyevd_ffi, routed to native .eigh
+            // ops and executed host-side via Accelerate LAPACK on the MPSGraph path
+            // (the fast CodeGenerator has no symmetric eigendecomposition).
+            || mlirSource.contains("lapack_ssyevd")
+            || mlirSource.contains("lapack_dsyevd")
         let hasCall = mlirSource.contains("call @")
             || mlirSource.contains("func.func private")
 

@@ -382,6 +382,61 @@ public final class Parser {
                 }
             } else if op.kind == .customCall,
                       let target = op.attributes.callTargetName,
+                      target.hasPrefix("lapack_ssyevd") || target.hasPrefix("lapack_dsyevd")
+                        || target.hasPrefix("lapack_cheevd") || target.hasPrefix("lapack_zheevd") {
+                // Symmetric eigendecomposition LAPACK FFI: `@lapack_ssyevd_ffi(%a)`
+                // returns a 3-tuple
+                //   (#0 eigenvectors v [N×N], #1 eigenvalues w [N], #2 info).
+                // JAX's `@eigh` wrapper masks v/w to NaN when info != 0 and returns
+                // (w, v). The decomposition itself runs host-side via Accelerate
+                // LAPACK (see MetalExecutor's host-eigh shortcut), so the job here is
+                // to route the consumed results (#0 v, #1 w) to native `.eigh` ops
+                // and emit info = 0 for #2 (LAPACK always succeeds for the
+                // well-conditioned symmetric inputs eigh targets; the wrapper passes
+                // value through untouched when info == 0).
+                //
+                // Result-component encoding (op.attributes.tupleIndex):
+                //   0 = w (eigenvalues, ascending), 1 = v (eigenvectors, columns).
+                // Shapes derive from the input N×N matrix; the UPLO triangle the
+                // routine reads is decoded onto `attributes.lower` from the
+                // backend_config `uplo` byte.
+                let resolvedOperands = op.operands.map { resolveAlias($0, aliases: valueAliases) }
+                let inputShape = op.resultType.shape   // result #0 == input shape N×N
+                let n = inputShape.count >= 1 ? inputShape[0] : 0
+                let elem = op.resultType.elementType
+
+                // v: N×N eigenvectors (columns)  -> custom_call result #0
+                var vAttrs = op.attributes
+                vAttrs.tupleIndex = 1
+                operations.append(HLOOperation(
+                    result: "\(op.result).0",
+                    kind: .eigh,
+                    operands: resolvedOperands,
+                    resultType: TensorType(shape: [n, n], elementType: elem),
+                    attributes: vAttrs
+                ))
+                // w: [N] eigenvalues (ascending)  -> custom_call result #1
+                var wAttrs = op.attributes
+                wAttrs.tupleIndex = 0
+                operations.append(HLOOperation(
+                    result: "\(op.result).1",
+                    kind: .eigh,
+                    operands: resolvedOperands,
+                    resultType: TensorType(shape: [n], elementType: elem),
+                    attributes: wAttrs
+                ))
+                // info = 0 (success), tensor<i32>. The wrapper compares this to 0.
+                var infoAttrs = HLOAttributes()
+                infoAttrs.constantValue = .scalar(0)
+                operations.append(HLOOperation(
+                    result: "\(op.result).2",
+                    kind: .constant,
+                    operands: [],
+                    resultType: TensorType(shape: [], elementType: .int32),
+                    attributes: infoAttrs
+                ))
+            } else if op.kind == .customCall,
+                      let target = op.attributes.callTargetName,
                       target.hasPrefix("lapack_sgeqrf") || target.hasPrefix("lapack_dgeqrf") {
                 // QR factorization LAPACK FFI: `@lapack_sgeqrf_ffi(%A)` returns a
                 // 2-tuple (#0 factored A [M×N], #1 tau [min(M,N)]). Result #0 holds
