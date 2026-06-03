@@ -15,6 +15,10 @@ MetalHLO is a fully-functional JAX backend for Apple Silicon. **130 tests across
 | `jit`, `value_and_grad`, full training step with optax (SGD, Adam) | [flax_metalhlo_training.py](Examples/FlaxExample/flax_metalhlo_training.py) |
 | `vmap`, `vmap` of `grad` (per-example gradients), nested `vmap`, non-default `in_axes`/`out_axes` | [flax_metalhlo_vmap.py](Examples/FlaxExample/flax_metalhlo_vmap.py) |
 | `jax.lax.scan`, `flax.linen.scan` forward, `nn.scan` + `grad` (RNN training) | [flax_metalhlo_scan.py](Examples/FlaxExample/flax_metalhlo_scan.py) |
+| `jax.checkpoint` / `jax.remat`, `jax.lax.optimization_barrier` | [OptimizationBarrierTest.swift](Tests/MetalHLOCoreTests/OptimizationBarrierTest.swift) |
+| `jax.lax.top_k`, `jnp.argmax` / `argmin` (in-`jit`), `jnp.cumsum`, `jnp.arctan2`, `jax.lax.reduce_precision` | [Tests/MetalHLOCoreTests](Tests/MetalHLOCoreTests) |
+| `jax.random` — bit-exact threefry2x32 (`bits`/`uniform` match JAX CPU exactly) | [ThreefryRngTest.swift](Tests/MetalHLOCoreTests/ThreefryRngTest.swift) |
+| `jax.debug.print` / `jax.debug.callback` (side-effect-only host callbacks) | [HostCallbackTest.swift](Tests/MetalHLOCoreTests/HostCallbackTest.swift) |
 
 ### Dtypes
 
@@ -40,8 +44,11 @@ MetalHLO is a fully-functional JAX backend for Apple Silicon. **130 tests across
 
 ### Known limitations
 
-- **Multi-step CNN training**: step 0 matches CPU exactly; subsequent steps drift up to ~0.1 absolute. Test absorbs with `rtol=1e-1`. Cross-process variance was reduced by routing conv-grad and pool-backward off MPSGraph's autotuned kernels onto deterministic primitives; residual is in MPSGraph's internal small-op fusion.
-- **Sharding** (`pjit` with mesh, `shard_map`, `nn.partitioning`): not supported. MetalHLO is single-device.
+- **`jax.random.normal`**: the underlying threefry2x32 *bits* match JAX bit-for-bit (so `jax.random.bits`/`uniform` are exact), but `normal` diverges by ~2.4e-7 from the downstream `ndtri` inverse-CDF rounding in fp32 — not the RNG itself.
+- **`jax.scipy.linalg` (`cholesky`, `solve_triangular`) and `lax.map`**: implemented for direct StableHLO input, but JAX-on-CPU lowers these to LAPACK FFI `custom_call`s (`@lapack_spotrf_ffi`, `@lapack_strsm_ffi`) and a `while` loop respectively; routing those custom_calls to the native implementations is still pending. `triangular_solve` with `left_side=false` (`x·A=b`) is not yet implemented.
+- **Sharding** (`pjit` with mesh, `shard_map`, `nn.partitioning`): not supported — MetalHLO is single-device. Multi-device SPMD modules (`num_partitions`/`num_replicas > 1`) now fail loudly at parse time rather than silently running unpartitioned; single-device meshes pass through.
+- **Host callbacks**: `jax.debug.print` / `jax.debug.callback` work (the side effect is dropped, numerics are exact); `pure_callback` / `io_callback` are unsupported (they feed host values back into the graph and need round-trip infrastructure) and fail loudly.
+- **Multi-step CNN training**: step 0 matches CPU exactly; subsequent steps may drift up to ~0.1 absolute (test absorbs with `rtol=1e-1`). Residual is in MPSGraph's internal small-op fusion. (The RNG path is now JAX-bit-exact, removing one prior source of divergence.)
 - **Quantization, `nn.custom_vjp`**: not tested.
 
 ### Compatibility
@@ -501,34 +508,36 @@ MetalHLO's optimization pipeline runs in phases, inspired by XLA's approach:
 
 | Category | Operations |
 |----------|------------|
-| **Binary Arithmetic** | add, subtract, multiply, divide, maximum, minimum, power |
+| **Binary Arithmetic** | add, subtract, multiply, divide, maximum, minimum, power, atan2 |
 | **Unary Math** | negate, abs, exp, log, sqrt, rsqrt, sin, cos, tanh, floor, ceil, sign, tan, logistic, is_finite, expm1, log1p, cbrt, round_nearest_afz, round_nearest_even |
 | **Bitwise** | not, and, or, xor, shift_left, shift_right_arithmetic, shift_right_logical, popcnt |
-| **Type Conversion** | convert, bitcast_convert |
+| **Type Conversion** | convert, bitcast_convert, reduce_precision (IEEE round-to-nearest-even mantissa narrowing) |
 | **Matrix** | dot, dot_general, transpose, reshape, broadcast_in_dim, reverse |
 | **Dynamic Shape** | dynamic_slice, dynamic_update_slice, dynamic_reshape, dynamic_broadcast_in_dim, dynamic_pad, dynamic_iota, dynamic_gather |
 | **Convolution** | convolution |
-| **Reduction** | reduce (sum, max, min, mean), reduce_window |
+| **Reduction** | reduce (sum, max, min, mean), reduce_window, argmax/argmin, cumulative_sum (cumsum) |
 | **Normalization** | batch_norm_inference, batch_norm_training, batch_norm_grad |
 | **FFT** | fft (FFT, IFFT, RFFT, IRFFT) |
-| **Sorting** | sort |
+| **Sorting** | sort, top_k (values + indices) |
 | **Comparison** | compare (EQ, NE, LT, LE, GT, GE), select, clamp |
 | **Indexing** | slice, pad, concatenate, gather, scatter |
-| **RNG** | rng (uniform, normal), rng_bit_generator |
+| **RNG** | rng (uniform, normal), rng_bit_generator (threefry2x32 — bit-exact with JAX) |
 | **Constants** | constant, iota |
-| **Control Flow** | while, if |
+| **Control Flow** | while, if, optimization_barrier (`jax.checkpoint` / `jax.remat`) |
 | **Quantization** | uniform_quantize, uniform_dequantize |
 | **Complex Numbers** | complex, real, imag |
 | **Select/Scatter** | select_and_scatter |
 | **Custom Calls** | fused_scaled_dot_product_attention, fused_depth_attention, fused_layer_norm, fused_rms_norm, fused_matmul_bias_activation, fused_softmax, fused_gelu, fused_rope |
 
-### Operations Requiring MPS Kernel Bridging (3 ops)
+### Linear Algebra (implemented on the MPSGraph path)
 
 | Operation | Notes |
 |-----------|-------|
-| `triangular_solve` | Requires MPSMatrixSolveTriangular |
-| `cholesky` | Requires MPSMatrixDecompositionCholesky |
-| `map` | Requires JIT compilation |
+| `triangular_solve` | Forward/back substitution in MPSGraph ops (`left_side=true`) |
+| `cholesky` | Cholesky–Banachiewicz recurrence in MPSGraph ops; honors `lower` |
+| `map` | Element-wise region inlined over broadcast inputs |
+
+These lower correctly from direct StableHLO. Note that JAX-on-CPU emits `jax.scipy.linalg.cholesky`/`solve_triangular` as LAPACK FFI `custom_call`s and `lax.map` as a `while` loop — routing those custom_calls to these implementations is a pending follow-up (see [Known limitations](#known-limitations)).
 
 ### Excluded by Design (14 ops)
 
