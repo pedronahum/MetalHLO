@@ -475,24 +475,23 @@ public final class IntegratedExecutor: @unchecked Sendable {
         // we already do (constantBuffers / unifiedBuffer / outputBufferPool
         // are all stored in instance fields; input buffers are kept alive by
         // the caller dictionary `inputs:` for the duration of execute()).
-        let commandBuffer: MTLCommandBuffer
-        if useDispatchOpts {
-            let cbDesc = MTLCommandBufferDescriptor()
-            cbDesc.retainedReferences = false
-            guard let cb = commandQueue.makeCommandBuffer(descriptor: cbDesc) else {
-                throw IntegratedExecutorError.commandBufferCreationFailed
+        func makeConfiguredCommandBuffer() throws -> MTLCommandBuffer {
+            let made: MTLCommandBuffer?
+            if useDispatchOpts {
+                let cbDesc = MTLCommandBufferDescriptor()
+                cbDesc.retainedReferences = false
+                made = commandQueue.makeCommandBuffer(descriptor: cbDesc)
+            } else {
+                made = commandQueue.makeCommandBuffer()
             }
-            commandBuffer = cb
-        } else {
-            guard let cb = commandQueue.makeCommandBuffer() else {
-                throw IntegratedExecutorError.commandBufferCreationFailed
-            }
-            commandBuffer = cb
+            guard let cb = made else { throw IntegratedExecutorError.commandBufferCreationFailed }
+            if let label = config.debugLabel { cb.label = label }
+            return cb
         }
 
-        if let label = config.debugLabel {
-            commandBuffer.label = label
-        }
+        // Mutable so the pipelined path can roll to a fresh command buffer at
+        // each chunk boundary; the tail (commit + wait) operates on the last one.
+        var commandBuffer = try makeConfiguredCommandBuffer()
 
         // Kernel timings for profiling
         var kernelTimings: [OpID: Double]?
@@ -500,11 +499,12 @@ public final class IntegratedExecutor: @unchecked Sendable {
             kernelTimings = [:]
         }
 
-        // Create a single encoder for all operations (reduces overhead significantly)
-        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+        // Create an encoder for the first chunk (the pipelined path opens a new
+        // one per chunk; the single-buffer path keeps using this one).
+        guard let firstEncoder = commandBuffer.makeComputeCommandEncoder() else {
             throw IntegratedExecutorError.encoderCreationFailed
         }
-
+        var encoder = firstEncoder
         if let label = config.debugLabel {
             encoder.label = label
         }
@@ -568,43 +568,28 @@ public final class IntegratedExecutor: @unchecked Sendable {
             encoder.endEncoding()
         }
 
-        // A mid-loop throw (e.g. a missing input/constant binding from a
-        // miscompiled op) must NOT leave a live command encoder: Metal aborts
-        // the whole process ("encoder released without endEncoding") when an
-        // unended encoder is deallocated. Track the currently-open encoder and
-        // end it on every exit path so the error propagates as a clean Swift
-        // throw instead of a SIGABRT.
-        var openEncoder: MTLComputeCommandEncoder? = perOpProfilingActive ? nil : encoder
-        defer { openEncoder?.endEncoding() }
+        // Encode/GPU overlap: instead of encoding all ~900 kernels into one
+        // command buffer and committing once (the GPU sits idle for the whole
+        // ~8 ms CPU encode), split the encode across several command buffers and
+        // commit each as it fills. Committed buffers on the same queue execute
+        // in order and are memory-coherent with each other, so the GPU starts on
+        // chunk 0 while the CPU encodes chunk 1 — no explicit cross-buffer
+        // barrier needed (the buffer boundary is itself a full sync point).
+        // Disabled while per-op profiling (its counter sample buffers are tied to
+        // a single command buffer). METALHLO_PIPELINE_CHUNK=0 disables; tune via
+        // the same env var.
+        let pipelineChunk: Int = {
+            if perOpProfilingActive { return 0 }
+            if let raw = ProcessInfo.processInfo.environment["METALHLO_PIPELINE_CHUNK"],
+               let n = Int(raw) { return n }
+            return 128
+        }()
+        let pipelined = pipelineChunk > 0 && plan.count > pipelineChunk
 
-        for i in 0..<plan.count {
-            // Per-op encoder path when profiling is on — gives one sample
-            // pair per dispatch. Otherwise we keep the original single-encoder
-            // hot path (the `encoder` opened above).
-            let opEncoder: MTLComputeCommandEncoder
-            if perOpProfilingActive {
-                let chunkIdx = i / opsPerChunk
-                let localIdx = i % opsPerChunk
-                let sb = perOpSampleBuffers[chunkIdx]
-                let passDesc = MTLComputePassDescriptor()
-                passDesc.dispatchType = .serial
-                passDesc.sampleBufferAttachments[0].sampleBuffer = sb
-                passDesc.sampleBufferAttachments[0].startOfEncoderSampleIndex = localIdx * 2
-                passDesc.sampleBufferAttachments[0].endOfEncoderSampleIndex = localIdx * 2 + 1
-                guard let e = commandBuffer.makeComputeCommandEncoder(descriptor: passDesc) else {
-                    throw IntegratedExecutorError.encoderCreationFailed
-                }
-                opEncoder = e
-                openEncoder = e
-                lastPipeline = nil  // fresh encoder — must rebind
-            } else {
-                opEncoder = encoder
-            }
-            // Emit explicit barrier BEFORE this op when the producer→
-            // consumer analysis flagged it. Required when running with
-            // `hazardTrackingModeUntracked` on the unified buffer.
-            // Skipped when profiling (each op has its own encoder anyway)
-            // and harmlessly redundant when per-op barrier is forced.
+        // Encodes a single op into the given encoder. Shared by the single-buffer,
+        // pipelined, and per-op-profiling paths.
+        func encodeOneOp(_ i: Int, into opEncoder: MTLComputeCommandEncoder,
+                         _ lastPipeline: inout MTLComputePipelineState?) throws {
             if useExplicitBarriers && !perOpProfilingActive && barrierSet.contains(i) {
                 opEncoder.memoryBarrier(scope: .buffers)
             }
@@ -657,9 +642,59 @@ public final class IntegratedExecutor: @unchecked Sendable {
             if perOpBarrier && i < lastIdx {
                 opEncoder.memoryBarrier(scope: .buffers)
             }
+        }
+
+        // A mid-loop throw (e.g. a missing input/constant binding from a
+        // miscompiled op) must NOT leave a live command encoder: Metal aborts
+        // the whole process ("encoder released without endEncoding") when an
+        // unended encoder is deallocated. Track the currently-open encoder and
+        // end it on every exit path so the error propagates as a clean Swift
+        // throw instead of a SIGABRT.
+        var openEncoder: MTLComputeCommandEncoder? = perOpProfilingActive ? nil : encoder
+        defer { openEncoder?.endEncoding() }
+
+        for i in 0..<plan.count {
+            // Per-op encoder path when profiling is on — gives one sample
+            // pair per dispatch. Otherwise we keep the original single-encoder
+            // hot path (the `encoder` opened above).
             if perOpProfilingActive {
-                opEncoder.endEncoding()
+                let chunkIdx = i / opsPerChunk
+                let localIdx = i % opsPerChunk
+                let sb = perOpSampleBuffers[chunkIdx]
+                let passDesc = MTLComputePassDescriptor()
+                passDesc.dispatchType = .serial
+                passDesc.sampleBufferAttachments[0].sampleBuffer = sb
+                passDesc.sampleBufferAttachments[0].startOfEncoderSampleIndex = localIdx * 2
+                passDesc.sampleBufferAttachments[0].endOfEncoderSampleIndex = localIdx * 2 + 1
+                guard let e = commandBuffer.makeComputeCommandEncoder(descriptor: passDesc) else {
+                    throw IntegratedExecutorError.encoderCreationFailed
+                }
+                openEncoder = e
+                lastPipeline = nil  // fresh encoder — must rebind
+                try encodeOneOp(i, into: e, &lastPipeline)
+                e.endEncoding()
                 openEncoder = nil
+                continue
+            }
+
+            try encodeOneOp(i, into: encoder, &lastPipeline)
+
+            // Pipelined path: at each chunk boundary close + commit the current
+            // command buffer so the GPU can start on it, then roll to a fresh
+            // buffer/encoder for the next chunk. The final chunk is left open and
+            // committed by the tail below.
+            if pipelined && (i + 1) % pipelineChunk == 0 && (i + 1) < plan.count {
+                encoder.endEncoding()
+                openEncoder = nil
+                commandBuffer.commit()
+                commandBuffer = try makeConfiguredCommandBuffer()
+                guard let nextEncoder = commandBuffer.makeComputeCommandEncoder() else {
+                    throw IntegratedExecutorError.encoderCreationFailed
+                }
+                if let label = config.debugLabel { nextEncoder.label = label }
+                encoder = nextEncoder
+                openEncoder = nextEncoder
+                lastPipeline = nil  // fresh encoder — must rebind
             }
         }
         _ = kernelTimings  // not used in the fast path — kept for executeAsync caller
