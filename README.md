@@ -16,7 +16,9 @@ MetalHLO is a fully-functional JAX backend for Apple Silicon. **130 tests across
 | `vmap`, `vmap` of `grad` (per-example gradients), nested `vmap`, non-default `in_axes`/`out_axes` | [flax_metalhlo_vmap.py](Examples/FlaxExample/flax_metalhlo_vmap.py) |
 | `jax.lax.scan`, `flax.linen.scan` forward, `nn.scan` + `grad` (RNN training) | [flax_metalhlo_scan.py](Examples/FlaxExample/flax_metalhlo_scan.py) |
 | `jax.checkpoint` / `jax.remat`, `jax.lax.optimization_barrier` | [OptimizationBarrierTest.swift](Tests/MetalHLOCoreTests/OptimizationBarrierTest.swift) |
-| `jax.lax.top_k`, `jnp.argmax` / `argmin` (in-`jit`), `jnp.cumsum`, `jnp.arctan2`, `jax.lax.reduce_precision` | [Tests/MetalHLOCoreTests](Tests/MetalHLOCoreTests) |
+| `jax.lax.top_k`, `jnp.argmax` / `argmin` (in-`jit`), `jnp.cumsum` / `cumprod` / `cummax` / `cumlogsumexp`, `jnp.arctan2`, `jax.lax.reduce_precision`, `jnp.searchsorted` | [Tests/MetalHLOCoreTests](Tests/MetalHLOCoreTests) |
+| `jax.lax.switch` (multi-branch), `jax.lax.cond` | [CaseSwitchTest.swift](Tests/MetalHLOCoreTests/CaseSwitchTest.swift) |
+| `jax.scipy.linalg.cholesky` / `solve_triangular` (routed from JAX's LAPACK FFI), `jax.lax.lgamma` / `digamma` / `erf` | [LapackRoutingTest.swift](Tests/MetalHLOCoreTests/LapackRoutingTest.swift) |
 | `jax.random` — bit-exact threefry2x32 (`bits`/`uniform` match JAX CPU exactly) | [ThreefryRngTest.swift](Tests/MetalHLOCoreTests/ThreefryRngTest.swift) |
 | `jax.debug.print` / `jax.debug.callback` (side-effect-only host callbacks) | [HostCallbackTest.swift](Tests/MetalHLOCoreTests/HostCallbackTest.swift) |
 
@@ -45,7 +47,8 @@ MetalHLO is a fully-functional JAX backend for Apple Silicon. **130 tests across
 ### Known limitations
 
 - **`jax.random.normal`**: the underlying threefry2x32 *bits* match JAX bit-for-bit (so `jax.random.bits`/`uniform` are exact), but `normal` diverges by ~2.4e-7 from the downstream `ndtri` inverse-CDF rounding in fp32 — not the RNG itself.
-- **`jax.scipy.linalg` (`cholesky`, `solve_triangular`) and `lax.map`**: implemented for direct StableHLO input, but JAX-on-CPU lowers these to LAPACK FFI `custom_call`s (`@lapack_spotrf_ffi`, `@lapack_strsm_ffi`) and a `while` loop respectively; routing those custom_calls to the native implementations is still pending. `triangular_solve` with `left_side=false` (`x·A=b`) is not yet implemented.
+- **`jnp.linalg.svd` / `qr` / `eigh`**: not implemented — these lower to LAPACK FFI `custom_call`s (`@lapack_sgesdd_ffi`, `@lapack_sgeqrf_ffi`, `@lapack_ssyevd_ffi`) with no native equivalent yet. (`cholesky` and `solve_triangular` *are* supported.) `triangular_solve` with `left_side=false` (`x·A=b`) is also not yet implemented.
+- **`jnp.unique`**: not supported — its deep nested-call lowering (`lexsort` + `cumsum` + masking helpers kept as separate functions) exposes a limitation in cross-function operand remapping; fails rather than returning wrong values.
 - **Sharding** (`pjit` with mesh, `shard_map`, `nn.partitioning`): not supported — MetalHLO is single-device. Multi-device SPMD modules (`num_partitions`/`num_replicas > 1`) now fail loudly at parse time rather than silently running unpartitioned; single-device meshes pass through.
 - **Host callbacks**: `jax.debug.print` / `jax.debug.callback` work (the side effect is dropped, numerics are exact); `pure_callback` / `io_callback` are unsupported (they feed host values back into the graph and need round-trip infrastructure) and fail loudly.
 - **Multi-step CNN training**: step 0 matches CPU exactly; subsequent steps may drift up to ~0.1 absolute (test absorbs with `rtol=1e-1`). Residual is in MPSGraph's internal small-op fusion. (The RNG path is now JAX-bit-exact, removing one prior source of divergence.)
@@ -515,15 +518,16 @@ MetalHLO's optimization pipeline runs in phases, inspired by XLA's approach:
 | **Matrix** | dot, dot_general, transpose, reshape, broadcast_in_dim, reverse |
 | **Dynamic Shape** | dynamic_slice, dynamic_update_slice, dynamic_reshape, dynamic_broadcast_in_dim, dynamic_pad, dynamic_iota, dynamic_gather |
 | **Convolution** | convolution |
-| **Reduction** | reduce (sum, max, min, mean), reduce_window, argmax/argmin, cumulative_sum (cumsum) |
+| **Reduction** | reduce (sum, max, min, mean), reduce_window, argmax/argmin, cumulative_sum (cumsum/cumprod/cummax/cumlogsumexp) |
 | **Normalization** | batch_norm_inference, batch_norm_training, batch_norm_grad |
 | **FFT** | fft (FFT, IFFT, RFFT, IRFFT) |
-| **Sorting** | sort, top_k (values + indices) |
+| **Sorting** | sort, top_k (values + indices), searchsorted |
+| **Special Functions** | erf, lgamma, digamma (chlo composites, legalized to stablehlo) |
 | **Comparison** | compare (EQ, NE, LT, LE, GT, GE), select, clamp |
 | **Indexing** | slice, pad, concatenate, gather, scatter |
 | **RNG** | rng (uniform, normal), rng_bit_generator (threefry2x32 — bit-exact with JAX) |
 | **Constants** | constant, iota |
-| **Control Flow** | while, if, optimization_barrier (`jax.checkpoint` / `jax.remat`) |
+| **Control Flow** | while, if (`jax.lax.cond`), case (`jax.lax.switch`), optimization_barrier (`jax.checkpoint` / `jax.remat`) |
 | **Quantization** | uniform_quantize, uniform_dequantize |
 | **Complex Numbers** | complex, real, imag |
 | **Select/Scatter** | select_and_scatter |
@@ -537,7 +541,7 @@ MetalHLO's optimization pipeline runs in phases, inspired by XLA's approach:
 | `cholesky` | Cholesky–Banachiewicz recurrence in MPSGraph ops; honors `lower` |
 | `map` | Element-wise region inlined over broadcast inputs |
 
-These lower correctly from direct StableHLO. Note that JAX-on-CPU emits `jax.scipy.linalg.cholesky`/`solve_triangular` as LAPACK FFI `custom_call`s and `lax.map` as a `while` loop — routing those custom_calls to these implementations is a pending follow-up (see [Known limitations](#known-limitations)).
+`cholesky` and `triangular_solve` are reachable end-to-end from JAX: `jax.scipy.linalg.cholesky` / `solve_triangular` lower (on CPU) to LAPACK FFI `custom_call`s (`@lapack_spotrf_ffi` / `@lapack_strsm_ffi`), which the parser decodes (uplo/side/trans/diag) and routes to these native implementations. `svd`, `qr`, and `eigh` (their `@lapack_sgesdd_ffi` / `@lapack_sgeqrf_ffi` / `@lapack_ssyevd_ffi` custom_calls) are not yet implemented (see [Known limitations](#known-limitations)).
 
 ### Excluded by Design (14 ops)
 
