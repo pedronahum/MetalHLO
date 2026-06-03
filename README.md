@@ -47,7 +47,7 @@ MetalHLO is a fully-functional JAX backend for Apple Silicon. **130 tests across
 ### Known limitations
 
 - **`jax.random.normal`**: the underlying threefry2x32 *bits* match JAX bit-for-bit (so `jax.random.bits`/`uniform` are exact), but `normal` diverges by ~2.4e-7 from the downstream `ndtri` inverse-CDF rounding in fp32 — not the RNG itself.
-- **`jnp.sort` / `argsort` / `lexsort` / `jnp.unique`**: not yet supported end-to-end. JAX's `sort` lowering (a comparator-region sort with a `dimension : i64` annotation) isn't parsed on the fast codegen path, and that path has no stable-sort kernel that returns the permutation indices these ops need (MPSGraph's single-key `sort` returns values only). They fail with a clear error rather than wrong results. (`top_k` and `searchsorted`, which need only partial/looked-up order, *are* supported.) `triangular_solve` with `left_side=false` (`x·A=b`) is also not yet implemented.
+- **`jnp.unique`**: not supported. Its lowering keeps several helpers (`lexsort` + `cumsum` + masking) as separate private functions, and the cross-function operand wiring miscomposes them — each helper is individually correct, but the composed result is wrong. (`sort`, `argsort`, and `lexsort` themselves *are* supported and verified.) `triangular_solve` with `left_side=false` (`x·A=b`) is also not yet implemented.
 - **Sharding** (`pjit` with mesh, `shard_map`, `nn.partitioning`): not supported — MetalHLO is single-device. Multi-device SPMD modules (`num_partitions`/`num_replicas > 1`) now fail loudly at parse time rather than silently running unpartitioned; single-device meshes pass through.
 - **Host callbacks**: `jax.debug.print` / `jax.debug.callback` work (the side effect is dropped, numerics are exact); `pure_callback` / `io_callback` are unsupported (they feed host values back into the graph and need round-trip infrastructure) and fail loudly.
 - **Multi-step CNN training**: step 0 matches CPU exactly; subsequent steps may drift up to ~0.1 absolute (test absorbs with `rtol=1e-1`). Residual is in MPSGraph's internal small-op fusion. (The RNG path is now JAX-bit-exact, removing one prior source of divergence.)
@@ -520,7 +520,7 @@ MetalHLO's optimization pipeline runs in phases, inspired by XLA's approach:
 | **Reduction** | reduce (sum, max, min, mean), reduce_window, argmax/argmin, cumulative_sum (cumsum/cumprod/cummax/cumlogsumexp) |
 | **Normalization** | batch_norm_inference, batch_norm_training, batch_norm_grad |
 | **FFT** | fft (FFT, IFFT, RFFT, IRFFT) |
-| **Sorting** | sort (single-key, MPSGraph path), top_k (values + indices), searchsorted |
+| **Sorting** | sort / argsort / lexsort (stable, any axis), top_k (values + indices), searchsorted |
 | **Special Functions** | erf, lgamma, digamma (chlo composites, legalized to stablehlo) |
 | **Comparison** | compare (EQ, NE, LT, LE, GT, GE), select, clamp |
 | **Indexing** | slice, pad, concatenate, gather, scatter |
