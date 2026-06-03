@@ -154,16 +154,59 @@ public struct FunctionInliner {
             // to flow a callee value through).
             let newOperands = op.operands.map { remap($0) }
             let newResult = remap(op.result)
+
+            // A `while` op carries cond/body regions whose ops may reference
+            // enclosing-scope SSA values (a bound/step constant hoisted above
+            // the loop, a captured tensor). Inlining renames those enclosing
+            // defs (e.g. `%c_0` → `_inl0_%c_0`); the region references must move
+            // with them or they dangle — and the WhileLoopUnroller, which reads
+            // the bound/step constants by name, then can't recognize the loop.
+            // Remap every region operand that resolves through the current
+            // rename map. Region-local definitions and block args aren't in the
+            // map, so `remap` leaves them untouched.
+            var newAttributes = op.attributes
+            if op.kind == .whileOp, let regions = op.attributes.whileRegions {
+                newAttributes.whileRegions = WhileRegions(
+                    condition: remapRegion(regions.condition, remap),
+                    body: remapRegion(regions.body, remap)
+                )
+            }
+
             result.append(HLOOperation(
                 result: newResult,
                 kind: op.kind,
                 operands: newOperands,
                 resultType: op.resultType,
-                attributes: op.attributes,
+                attributes: newAttributes,
                 resultCount: op.resultCount
             ))
         }
 
         return result
+    }
+
+    /// Returns `region` with every operation operand passed through `remap`.
+    /// Used to carry enclosing-scope renames (from inlining) into a `while`
+    /// op's cond/body regions. Region-local definitions and block args are
+    /// absent from the rename map, so they pass through unchanged.
+    private static func remapRegion(
+        _ region: Region,
+        _ remap: (String) -> String
+    ) -> Region {
+        let newOps = region.operations.map { op in
+            HLOOperation(
+                result: op.result,
+                kind: op.kind,
+                operands: op.operands.map(remap),
+                resultType: op.resultType,
+                attributes: op.attributes,
+                resultCount: op.resultCount
+            )
+        }
+        return Region(
+            arguments: region.arguments,
+            operations: newOps,
+            returnValues: region.returnValues
+        )
     }
 }

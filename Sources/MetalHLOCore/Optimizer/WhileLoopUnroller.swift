@@ -209,10 +209,22 @@ public struct WhileLoopUnroller {
         let lhs = cmp.operands[0]
         let rhs = cmp.operands[1]
 
+        // The bound / step constants are normally defined inside the cond /
+        // body regions, but a prior text-level inliner can hoist them into the
+        // enclosing function (e.g. JAX's searchsorted lowering after the PJRT
+        // text transforms move the `dense<3>` bound and `dense<1>` step ahead of
+        // the while). Resolve a constant by name from the region first, then
+        // fall back to the enclosing-scope constant table so a hoisted literal
+        // is still recognized.
+        func constant(named name: String, in region: Region) -> Double? {
+            scalarIntConstant(named: name, in: region)
+                ?? enclosingConstants[name]
+        }
+
         // Find which side is the block-arg induction var and which is the bound.
         let ivArg: String
         let bound: Double
-        if condArgNames.contains(lhs), let b = scalarIntConstant(named: rhs, in: condition) {
+        if condArgNames.contains(lhs), let b = constant(named: rhs, in: condition) {
             ivArg = lhs
             bound = b
         } else {
@@ -234,9 +246,9 @@ public struct WhileLoopUnroller {
         else { return nil }
 
         let step: Double
-        if inc.operands[0] == bodyIVArg, let s = scalarIntConstant(named: inc.operands[1], in: body) {
+        if inc.operands[0] == bodyIVArg, let s = constant(named: inc.operands[1], in: body) {
             step = s
-        } else if inc.operands[1] == bodyIVArg, let s = scalarIntConstant(named: inc.operands[0], in: body) {
+        } else if inc.operands[1] == bodyIVArg, let s = constant(named: inc.operands[0], in: body) {
             step = s
         } else {
             return nil

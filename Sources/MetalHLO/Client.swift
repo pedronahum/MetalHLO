@@ -251,7 +251,28 @@ public final class Client: @unchecked Sendable {
         // executor runs a single function and has no cross-function call
         // support, so unresolved calls would silently produce no output (JAX
         // lowers composites like jnp.cumsum through nested private helpers).
-        let module = FunctionInliner.inline(parsedModule)
+        //
+        // Some composites (jax.random.bits, jnp.searchsorted) lower through a
+        // counted `while` whose body is a `func.call`. Mirror the gpuOnly fast
+        // path's inline→unroll→inline sequence: a bare inline would leave the
+        // `while` op (and its `%result#k` references) in the entry, which the
+        // heterogeneous executor cannot run — every loop-carried result then
+        // resolves to a missing input. Unrolling flattens the loop to
+        // straight-line ops and the second inline flattens the body calls it
+        // exposes. Each step is a no-op when its pattern is absent.
+        let inlined1 = FunctionInliner.inline(parsedModule)
+        let unrolled = WhileLoopUnroller.unroll(inlined1)
+        let module = FunctionInliner.inline(unrolled)
+
+        // If the entry still carries a `while` (a data-dependent loop the
+        // unroller can't flatten), the heterogeneous executor has no runtime
+        // control flow — route to the gpuOnly path, which compiles such
+        // programs through the MPSGraph backend with native control flow.
+        if module.function.operations.contains(where: { $0.kind == .whileOp }) {
+            var gpuConfig = config
+            gpuConfig.devicePolicy = .gpuOnly
+            return try compile(mlir, config: gpuConfig)
+        }
 
         // Analyze whether heterogeneous execution is beneficial
         let analyzer = ANEAnalyzer()

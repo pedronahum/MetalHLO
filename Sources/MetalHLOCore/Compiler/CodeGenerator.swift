@@ -6115,14 +6115,21 @@ public final class CodeGenerator: @unchecked Sendable {
             }
             // A recorded non-float (integer) type: read at its true width so
             // the load converts to the chain's float type instead of
-            // reinterpreting raw bytes. Float / unknown → chain type (unchanged).
+            // reinterpreting raw bytes. Float / unknown → chain compute type.
             if slot < inputElementTypes.count {
                 let et = inputElementTypes[slot]
                 if !isFloatType(et) {
                     return metalTypeName(for: et)
                 }
             }
-            return metalType
+            // Non-predicate float (or unknown) externals are read at the chain's
+            // *compute* type, not the output type. When the chain root is a
+            // compare its output `metalType` is `bool`, but its float data
+            // inputs (the compare operands, select branches, …) must be read as
+            // `float` — reading them as `bool` reinterprets every nonzero value
+            // as 1.0 and collapses the comparison (e.g. `8.0 <= 5.0` becomes
+            // `true <= true`). computeType is `float` exactly in that case.
+            return computeType
         }
 
         var inputParams: [String] = []
