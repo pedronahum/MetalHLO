@@ -115,6 +115,39 @@ private func convertBytecodeToText(_ bytecode: Data) -> Result<String, BytecodeE
                 o.append(l)
             return '\n'.join(o)
         text = _fix_shadows(text)
+        # Rewrite the chlo.top_k composite to our dedicated stablehlo.top_k op
+        # BEFORE the generic composite->func.call rewrite below. JAX lowers
+        # jax.lax.top_k to:
+        #   %r:2 = stablehlo.composite "chlo.top_k" %x
+        #       {composite_attributes = {k = K : i64}, decomposition = @impl, ...}
+        #       : (intype) -> (vtype, itype)
+        # whose decomposition is an iota + 2-operand stablehlo.sort + slice. The
+        # generic composite rewrite can't absorb that body on the fast path (no
+        # comparator-region sort), and its regex also chokes on the nested
+        # {composite_attributes = {...}} braces. Instead, collapse the composite
+        # to a single top_k op the parser lowers directly, and drop the now
+        # orphaned decomposition function.
+        topk_impls = []
+        def rewrite_topk(m):
+            results, operand, k, sig = m.group(1), m.group(2), m.group(3), m.group(4)
+            dm = re.search(r'decomposition\s*=\s*@([\w.]+)', m.group(0))
+            if dm:
+                topk_impls.append(dm.group(1))
+            return f'{results} = stablehlo.top_k {operand} {{k = {k}}} : {sig}'
+        # %r:2 = stablehlo.composite "chlo.top_k" %x
+        #     {composite_attributes = {k = K : i64}, decomposition = @impl, ...} : sig
+        text = re.sub(
+            r'(%\S+:2)\s*=\s*stablehlo\.composite\s+"chlo\.top_k"\s+(%\S+)\s*'
+            r'\{[^{}]*\{[^{}]*k\s*=\s*(\d+)[^{}]*\}[^{}]*\}\s*:\s*'
+            r'(\([^)]*\)\s*->\s*\([^)]*\))',
+            rewrite_topk, text)
+        # Remove orphaned chlo.top_k.impl decomposition functions (balanced-brace
+        # body) — nothing calls them once the composite is gone.
+        for fn in set(topk_impls):
+            text = re.sub(
+                r'\n\s*func\.func\s+private\s+@' + re.escape(fn) +
+                r'\b.*?\n\s*\}\s*(?=\n)',
+                '\n', text, flags=re.DOTALL)
         # Rewrite stablehlo.composite to a func.call to its decomposition
         # function. The composite op groups other ops behind a name (e.g.
         # "chlo.erf"), and StableHLO emits the actual implementation as a

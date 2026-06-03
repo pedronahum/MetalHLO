@@ -152,6 +152,15 @@ public struct HLOAttributes: Sendable {
     /// Whether the sort should be stable.
     public var isStable: Bool?
 
+    // MARK: - Top-K Attributes
+
+    /// Number of largest elements to keep along the last axis (jax.lax.top_k).
+    public var topK: Int?
+
+    /// Result type of the top-k indices output (i32), captured at parse time so
+    /// the indices op can be split off from the same 2-result top_k op.
+    public var topKIndexType: TensorType?
+
     /// Sort descending instead of ascending.
     public var sortDescending: Bool?
 

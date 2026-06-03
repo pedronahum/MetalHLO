@@ -217,6 +217,21 @@ public enum HLOOpKind: String, CaseIterable, Sendable {
     /// Sort along dimension.
     case sort
 
+    // MARK: - Top-K (2 ops)
+    //
+    // jax.lax.top_k lowers to a single chlo.top_k that the bytecode
+    // preprocessor collapses to `stablehlo.top_k`. The parser splits that
+    // 2-result op into these two single-result ops (values + indices), each of
+    // which the fast CodeGenerator path lowers to its own kernel. Top-k always
+    // operates over the last axis and returns the k largest values in
+    // descending order plus their original positions.
+
+    /// Top-k values along the last axis (the k largest, descending).
+    case topKValues = "top_k_values"
+
+    /// Top-k indices along the last axis (positions of the k largest).
+    case topKIndices = "top_k_indices"
+
     // MARK: - Comparison Operations (2 ops)
 
     /// Comparison (EQ, NE, LT, LE, GT, GE).
@@ -449,7 +464,8 @@ extension HLOOpKind {
              .not, .clz, .convert, .reshape, .transpose, .broadcastInDim,
              .iota, .tan, .logistic, .isFinite, .reverse, .fft, .sort,
              .expm1, .log1p, .cbrt, .roundNearestAfz, .roundNearestEven,
-             .popcnt, .real, .imag, .cholesky, .bitcastConvert, .reducePrecision:
+             .popcnt, .real, .imag, .cholesky, .bitcastConvert, .reducePrecision,
+             .topKValues, .topKIndices:
             return .exactly(1)
 
         // Binary

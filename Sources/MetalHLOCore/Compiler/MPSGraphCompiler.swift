@@ -410,6 +410,13 @@ public final class MPSGraphCompiler {
         case .sort:
             return try compileSort(op)
 
+        // Top-k over the last axis (jax.lax.top_k), split into a values op and
+        // an indices op by the parser.
+        case .topKValues:
+            return try compileTopK(op, emitIndices: false)
+        case .topKIndices:
+            return try compileTopK(op, emitIndices: true)
+
         // Comparison
         case .compare:
             return try compileCompare(op)
@@ -3619,6 +3626,34 @@ public final class MPSGraphCompiler {
             descriptor: descriptor,
             name: op.result
         )
+    }
+
+    /// Compiles one half of a top_k (values or indices) over the last axis.
+    /// jax.lax.top_k keeps the k largest elements in descending order; ties
+    /// break toward the smaller original index. argSort with a descending order
+    /// gives the permutation; slicing its first k entries yields the indices,
+    /// and gathering the input along that permutation yields the values.
+    private func compileTopK(_ op: HLOOperation, emitIndices: Bool) throws -> MPSGraphTensor {
+        let input = try getOperand(op.operands[0])
+        let rank = op.resultType.shape.count
+        let axis = rank - 1  // top_k always operates on the last axis
+        let k = op.attributes.topK ?? op.resultType.shape.last ?? 0
+
+        // Descending sort permutation along the last axis.
+        let sortedIndices = graph.argSort(input, axis: axis, descending: true, name: nil)
+
+        if emitIndices {
+            // Slice the first k indices, cast to the result int type.
+            let topIndices = graph.sliceTensor(
+                sortedIndices, dimension: axis, start: 0, length: k, name: nil)
+            return graph.cast(topIndices, to: op.resultType.elementType.mpsDataType, name: op.result)
+        } else {
+            // Gather input into sorted order, then take the first k.
+            let sortedValues = graph.gatherAlongAxis(
+                axis, updates: input, indices: sortedIndices, name: nil)
+            return graph.sliceTensor(
+                sortedValues, dimension: axis, start: 0, length: k, name: op.result)
+        }
     }
 
     private func compileSort(_ op: HLOOperation) throws -> MPSGraphTensor {

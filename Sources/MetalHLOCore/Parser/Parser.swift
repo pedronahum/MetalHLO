@@ -129,6 +129,32 @@ public final class Parser {
                 if let first = resolvedOperands.first {
                     valueAliases[op.result] = first
                 }
+            } else if op.kind == .topKValues {
+                // top_k is a single 2-result op. Split it into a values op
+                // (result %name.0) and an indices op (result %name.1), both
+                // reading the same input. Downstream %name#0 / %name#1 refs are
+                // rewritten by the lexer to %name.0 / %name.1, so they resolve
+                // directly to these results — no alias needed. Each op carries
+                // the shared `k` attribute; the values op keeps the values
+                // (f32) result type and the indices op takes the stashed i32
+                // index type.
+                let resolvedOperands = op.operands.map { resolveAlias($0, aliases: valueAliases) }
+                operations.append(HLOOperation(
+                    result: "\(op.result).0",
+                    kind: .topKValues,
+                    operands: resolvedOperands,
+                    resultType: op.resultType,
+                    attributes: op.attributes
+                ))
+                if let indexType = op.attributes.topKIndexType {
+                    operations.append(HLOOperation(
+                        result: "\(op.result).1",
+                        kind: .topKIndices,
+                        operands: resolvedOperands,
+                        resultType: indexType,
+                        attributes: op.attributes
+                    ))
+                }
             } else if op.kind == .getTupleElement {
                 // Resolve get_tuple_element to the actual tensor
                 let tupleRef = resolveAlias(op.operands.first ?? "", aliases: valueAliases)
@@ -327,6 +353,13 @@ public final class Parser {
             opName = name
         }
 
+        // top_k arrives as a single 2-result op (values, indices). We model it
+        // with two single-result kinds; parse it under .topKValues here and the
+        // function-body loop splits off the .topKIndices companion op.
+        if opName == "top_k" {
+            return .topKValues
+        }
+
         guard let kind = HLOOpKind(rawValue: opName) else {
             throw ParseError.invalidOperation(
                 "Unknown operation '\(name)'",
@@ -375,6 +408,41 @@ public final class Parser {
                 _ = try parseTensorType()
             }
             return (operands, attributes, firstType)
+        } else if kind == .topKValues {
+            // top_k %x {k = K} : (intype) -> (vtype, itype)
+            // Parsed under .topKValues; the values type becomes resultType and
+            // the indices type is stashed so the main loop can split off the
+            // .topKIndices op. top_k always operates on the last axis.
+            let operand = try parsePercentIdentifier()
+            operands.append(operand)
+            _ = match(.comma)
+            // Attribute block: { k = K }
+            if match(.leftBrace) {
+                while !check(.rightBrace) && !check(.eof) {
+                    if checkIdentifier("k") {
+                        try expectIdentifier("k")
+                        try expect(.equal)
+                        attributes.topK = try parseInteger()
+                    } else {
+                        advance()
+                    }
+                    _ = match(.comma)
+                }
+                try expect(.rightBrace)
+            }
+            // Type signature: (intype) -> (vtype, itype)
+            try expect(.colon)
+            try expect(.leftParen)
+            _ = try parseTensorType()  // input type (operand type)
+            try expect(.rightParen)
+            try expect(.arrow)
+            try expect(.leftParen)
+            let valuesType = try parseTensorType()
+            try expect(.comma)
+            let indicesType = try parseTensorType()
+            try expect(.rightParen)
+            attributes.topKIndexType = indicesType
+            return (operands, attributes, valuesType)
         } else if kind == .getTupleElement {
             // Special handling for get_tuple_element: %tuple[index]
             (operands, attributes) = try parseGetTupleElementOperandsAndAttributes()

@@ -824,6 +824,27 @@ public final class CodeGenerator: @unchecked Sendable {
                 metalType: metalType
             )
 
+        // Top-k operations (values + indices over the last axis)
+        case .topKValues:
+            source += generateTopKKernel(
+                entryPoint: entryPoint,
+                inputShape: inputShapes.first ?? [],
+                k: attributes.topK ?? outputShape.last ?? 0,
+                emitIndices: false,
+                valueType: metalType
+            )
+
+        case .topKIndices:
+            // The output element type is i32; the input is read as float.
+            let inType = attributes.inputElementTypes?.first ?? .float32
+            source += generateTopKKernel(
+                entryPoint: entryPoint,
+                inputShape: inputShapes.first ?? [],
+                k: attributes.topK ?? outputShape.last ?? 0,
+                emitIndices: true,
+                valueType: metalTypeName(for: inType)
+            )
+
         // Iota operations
         case .iota:
             source += generateIotaKernel(
@@ -1846,6 +1867,90 @@ public final class CodeGenerator: @unchecked Sendable {
         \(indexCode)
             \(srcPosCalc)
             output[tid] = input[srcPos];
+        }
+        """
+    }
+
+    /// Generates a top-k kernel over the last axis. Each thread handles one row
+    /// (the flattened product of all leading dims) and selects the k largest
+    /// elements of that row in descending order. With `emitIndices == false` it
+    /// writes the k values; with `emitIndices == true` it writes their original
+    /// last-axis positions as int32. Ties break toward the smaller index, which
+    /// matches jax.lax.top_k's stable descending sort.
+    ///
+    /// The selection is an O(n·k) running top-k pass (k is small in practice),
+    /// avoiding a full sort. Buffer layout matches the other unary kernels:
+    /// buffer(0) = input, buffer(1) = output, buffer(2) = count.
+    private func generateTopKKernel(
+        entryPoint: String,
+        inputShape: [Int],
+        k: Int,
+        emitIndices: Bool,
+        valueType: String
+    ) -> String {
+        guard !inputShape.isEmpty, k > 0 else {
+            // Degenerate: nothing to select. Emit a no-op copy to keep wiring.
+            return generateCopyKernel(entryPoint: entryPoint, metalType: emitIndices ? "int" : valueType)
+        }
+
+        let n = inputShape.last ?? 0
+        let rows = n > 0 ? inputShape.reduce(1, *) / n : 0
+        let outType = emitIndices ? "int" : valueType
+        // The k-th selected element is written from the running top-k buffers.
+        let writeStmt = emitIndices
+            ? "output[base_out + j] = best_idx[j];"
+            : "output[base_out + j] = best_val[j];"
+
+        return """
+        kernel void \(entryPoint)(
+            device const \(valueType)* input [[buffer(0)]],
+            device \(outType)* output [[buffer(1)]],
+            constant uint& count [[buffer(2)]],
+            uint tid [[thread_position_in_grid]])
+        {
+            if (tid >= \(rows)) return;
+            const uint n = \(n);
+            const uint k = \(k);
+            uint base_in = tid * n;
+            uint base_out = tid * k;
+
+            // Running top-k held in descending order. best_val[0] is the
+            // current maximum. Capacity is the compile-time constant k.
+            \(valueType) best_val[\(k)];
+            int best_idx[\(k)];
+            uint filled = 0;
+
+            for (uint i = 0; i < n; ++i) {
+                \(valueType) v = input[base_in + i];
+                // Find insertion position: keep descending order, and on ties
+                // place the new (larger-index) element AFTER existing ones so
+                // the smaller original index sorts first (stable descending).
+                if (filled < k) {
+                    uint pos = filled;
+                    while (pos > 0 && best_val[pos - 1] < v) {
+                        best_val[pos] = best_val[pos - 1];
+                        best_idx[pos] = best_idx[pos - 1];
+                        --pos;
+                    }
+                    best_val[pos] = v;
+                    best_idx[pos] = int(i);
+                    ++filled;
+                } else if (v > best_val[k - 1]) {
+                    // Displace the current k-th element.
+                    uint pos = k - 1;
+                    while (pos > 0 && best_val[pos - 1] < v) {
+                        best_val[pos] = best_val[pos - 1];
+                        best_idx[pos] = best_idx[pos - 1];
+                        --pos;
+                    }
+                    best_val[pos] = v;
+                    best_idx[pos] = int(i);
+                }
+            }
+
+            for (uint j = 0; j < k; ++j) {
+                \(writeStmt)
+            }
         }
         """
     }
@@ -6805,6 +6910,13 @@ public final class CodeGenerator: @unchecked Sendable {
                  .dynamicSlice, .dynamicUpdateSlice:
                 // These kernels are NOT vectorized - 1 thread per element
                 return DispatchConfig.dispatch1D(elements: totalElements, threadgroupSize: 256)
+            case .topKValues, .topKIndices:
+                // One thread per output row (all dims except the last). Each
+                // thread selects the k largest of its input row. k = last output
+                // dim, so rows = totalOutputElements / k.
+                let k = outputShape.last ?? 1
+                let rows = k > 0 ? totalElements / k : totalElements
+                return DispatchConfig.dispatch1D(elements: max(rows, 1), threadgroupSize: 256)
             default:
                 break
             }
