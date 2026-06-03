@@ -2490,7 +2490,20 @@ public final class Parser {
                 try expectIdentifier("dimension")
                 try expect(.equal)
                 attributes.axis = try parseInteger()
-                if match(.colon) { advance() }  // consume `: i64`
+                // Optional `: i64` type annotation on the dimension attribute.
+                // Distinguish from the op's RESULT-type colon in the short form
+                // `stablehlo.sort %a, dimension = 0 : tensor<...>` (no comparator
+                // region) — only consume when an integer type follows; otherwise
+                // leave the colon for the main parser's result-type parsing.
+                if check(.colon) {
+                    let next = peekNext()
+                    let intTypes: Set<String> = ["i1", "i8", "i16", "i32", "i64", "index",
+                                                 "ui8", "ui16", "ui32", "ui64"]
+                    if next.kind == .identifier, intTypes.contains(next.text) {
+                        advance()  // ':'
+                        advance()  // 'i64'
+                    }
+                }
             } else if checkIdentifier("is_stable") {
                 try expectIdentifier("is_stable")
                 try expect(.equal)
@@ -3845,6 +3858,16 @@ public final class Parser {
         while currentToken.kind == .newline {
             currentToken = lexer.nextToken()
         }
+    }
+
+    /// Returns the token after `currentToken` without consuming it.
+    private func peekNext() -> Token {
+        if peekedToken == nil {
+            var t = lexer.nextToken()
+            while t.kind == .newline { t = lexer.nextToken() }
+            peekedToken = t
+        }
+        return peekedToken!
     }
 
     private func check(_ kind: TokenKind) -> Bool {
