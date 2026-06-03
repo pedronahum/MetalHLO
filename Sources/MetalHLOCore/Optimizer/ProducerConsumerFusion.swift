@@ -743,6 +743,7 @@ public struct ReduceFusion: Sendable {
         case .mean: return "mean"
         case .product: return "product"
         case .and, .or: return nil  // not supported by the fused kernel
+        case .logAddExp: return nil // window-only (cumlogsumexp); not a fusable reduce
         }
     }
 

@@ -602,6 +602,8 @@ internal struct MILOpTranslator {
         case .product: milOp = "reduce_prod"
         case .and, .or:
             throw MILEmitterError.unsupportedOperation(.reduce, "boolean reduction not supported on ANE")
+        case .logAddExp:
+            throw MILEmitterError.unsupportedOperation(.reduce, "logAddExp reduction not supported on ANE")
         }
 
         // Determine if we keep dims based on output shape

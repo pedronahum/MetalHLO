@@ -1175,6 +1175,10 @@ public final class MPSGraphCompiler {
             // Bitwise OR reduction: any non-zero → 1, all zero → 0
             // Equivalent to checking if maximum > 0 for boolean inputs
             reduced = graph.reductionMaximum(with: input, axes: axesNS, name: nil)
+        case .logAddExp:
+            // logAddExp is only produced for reduce_window (cumlogsumexp), never
+            // a plain reduce; MPSGraph has no log-add-exp reduction primitive.
+            throw CompilationError.unsupportedOperation("reduce logAddExp not supported on MPSGraph")
         case .none:
             throw CompilationError.missingAttribute("reductionKind", operation: "reduce")
         }
@@ -3266,6 +3270,10 @@ public final class MPSGraphCompiler {
         case .or:
             // OR reduction via max pooling (boolean inputs: max of any = OR)
             return graph.maxPooling2D(withSourceTensor: processedInput, descriptor: descriptor, name: op.result)
+        case .logAddExp:
+            // logAddExp windows (cumlogsumexp) are handled by the fast
+            // CodeGenerator path; MPSGraph has no log-add-exp pooling primitive.
+            throw CompilationError.unsupportedOperation("reduce_window logAddExp not supported on MPSGraph")
         }
     }
 

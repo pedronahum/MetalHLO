@@ -2743,6 +2743,9 @@ public final class CodeGenerator: @unchecked Sendable {
         case .or:
             initValue = "0"
             accumOp = "accum = accum | val;"
+        case .logAddExp:
+            // Only emitted for reduce_window (cumlogsumexp), never plain reduce.
+            fatalError("logAddExp reduction is only supported via reduce_window")
         }
 
         let source = """
@@ -2914,6 +2917,9 @@ public final class CodeGenerator: @unchecked Sendable {
         case .product: initValue = "1"
         case .and: initValue = "1"
         case .or: initValue = "0"
+        // log-add-exp identity is -inf (logsumexp of the empty set), matching
+        // the 0xFF800000 (-inf) init constant JAX feeds the reduce_window.
+        case .logAddExp: initValue = "-INFINITY"
         }
 
         var code = """
@@ -2946,6 +2952,15 @@ public final class CodeGenerator: @unchecked Sendable {
         // Count for mean computation
         if reductionKind == .mean {
             code += "    int window_count = 0;\n"
+        }
+
+        // log-add-exp seeds acc with -inf, but Metal's fast-math contracts treat
+        // infinities as UB, so a -inf accumulator can poison the first combine.
+        // Track whether any element has been folded in yet and assign the first
+        // one directly (logaddexp(-inf, x) == x), keeping the stable form only
+        // for subsequent elements. This is exact and avoids all inf arithmetic.
+        if reductionKind == .logAddExp {
+            code += "    bool acc_seen = false;\n"
         }
 
         // Generate nested loops for window dimensions
@@ -3007,6 +3022,25 @@ public final class CodeGenerator: @unchecked Sendable {
             code += "            acc = \(metalType)(int(acc) & int(val));\n"
         case .or:
             code += "            acc = \(metalType)(int(acc) | int(val));\n"
+        case .logAddExp:
+            // Numerically stable logaddexp, mirroring JAX's reducer region:
+            //   m = max(acc, val); d = acc - val;
+            //   result = m + log1p(exp(-|d|))
+            // The d != d (NaN) guard handles acc == val == -inf, where d is NaN;
+            // there the stable form is undefined, so fall back to acc + val (= -inf)
+            // exactly as the source select(NE d d, acc+val, ...) does.
+            code += "            if (!acc_seen) {\n"
+            code += "                acc = val;\n"
+            code += "                acc_seen = true;\n"
+            code += "            } else {\n"
+            // MSL has no log1p; the argument 1 + exp(-|d|) is always in [1, 2],
+            // so log(1 + e) loses no precision versus log1p(e) here (log1p only
+            // matters when e is near 0, but e + 1 >= 1 keeps full mantissa).
+            code += "                \(metalType) m = max(acc, val);\n"
+            code += "                \(metalType) d = acc - val;\n"
+            code += "                \(metalType) stable = m + \(metalType)(log(\(metalType)(1) + exp(-abs(d))));\n"
+            code += "                acc = (d != d) ? (acc + val) : stable;\n"
+            code += "            }\n"
         }
 
         if !boundsChecks.isEmpty {
@@ -5168,6 +5202,12 @@ public final class CodeGenerator: @unchecked Sendable {
         case .product: reductionOp = .prod
         case .and: reductionOp = .sum  // Bitwise AND treated as sum of bools for now
         case .or: reductionOp = .max   // Bitwise OR treated as max of bools for now
+        case .logAddExp:
+            // logAddExp is only produced for reduce_window (cumlogsumexp); it is
+            // never emitted as a plain `reduce` reducer (JAX lowers logsumexp into
+            // reduce-max + exp + sum + log instead). Reaching here means routing
+            // sent a logAddExp window down the full-axis reduce path.
+            fatalError("logAddExp reduction is only supported via reduce_window")
         }
 
         // Analyze the reduction pattern and try to use specialized kernels
@@ -5277,6 +5317,9 @@ public final class CodeGenerator: @unchecked Sendable {
             accumOp = "accum = float(int(accum) | int(val));"
             reduceOp = "float(int(a) | int(b))"
             initValue = "0.0f"
+        case .logAddExp:
+            // Only emitted for reduce_window (cumlogsumexp), never plain reduce.
+            fatalError("logAddExp reduction is only supported via reduce_window")
         }
 
         // NOTE: reduce operation has two inputs: data (buffer 0) and init value (buffer 1)
@@ -5396,6 +5439,9 @@ public final class CodeGenerator: @unchecked Sendable {
             initValue = "0.0f"
             reduceOp = "float(int(a) | int(b))"
             scalarReduceExpr = { acc, val in "float(int(\(acc)) | int(\(val)))" }
+        case .logAddExp:
+            // Only emitted for reduce_window (cumlogsumexp), never plain reduce.
+            fatalError("logAddExp reduction is only supported via reduce_window")
         }
 
         // Build the MLX-style interleaved inner loop. The Metal compiler issues
@@ -5514,6 +5560,9 @@ public final class CodeGenerator: @unchecked Sendable {
         case .product:    initValue = "1.0f"; reduceOp = "a * b";   accumOp = "accum *= val;"
         case .and:        initValue = "1.0f"; reduceOp = "float(int(a) & int(b))"; accumOp = "accum = float(int(accum) & int(val));"
         case .or:         initValue = "0.0f"; reduceOp = "float(int(a) | int(b))"; accumOp = "accum = float(int(accum) | int(val));"
+        case .logAddExp:
+            // Only emitted for reduce_window (cumlogsumexp), never plain reduce.
+            fatalError("logAddExp reduction is only supported via reduce_window")
         }
 
         let source = """
@@ -5585,6 +5634,9 @@ public final class CodeGenerator: @unchecked Sendable {
                         \(varName) = float(int(\(varName)) | int(simd_shuffle_down(\(varName), _off)));
                     }
             """
+        case .logAddExp:
+            // Only emitted for reduce_window (cumlogsumexp), never plain reduce.
+            fatalError("logAddExp reduction is only supported via reduce_window")
         }
     }
 

@@ -829,6 +829,8 @@ public struct CoreMLOpBuilder {
         case .product: milOp = "reduce_prod"
         case .and, .or:
             throw MILEmitterError.unsupportedOperation(.reduce, "boolean reduction not supported on ANE")
+        case .logAddExp:
+            throw MILEmitterError.unsupportedOperation(.reduce, "logAddExp reduction not supported on ANE")
         }
 
         let inputShape = operandShapes[op.operands[0]] ?? []

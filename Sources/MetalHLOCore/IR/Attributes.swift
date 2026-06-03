@@ -446,6 +446,11 @@ public enum ReductionKind: Sendable {
     case product
     case and
     case or
+    /// Numerically stable log-add-exp: combine(a, b) = max(a, b) + log1p(exp(-|a - b|)).
+    /// This is the reducer jax.lax.cumlogsumexp emits as a reduce_window region;
+    /// it is associative/commutative so it composes over a window like any other
+    /// reduction. The `-inf` init element acts as the identity.
+    case logAddExp
 }
 
 /// Scatter computation kind for combining values.

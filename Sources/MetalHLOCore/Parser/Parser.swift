@@ -694,6 +694,13 @@ public final class Parser {
     /// Tracks whether the last parsed operation name was in generic form (quoted)
     private var isGenericForm = false
 
+    /// Set by parseOperationRegion when the region it just consumed is the
+    /// numerically-stable log-add-exp combiner jax.lax.cumlogsumexp emits
+    /// (signature: a `log_plus_one` op inside the reducer). The reducer's first
+    /// op is `maximum`, so the generic computation-kind scan returns `.max`;
+    /// this flag lets the reduce_window caller override that to `.logAddExp`.
+    private var lastRegionWasLogAddExp = false
+
     private func parseOperationName() throws -> String {
         var name = ""
         isGenericForm = false
@@ -889,6 +896,22 @@ public final class Parser {
                             attributes.reductionKind = .min
                         } else if t == "stablehlo.multiply" || t == "multiply" {
                             attributes.reductionKind = .product
+                        }
+                    }
+                    // jax.lax.cumlogsumexp emits a reduce_window whose reducer is
+                    // a numerically-stable log-add-exp, not a plain reduction:
+                    //   max(a,b); d=a-b; nan=(d!=d); s=a+b; e=exp(-|d|);
+                    //   l=log1p(e); r=max+l; select(nan, s, r)
+                    // The first op in that region is `maximum`, so the matcher
+                    // above mis-detects it as `.max`. The `log_plus_one`
+                    // (log1p) op appears only in this logaddexp combiner, so use
+                    // it as the unambiguous signature and override the earlier
+                    // guess. Without this, cumlogsumexp computes a cumulative
+                    // max instead of a cumulative logsumexp.
+                    if kind == .reduceWindow && currentToken.kind == .identifier {
+                        let t = currentToken.text
+                        if t == "stablehlo.log_plus_one" || t == "log_plus_one" {
+                            attributes.reductionKind = .logAddExp
                         }
                     }
                     // Detect scatter combine op the same way — JAX-emitted
@@ -1204,12 +1227,19 @@ public final class Parser {
             } else if kind == .reduceWindow {
                 // Map the reducer region (stablehlo.add for cumsum) onto the
                 // reduce_window reduction kind so codegen sums the window.
-                switch computationKind {
-                case .add: attributes.reductionKind = .sum
-                case .max: attributes.reductionKind = .max
-                case .min: attributes.reductionKind = .min
-                case .mul: attributes.reductionKind = .product
-                default: break
+                if lastRegionWasLogAddExp {
+                    // cumlogsumexp's stable log-add-exp reducer leads with a
+                    // `maximum` op, so computationKind is .max here; the
+                    // log_plus_one signature corrects it to the real combiner.
+                    attributes.reductionKind = .logAddExp
+                } else {
+                    switch computationKind {
+                    case .add: attributes.reductionKind = .sum
+                    case .max: attributes.reductionKind = .max
+                    case .min: attributes.reductionKind = .min
+                    case .mul: attributes.reductionKind = .product
+                    default: break
+                    }
                 }
             }
         }
@@ -2583,6 +2613,7 @@ public final class Parser {
         skipNewlines()
 
         var computationKind: ScatterComputationKind? = nil
+        lastRegionWasLogAddExp = false
 
         // Track brace depth to handle nested braces
         var braceDepth = 1
@@ -2610,6 +2641,13 @@ public final class Parser {
                     computationKind = .min
                 } else if text == "stablehlo.multiply" || text == "multiply" {
                     computationKind = .mul
+                } else if text == "stablehlo.log_plus_one" || text == "log_plus_one" {
+                    // log_plus_one appears only in cumlogsumexp's reduce_window
+                    // reducer (a stable log-add-exp), never in a plain scatter/
+                    // reduce combiner. Flag it so the reduce_window caller maps
+                    // this region to .logAddExp instead of the .max it would
+                    // otherwise infer from the leading `maximum` op.
+                    lastRegionWasLogAddExp = true
                 }
                 // If we see stablehlo.return without having found an operation,
                 // the region is identity (just returns the update argument)
