@@ -49,6 +49,21 @@ public final class Parser {
         } else {
             moduleName = "module"
         }
+        // Optional module attribute dict: `attributes { ... }` (JAX emits
+        // mhlo.num_partitions/num_replicas here). Skip the balanced braces.
+        if checkIdentifier("attributes") {
+            advance()
+            if check(.leftBrace) {
+                advance()
+                var depth = 1
+                while depth > 0 && !check(.eof) {
+                    if check(.leftBrace) { depth += 1 }
+                    else if check(.rightBrace) { depth -= 1 }
+                    advance()
+                }
+            }
+            skipNewlines()
+        }
         try expect(.leftBrace)
         skipNewlines()
 
@@ -77,9 +92,10 @@ public final class Parser {
         // Expect: func.func [private] @name(args) -> (return_types) {
         try expectIdentifier("func.func")
 
-        // Check for 'private' visibility
+        // Check for visibility: `private` or `public` (JAX marks the entry
+        // `public`). Only `private` affects how we treat the function.
         let isPrivate = checkIdentifier("private")
-        if isPrivate { advance() }
+        if isPrivate || checkIdentifier("public") { advance() }
 
         let funcName = try parseAtIdentifier()
         let inputs = try parseFunctionArguments()
@@ -239,6 +255,8 @@ public final class Parser {
                 let name = try parsePercentIdentifier()
                 try expect(.colon)
                 let type = try parseTensorType()
+                // Optional per-arg attribute dict, e.g. `{mhlo.sharding = ...}`.
+                skipOptionalAttributeDict()
                 args.append(HLOArgument(name: name, type: type))
             } while match(.comma)
         }
@@ -256,6 +274,9 @@ public final class Parser {
             if !check(.rightParen) {
                 repeat {
                     let type = try parseTensorType()
+                    // Optional per-result attribute dict, e.g.
+                    // `{jax.result_info = "result"}` on the entry's outputs.
+                    skipOptionalAttributeDict()
                     types.append(type)
                 } while match(.comma)
             }
@@ -266,6 +287,21 @@ public final class Parser {
             // Bare return type (e.g., -> tensor<3x3xf32>)
             let type = try parseTensorType()
             return [type]
+        }
+    }
+
+    /// Skips an optional MLIR attribute dictionary `{ ... }` (balanced braces)
+    /// when one immediately follows. Used for per-argument / per-result
+    /// attributes that JAX attaches to entry-function signatures (sharding,
+    /// jax.result_info, …) which carry no semantics for the fast path.
+    private func skipOptionalAttributeDict() {
+        guard check(.leftBrace) else { return }
+        advance()
+        var depth = 1
+        while depth > 0 && !check(.eof) {
+            if check(.leftBrace) { depth += 1 }
+            else if check(.rightBrace) { depth -= 1 }
+            advance()
         }
     }
 

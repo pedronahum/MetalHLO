@@ -23,6 +23,12 @@ public struct FunctionInliner {
     /// returned unchanged so this is effectively free.
     public static func inline(_ module: HLOModule) -> HLOModule {
         let entry = module.function
+        // A `call` may also sit inside a while body (the threefry pattern:
+        // entry -> @threefry2x32 holds a while whose body calls @closed_call).
+        // Such nested calls aren't flattened here (regions are opaque to this
+        // pass), but the helper functions they reach must survive so a later
+        // pass (the while unroller, then a second inline) can still resolve
+        // them — hence we retain the module's other functions in the result.
         guard entry.operations.contains(where: { $0.kind == .call }) else {
             return module
         }
@@ -52,7 +58,15 @@ public struct FunctionInliner {
             returnValues: newReturns
         )
 
-        return HLOModule(name: module.name, functions: [newEntry])
+        // Retain non-entry functions so calls left inside while bodies remain
+        // resolvable for a subsequent inline pass.
+        var functions = module.functions
+        if let idx = functions.firstIndex(where: { $0.name == entry.name }) {
+            functions[idx] = newEntry
+        } else {
+            functions.insert(newEntry, at: 0)
+        }
+        return HLOModule(name: module.name, functions: functions)
     }
 
     /// Recursively rewrites a list of operations, inlining any `call` ops.

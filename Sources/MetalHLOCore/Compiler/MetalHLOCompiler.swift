@@ -168,7 +168,21 @@ public final class MetalHLOCompiler: @unchecked Sendable {
         // (main -> call @cumsum -> call @cumsum_0); without inlining these the
         // calls produce no output. No-op when the entry has no calls.
         let parsedModule = try parseFullModule(mlir)
-        let parsed = FunctionInliner.inline(parsedModule).function
+        // STAGE 1.05: INLINE → UNROLL COUNTED WHILE LOOPS → INLINE.
+        // The fast path has no runtime control flow. JAX lowers some composites
+        // (notably jax.random's threefry2x32 block) through a private helper
+        // that wraps a `while` with a static trip count around a nested
+        // func.call. Three steps flatten this for the fast path:
+        //   1. inline the helper so the entry contains the while op;
+        //   2. unroll the counted loop, hoisting its body (incl. the nested
+        //      func.call) to the entry as straight-line ops;
+        //   3. inline again to flatten the now-top-level body calls.
+        // Each step is a no-op when its pattern is absent (no calls / no while
+        // loops), so non-RNG programs pay nothing. Non-counted loops are left
+        // untouched for the MPSGraph path.
+        let inlined1 = FunctionInliner.inline(parsedModule)
+        let unrolled = WhileLoopUnroller.unroll(inlined1)
+        let parsed = FunctionInliner.inline(unrolled).function
 
         // ═══════════════════════════════════════════════════════════════
         // STAGE 1.5: TF32 MATMUL TRANSFORM (env-gated, no-op if disabled)
