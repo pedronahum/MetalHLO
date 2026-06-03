@@ -2668,7 +2668,11 @@ public final class CodeGenerator: @unchecked Sendable {
         attributes: HLOAttributes,
         metalType: String
     ) -> String {
-        guard inputShape.count >= 3, outputShape.count >= 3 else {
+        // Rank 1 and 2 reduce_windows are how JAX lowers jnp.cumsum (a windowed
+        // prefix sum with left padding) along a single axis; the loop/bounds
+        // logic below is rank-general, so support any rank >= 1.
+        guard inputShape.count >= 1, outputShape.count >= 1,
+              inputShape.count == outputShape.count else {
             return generateCopyKernel(entryPoint: entryPoint, metalType: metalType)
         }
 

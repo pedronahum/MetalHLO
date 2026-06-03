@@ -594,6 +594,35 @@ public final class Parser {
             try expect(.rightParen)
         }
 
+        // Parse the inherent-attributes (properties) block emitted in the
+        // newer generic form: <{ attr = value, ... }>. JAX 0.10 lowers
+        // jnp.cumsum / jax.lax.cumsum to a generic stablehlo.reduce_window with
+        // the window/padding/dilation attributes inside this `<{...}>` dict and
+        // the reducer expressed as a trailing region. Route reduce_window to its
+        // dedicated attribute parser so window_dimensions / padding / dilations
+        // are captured instead of silently skipped.
+        if check(.leftAngle) {
+            advance() // consume '<'
+            if match(.leftBrace) {
+                if kind == .reduceWindow {
+                    let windowAttrs = try parseReduceWindowAttributes()
+                    attributes.windowDimensions = windowAttrs.windowDimensions
+                    attributes.windowStrides = windowAttrs.windowStrides
+                    attributes.convPadding = windowAttrs.convPadding
+                    attributes.baseDilations = windowAttrs.baseDilations
+                    attributes.windowDilations = windowAttrs.windowDilations
+                }
+                // Skip any remaining/unknown attributes up to the closing brace.
+                while !check(.rightBrace) && !check(.eof) {
+                    advance()
+                }
+                try expect(.rightBrace)
+            }
+            if check(.rightAngle) {
+                advance() // consume '>'
+            }
+        }
+
         // Parse region if present: ({^bb0(%arg0: type, %arg1: type): ops... })
         // This appears between operands and attributes for ops like scatter and reduce.
         // The region body determines the computation kind (e.g., identity, add, max).
@@ -601,6 +630,16 @@ public final class Parser {
             let computationKind = try parseOperationRegion()
             if kind == .scatter {
                 attributes.scatterComputationKind = computationKind
+            } else if kind == .reduceWindow {
+                // Map the reducer region (stablehlo.add for cumsum) onto the
+                // reduce_window reduction kind so codegen sums the window.
+                switch computationKind {
+                case .add: attributes.reductionKind = .sum
+                case .max: attributes.reductionKind = .max
+                case .min: attributes.reductionKind = .min
+                case .mul: attributes.reductionKind = .product
+                default: break
+                }
             }
         }
 
@@ -1300,17 +1339,34 @@ public final class Parser {
                 if check(.colon) {
                     advance()
                 }
+                // MLIR dense-array syntax lists elements bare (no brackets):
+                //   array<i64: 1, 2, 3>  or  array<i64>  (empty).
+                // The element list is terminated by the closing '>'.
+                var dims: [Int] = []
+                if !check(.rightAngle) {
+                    repeat {
+                        dims.append(try parseInteger())
+                    } while match(.comma)
+                }
+                if check(.rightAngle) {
+                    advance()
+                }
+                return dims
             }
         }
+        // Fallback for the bracketed form: [1, 2, 3]
         return try parseDimensionList()
     }
 
     private func parsePaddingArray() throws -> [[Int]] {
         var result: [[Int]] = []
 
-        if checkIdentifier("dense") {
-            // dense<0> or dense<[[0,0],[0,0]]> format
-            try expectIdentifier("dense")
+        if checkIdentifier("dense") || checkKeyword(.dense) {
+            // dense<0> or dense<[[0,0],[0,0]]> format.
+            // `dense` is tokenized as a keyword (constant literals use it), so
+            // accept either spelling — the generic reduce_window form JAX emits
+            // for cumsum writes `padding = dense<[[7, 0]]> : tensor<1x2xi64>`.
+            advance()
             try expect(.leftAngle)
 
             if case .integer(_) = currentToken.kind {
@@ -1338,11 +1394,28 @@ public final class Parser {
 
             try expect(.rightAngle)
 
-            // Skip tensor type if present
+            // Skip the dense literal's element type if present, e.g.
+            //   dense<[[7, 0]]> : tensor<1x2xi64>
+            // The `tensor<...>` itself contains angle brackets, so track depth
+            // and consume the matching closing '>' rather than stopping at the
+            // first one (which would leak a stray '>' into the surrounding
+            // attribute dict and silently drop later attributes).
             if check(.colon) {
                 advance()
-                while !check(.comma) && !check(.eof) && !check(.rightAngle) {
-                    advance()
+                var angleDepth = 0
+                while !check(.eof) {
+                    if check(.leftAngle) {
+                        angleDepth += 1
+                        advance()
+                    } else if check(.rightAngle) {
+                        if angleDepth == 0 { break }
+                        angleDepth -= 1
+                        advance()
+                    } else if angleDepth == 0 && check(.comma) {
+                        break
+                    } else {
+                        advance()
+                    }
                 }
             }
         } else if check(.leftBracket) {

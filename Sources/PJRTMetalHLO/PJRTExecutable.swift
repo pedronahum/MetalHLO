@@ -1705,6 +1705,15 @@ func pjrt_client_compile(
         try? mlirSource.write(toFile: filename, atomically: true, encoding: .utf8)
     }
 
+    // Preserve the pre-transform source. The text-level call inliners below
+    // only flatten a single level of @main wrappers and mishandle multi-level
+    // private-call chains (e.g. JAX's jnp.cumsum: main -> @cumsum -> @cumsum_0),
+    // leaving a dangling call to an already-deleted helper. For such residual
+    // call cases (no while/linalg control flow) we fall back to compiling the
+    // ORIGINAL module through the fast path, whose Swift FunctionInliner
+    // flattens nested calls correctly.
+    let preTransformSource = mlirSource
+
     // Step 1: Inline simple call wrappers (@main -> @private_func)
     mlirSource = inlineSimpleCallWrapper(mlirSource)
     // Step 2: Unroll static while loops (from fori_loop)
@@ -1739,7 +1748,15 @@ func pjrt_client_compile(
         let hasCall = mlirSource.contains("call @")
             || mlirSource.contains("func.func private")
 
-        let needsMPSGraph = hasWhileLoop || hasLinAlg || hasCall
+        // Residual calls without while/linalg control flow are nested
+        // private-call chains the text inliner couldn't flatten (and which it
+        // may have corrupted). Compile the untouched original through the fast
+        // path instead — its Swift FunctionInliner handles arbitrary nesting.
+        var needsMPSGraph = hasWhileLoop || hasLinAlg || hasCall
+        if hasCall && !hasWhileLoop && !hasLinAlg {
+            mlirSource = preTransformSource
+            needsMPSGraph = false
+        }
 
         let compileStart = CFAbsoluteTimeGetCurrent()
         let mlirLines = mlirSource.components(separatedBy: "\n").count

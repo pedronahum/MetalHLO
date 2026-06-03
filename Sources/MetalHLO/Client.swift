@@ -235,9 +235,9 @@ public final class Client: @unchecked Sendable {
     private func compileHeterogeneous(_ mlir: String, config: CompilationConfig) throws -> Executable {
         // Parse MLIR to get the HLO function
         let parser = Parser(source: mlir)
-        let module: HLOModule
+        let parsedModule: HLOModule
         do {
-            module = try parser.parse()
+            parsedModule = try parser.parse()
         } catch let error as ParseError {
             let location = error.location ?? SourceLocation(line: 1, column: 1, offset: 0)
             throw MetalHLOError.parseFailed(
@@ -246,6 +246,12 @@ public final class Client: @unchecked Sendable {
                 message: error.description
             )
         }
+
+        // Flatten any func.call into the entry function. The heterogeneous
+        // executor runs a single function and has no cross-function call
+        // support, so unresolved calls would silently produce no output (JAX
+        // lowers composites like jnp.cumsum through nested private helpers).
+        let module = FunctionInliner.inline(parsedModule)
 
         // Analyze whether heterogeneous execution is beneficial
         let analyzer = ANEAnalyzer()

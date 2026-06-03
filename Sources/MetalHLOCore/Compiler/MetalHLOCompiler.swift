@@ -161,7 +161,14 @@ public final class MetalHLOCompiler: @unchecked Sendable {
         // ═══════════════════════════════════════════════════════════════
         // STAGE 1: PARSE
         // ═══════════════════════════════════════════════════════════════
-        let parsed = try parseModule(mlir)
+        // STAGE 1.1: INLINE CALLS
+        // The fast path compiles a single function and has no cross-function
+        // call support, so flatten any func.call into the entry function. JAX
+        // lowers composites like jnp.cumsum through private helper functions
+        // (main -> call @cumsum -> call @cumsum_0); without inlining these the
+        // calls produce no output. No-op when the entry has no calls.
+        let parsedModule = try parseFullModule(mlir)
+        let parsed = FunctionInliner.inline(parsedModule).function
 
         // ═══════════════════════════════════════════════════════════════
         // STAGE 1.5: TF32 MATMUL TRANSFORM (env-gated, no-op if disabled)
@@ -286,6 +293,17 @@ public final class MetalHLOCompiler: @unchecked Sendable {
         do {
             let module = try parser.parse()
             return module.function
+        } catch {
+            throw MetalCompilationError.parseError(error.localizedDescription)
+        }
+    }
+
+    /// Parses MLIR to the full module (entry + private helper functions),
+    /// preserving call targets needed for inlining.
+    private func parseFullModule(_ mlir: String) throws -> HLOModule {
+        let parser = Parser(source: mlir)
+        do {
+            return try parser.parse()
         } catch {
             throw MetalCompilationError.parseError(error.localizedDescription)
         }
