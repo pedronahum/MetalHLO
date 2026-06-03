@@ -153,6 +153,10 @@ public final class Parser {
         // Tuple elimination: track tuple compositions and value aliases
         var tupleOperands: [String: [String]] = [:]
         var valueAliases: [String: String] = [:]
+        // Most recent @lapack_sgeqrf_ffi input (matrix A), so the paired
+        // @lapack_sorgqr_ffi (which materializes Q) can be re-rooted on A and the
+        // whole QR decomposition recomputed host-side from the original matrix.
+        var lastGeqrfInput: String? = nil
 
         while !check(.rightBrace) && !check(.eof) {
             if checkKeyword(.return) {
@@ -376,6 +380,60 @@ public final class Parser {
                 if let firstOperand = resolvedOperands.first {
                     valueAliases["\(op.result).0"] = firstOperand
                 }
+            } else if op.kind == .customCall,
+                      let target = op.attributes.callTargetName,
+                      target.hasPrefix("lapack_sgeqrf") || target.hasPrefix("lapack_dgeqrf") {
+                // QR factorization LAPACK FFI: `@lapack_sgeqrf_ffi(%A)` returns a
+                // 2-tuple (#0 factored A [M×N], #1 tau [min(M,N)]). Result #0 holds
+                // R in its upper triangle and the Householder reflectors below the
+                // diagonal; the surrounding StableHLO wrapper slices it to the
+                // top-left block and zeroes the strict lower triangle to form R.
+                // Result #1 (tau) is consumed only by the paired @lapack_sorgqr_ffi
+                // call, which we re-root on A below, so tau is never materialized.
+                //
+                // The decomposition runs host-side via Accelerate LAPACK (see
+                // MetalExecutor's host-QR shortcut). Here we route result #0 to a
+                // native `.qr` op tagged component 1 (the factored matrix), which
+                // feeds the R-forming slice/select ops, and remember A so the
+                // sorgqr call can recompute Q from it.
+                let resolvedOperands = op.operands.map { resolveAlias($0, aliases: valueAliases) }
+                let inputA = resolvedOperands.first
+                lastGeqrfInput = inputA
+                var factoredAttrs = op.attributes
+                factoredAttrs.tupleIndex = 1   // 1 = geqrf factored matrix
+                operations.append(HLOOperation(
+                    result: "\(op.result).0",
+                    kind: .qr,
+                    operands: resolvedOperands,
+                    resultType: op.resultType,   // result #0 == input shape M×N
+                    attributes: factoredAttrs
+                ))
+                // tau (#1) is unused once sorgqr is re-rooted on A; alias it to the
+                // input so any stray reference resolves to a valid value.
+                if let inputA {
+                    valueAliases["\(op.result).1"] = inputA
+                }
+            } else if op.kind == .customCall,
+                      let target = op.attributes.callTargetName,
+                      target.hasPrefix("lapack_sorgqr") || target.hasPrefix("lapack_dorgqr") {
+                // Materialize Q LAPACK FFI: `@lapack_sorgqr_ffi(%factored, %tau)`
+                // returns Q. Its result type carries Q's shape (M×min for reduced
+                // mode, M×M for complete), which the host shortcut reads to pick the
+                // sorgqr column count. The decomposition runs host-side from the
+                // original matrix A (captured at the paired geqrf call), so route
+                // the single result to a native `.qr` op tagged component 0 (Q),
+                // re-rooted on A rather than the geqrf intermediate.
+                let resolvedOperands = op.operands.map { resolveAlias($0, aliases: valueAliases) }
+                let qOperand = lastGeqrfInput ?? resolvedOperands.first
+                var qAttrs = op.attributes
+                qAttrs.tupleIndex = 0   // 0 = Q
+                operations.append(HLOOperation(
+                    result: op.result,
+                    kind: .qr,
+                    operands: qOperand.map { [$0] } ?? resolvedOperands,
+                    resultType: op.resultType,   // Q shape (M×min or M×M)
+                    attributes: qAttrs
+                ))
             } else if op.kind == .caseOp, let branches = op.attributes.caseRegions {
                 // stablehlo.case (jax.lax.switch): an integer index operand selects
                 // among N branch regions. The fast CodeGenerator path has no runtime

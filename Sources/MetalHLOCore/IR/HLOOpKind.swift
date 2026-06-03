@@ -201,6 +201,14 @@ public enum HLOOpKind: String, CaseIterable, Sendable {
     /// LAPACK. Produces three results: `.0` = U, `.1` = S, `.2` = Vh.
     case svd
 
+    /// QR decomposition (A = Q·R). Routed from the `@lapack_sgeqrf_ffi`
+    /// (factorization) + `@lapack_sorgqr_ffi` (materialize Q) custom_call pair
+    /// and executed host-side via Accelerate LAPACK. A `.qr` op carries a
+    /// component tag in `tupleIndex`: 0 = Q (orthonormal), 1 = the geqrf factored
+    /// matrix (R in the upper triangle, Householder vectors below — the surrounding
+    /// StableHLO slice/select wrapper masks it to R).
+    case qr
+
     // MARK: - Normalization Operations (3 ops)
 
     /// Batch normalization for inference.
@@ -486,7 +494,7 @@ extension HLOOpKind {
              .not, .clz, .convert, .reshape, .transpose, .broadcastInDim,
              .iota, .tan, .logistic, .isFinite, .reverse, .fft, .sort,
              .expm1, .log1p, .cbrt, .roundNearestAfz, .roundNearestEven,
-             .popcnt, .real, .imag, .cholesky, .svd, .bitcastConvert, .reducePrecision,
+             .popcnt, .real, .imag, .cholesky, .svd, .qr, .bitcastConvert, .reducePrecision,
              .topKValues, .topKIndices, .reduceArg:
             return .exactly(1)
 

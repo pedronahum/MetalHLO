@@ -1793,6 +1793,14 @@ func pjrt_client_compile(
             // MPSGraph path (the fast CodeGenerator has no SVD).
             || mlirSource.contains("lapack_sgesdd")
             || mlirSource.contains("lapack_dgesdd")
+            // jnp.linalg.qr lowers to @lapack_sgeqrf_ffi (+ @lapack_sorgqr_ffi to
+            // materialize Q), both routed to native .qr ops and executed host-side
+            // via Accelerate LAPACK on the MPSGraph path (the fast CodeGenerator
+            // has no QR).
+            || mlirSource.contains("lapack_sgeqrf")
+            || mlirSource.contains("lapack_dgeqrf")
+            || mlirSource.contains("lapack_sorgqr")
+            || mlirSource.contains("lapack_dorgqr")
         let hasCall = mlirSource.contains("call @")
             || mlirSource.contains("func.func private")
 

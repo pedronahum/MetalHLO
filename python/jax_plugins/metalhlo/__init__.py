@@ -84,6 +84,12 @@ def _register_linalg_lowerings():
     we want exactly the CPU lowering. JAX's `register_lowering` refuses unknown
     platforms, so we copy the CPU lowering entry directly into the per-platform
     lowering table for "metalhlo".
+
+    jnp.linalg.qr decomposes into the `geqrf` (factorization → `@lapack_sgeqrf_ffi`)
+    and `householder_product` (materialize Q → `@lapack_sorgqr_ffi`) primitives,
+    each with a CPU-only lowering; `qr_p` itself has no platform lowering. Copying
+    those two CPU entries makes a jit'd qr emit the LAPACK FFI custom_calls the
+    Swift compiler routes to host-side Accelerate LAPACK.
     """
     try:
         from jax._src.interpreters import mlir
@@ -93,7 +99,7 @@ def _register_linalg_lowerings():
 
     cpu_table = mlir._platform_specific_lowerings.get("cpu", {})
     metal_table = mlir._platform_specific_lowerings["metalhlo"]
-    for prim_name in ("svd_p",):
+    for prim_name in ("svd_p", "geqrf_p", "householder_product_p"):
         prim = getattr(lax_linalg, prim_name, None)
         if prim is None:
             continue

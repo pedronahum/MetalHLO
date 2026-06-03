@@ -224,4 +224,137 @@ struct LinalgMPSTests {
                     "svd 4x3 recon[\(idx)] got \(recon[idx]), want \(aData[idx])")
         }
     }
+
+    // Verifies a QR result: Q·R reconstructs A and Q's columns are orthonormal
+    // (QᵀQ ≈ I). Raw Q/R signs are convention-dependent, so we never compare raw
+    // factors — only the reconstruction and orthonormality.
+    private func checkQR(
+        A: [Float], m: Int, n: Int,
+        Q: [Float], R: [Float], qCols: Int
+    ) {
+        #expect(Q.count == m * qCols, "Q has \(Q.count) elems, want \(m * qCols)")
+        #expect(R.count == qCols * n, "R has \(R.count) elems, want \(qCols * n)")
+
+        // Q·R ≈ A  (Q is m×qCols, R is qCols×n).
+        for i in 0..<m {
+            for j in 0..<n {
+                var acc: Float = 0
+                for k in 0..<qCols { acc += Q[i * qCols + k] * R[k * n + j] }
+                #expect(abs(acc - A[i * n + j]) < 1e-3,
+                        "QR recon[\(i),\(j)] got \(acc), want \(A[i * n + j])")
+            }
+        }
+        // QᵀQ ≈ I_qCols (columns orthonormal).
+        for p in 0..<qCols {
+            for q in 0..<qCols {
+                var acc: Float = 0
+                for i in 0..<m { acc += Q[i * qCols + p] * Q[i * qCols + q] }
+                let want: Float = (p == q) ? 1 : 0
+                #expect(abs(acc - want) < 1e-3,
+                        "QᵀQ[\(p),\(q)] got \(acc), want \(want)")
+            }
+        }
+    }
+
+    // QR of a square 3×3 matrix, reduced mode (Q 3×3, R 3×3). Lowered exactly as
+    // JAX-CPU emits it: @lapack_sgeqrf_ffi factorization + @lapack_sorgqr_ffi to
+    // materialize Q, with the slice/iota/select wrapper that zeroes R's strict
+    // lower triangle. Routed to the native .qr ops and executed host-side.
+    @Test("qr reduced of a 3x3 matrix (host LAPACK)")
+    func qrReduced3x3() throws {
+        let client = try Client.create()
+        let mlir = """
+        module @jit_qr {
+          func.func public @main(%arg0: tensor<3x3xf32>) -> (tensor<3x3xf32>, tensor<3x3xf32>) {
+            %0:2 = stablehlo.custom_call @lapack_sgeqrf_ffi(%arg0) {backend_config = "", operand_layouts = [dense<[0, 1]> : tensor<2xindex>], result_layouts = [dense<[0, 1]> : tensor<2xindex>, dense<0> : tensor<1xindex>]} : (tensor<3x3xf32>) -> (tensor<3x3xf32>, tensor<3xf32>)
+            %1 = stablehlo.custom_call @lapack_sorgqr_ffi(%0#0, %0#1) {backend_config = "", operand_layouts = [dense<[0, 1]> : tensor<2xindex>, dense<0> : tensor<1xindex>], result_layouts = [dense<[0, 1]> : tensor<2xindex>]} : (tensor<3x3xf32>, tensor<3xf32>) -> tensor<3x3xf32>
+            %2 = stablehlo.iota dim = 0 : tensor<3x3xi32>
+            %c = stablehlo.constant dense<-1> : tensor<i32>
+            %3 = stablehlo.broadcast_in_dim %c, dims = [] : (tensor<i32>) -> tensor<3x3xi32>
+            %4 = stablehlo.add %2, %3 : tensor<3x3xi32>
+            %5 = stablehlo.iota dim = 1 : tensor<3x3xi32>
+            %6 = stablehlo.compare GE, %4, %5, SIGNED : (tensor<3x3xi32>, tensor<3x3xi32>) -> tensor<3x3xi1>
+            %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+            %7 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<3x3xf32>
+            %8 = stablehlo.select %6, %7, %0#0 : tensor<3x3xi1>, tensor<3x3xf32>
+            return %1, %8 : tensor<3x3xf32>, tensor<3x3xf32>
+          }
+        }
+        """
+        let executable = try client.compile(mlir)
+        let aData: [Float] = [1, 2, 3, 4, 5.5, 6, 7, 8, 10]
+        let a = try client.createBuffer(aData, shape: [3, 3], elementType: .float32)
+        let outputs = try executable.execute([a])
+        let Q = try outputs[0].toFloatArray()
+        let R = try outputs[1].toFloatArray()
+        checkQR(A: aData, m: 3, n: 3, Q: Q, R: R, qCols: 3)
+    }
+
+    // QR of a tall 4×3 matrix, reduced mode (Q 4×3, R 3×3). The geqrf factored
+    // matrix is sliced to its top-left 3×3 block before the strict-lower-triangle
+    // mask forms R.
+    @Test("qr reduced of a tall 4x3 matrix (host LAPACK)")
+    func qrReducedTall4x3() throws {
+        let client = try Client.create()
+        let mlir = """
+        module @jit_qr {
+          func.func public @main(%arg0: tensor<4x3xf32>) -> (tensor<4x3xf32>, tensor<3x3xf32>) {
+            %0:2 = stablehlo.custom_call @lapack_sgeqrf_ffi(%arg0) {backend_config = "", operand_layouts = [dense<[0, 1]> : tensor<2xindex>], result_layouts = [dense<[0, 1]> : tensor<2xindex>, dense<0> : tensor<1xindex>]} : (tensor<4x3xf32>) -> (tensor<4x3xf32>, tensor<3xf32>)
+            %1 = stablehlo.custom_call @lapack_sorgqr_ffi(%0#0, %0#1) {backend_config = "", operand_layouts = [dense<[0, 1]> : tensor<2xindex>, dense<0> : tensor<1xindex>], result_layouts = [dense<[0, 1]> : tensor<2xindex>]} : (tensor<4x3xf32>, tensor<3xf32>) -> tensor<4x3xf32>
+            %2 = stablehlo.slice %0#0 [0:3, 0:3] : (tensor<4x3xf32>) -> tensor<3x3xf32>
+            %3 = stablehlo.iota dim = 0 : tensor<3x3xi32>
+            %c = stablehlo.constant dense<-1> : tensor<i32>
+            %4 = stablehlo.broadcast_in_dim %c, dims = [] : (tensor<i32>) -> tensor<3x3xi32>
+            %5 = stablehlo.add %3, %4 : tensor<3x3xi32>
+            %6 = stablehlo.iota dim = 1 : tensor<3x3xi32>
+            %7 = stablehlo.compare GE, %5, %6, SIGNED : (tensor<3x3xi32>, tensor<3x3xi32>) -> tensor<3x3xi1>
+            %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+            %8 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<3x3xf32>
+            %9 = stablehlo.select %7, %8, %2 : tensor<3x3xi1>, tensor<3x3xf32>
+            return %1, %9 : tensor<4x3xf32>, tensor<3x3xf32>
+          }
+        }
+        """
+        let executable = try client.compile(mlir)
+        let aData: [Float] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13]
+        let a = try client.createBuffer(aData, shape: [4, 3], elementType: .float32)
+        let outputs = try executable.execute([a])
+        let Q = try outputs[0].toFloatArray()
+        let R = try outputs[1].toFloatArray()
+        checkQR(A: aData, m: 4, n: 3, Q: Q, R: R, qCols: 3)
+    }
+
+    // QR of a tall 4×3 matrix, complete mode (Q 4×4, R 4×3). The geqrf factored
+    // matrix is padded to 4×4 before sorgqr materializes the full orthonormal Q.
+    @Test("qr complete of a tall 4x3 matrix (host LAPACK)")
+    func qrCompleteTall4x3() throws {
+        let client = try Client.create()
+        let mlir = """
+        module @jit_qr {
+          func.func public @main(%arg0: tensor<4x3xf32>) -> (tensor<4x4xf32>, tensor<4x3xf32>) {
+            %0:2 = stablehlo.custom_call @lapack_sgeqrf_ffi(%arg0) {backend_config = "", operand_layouts = [dense<[0, 1]> : tensor<2xindex>], result_layouts = [dense<[0, 1]> : tensor<2xindex>, dense<0> : tensor<1xindex>]} : (tensor<4x3xf32>) -> (tensor<4x3xf32>, tensor<3xf32>)
+            %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+            %1 = stablehlo.pad %0#0, %cst, low = [0, 0], high = [0, 1], interior = [0, 0] : (tensor<4x3xf32>, tensor<f32>) -> tensor<4x4xf32>
+            %2 = stablehlo.custom_call @lapack_sorgqr_ffi(%1, %0#1) {backend_config = "", operand_layouts = [dense<[0, 1]> : tensor<2xindex>, dense<0> : tensor<1xindex>], result_layouts = [dense<[0, 1]> : tensor<2xindex>]} : (tensor<4x4xf32>, tensor<3xf32>) -> tensor<4x4xf32>
+            %3 = stablehlo.iota dim = 0 : tensor<4x3xi32>
+            %c = stablehlo.constant dense<-1> : tensor<i32>
+            %4 = stablehlo.broadcast_in_dim %c, dims = [] : (tensor<i32>) -> tensor<4x3xi32>
+            %5 = stablehlo.add %3, %4 : tensor<4x3xi32>
+            %6 = stablehlo.iota dim = 1 : tensor<4x3xi32>
+            %7 = stablehlo.compare GE, %5, %6, SIGNED : (tensor<4x3xi32>, tensor<4x3xi32>) -> tensor<4x3xi1>
+            %cst_0 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+            %8 = stablehlo.broadcast_in_dim %cst_0, dims = [] : (tensor<f32>) -> tensor<4x3xf32>
+            %9 = stablehlo.select %7, %8, %0#0 : tensor<4x3xi1>, tensor<4x3xf32>
+            return %2, %9 : tensor<4x4xf32>, tensor<4x3xf32>
+          }
+        }
+        """
+        let executable = try client.compile(mlir)
+        let aData: [Float] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13]
+        let a = try client.createBuffer(aData, shape: [4, 3], elementType: .float32)
+        let outputs = try executable.execute([a])
+        let Q = try outputs[0].toFloatArray()
+        let R = try outputs[1].toFloatArray()
+        checkQR(A: aData, m: 4, n: 3, Q: Q, R: R, qCols: 4)
+    }
 }

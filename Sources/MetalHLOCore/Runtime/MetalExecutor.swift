@@ -212,6 +212,11 @@ public final class MetalExecutor: @unchecked Sendable {
             return try executeHostSvd(shortcut: svd, inputs: inputs)
         }
 
+        // Host path: jnp.linalg.qr executed via Accelerate LAPACK (sgeqrf + sorgqr).
+        if let qr = compiled.hostQrShortcut {
+            return try executeHostQr(shortcut: qr, inputs: inputs)
+        }
+
         // Fast path: embedded attention split — pre MPSGraph → Flash Attention → post MPSGraph.
         if let split = compiled.embeddedAttentionSplit {
             if let result = try? executeEmbeddedAttentionSplit(split: split, inputs: inputs) {
@@ -531,6 +536,115 @@ public final class MetalExecutor: @unchecked Sendable {
             case 2: outputs.append(vhStorage)
             default:
                 throw ExecutorError.generalError("Host SVD: unknown output component \(comp)")
+            }
+        }
+
+        let end = CFAbsoluteTimeGetCurrent()
+        let timing = ExecutionTiming(encodeTime: 0, gpuTime: end - start, totalTime: end - start)
+        return (outputs, timing)
+    }
+
+    /// Executes a `jnp.linalg.qr` decomposition host-side via Accelerate LAPACK
+    /// (`sgeqrf` then `sorgqr`), mirroring how JAX-CPU itself lowers QR.
+    ///
+    /// A = Q·R with A an M×N row-major matrix and k = min(M,N) reflectors. The
+    /// caller's `qColumns` is min(M,N) for reduced mode or M for complete mode;
+    /// Q is M×qColumns and R is qColumns×N.
+    ///
+    /// Marshalling: StableHLO is row-major, LAPACK column-major. Rather than rely
+    /// on the transpose-duality trick (which doesn't compose cleanly with the
+    /// in-place geqrf→orgqr handoff and the R upper-triangle extraction), we copy A
+    /// explicitly into a column-major buffer (`a[i + j*lda]`, lda = M), run the
+    /// factorization in place, read R out of the upper triangle, then run sorgqr to
+    /// overwrite the buffer with Q's columns, and transpose Q back to row-major.
+    private func executeHostQr(
+        shortcut: HostQrShortcut,
+        inputs: [BufferStorage]
+    ) throws -> ([BufferStorage], ExecutionTiming) {
+        let start = CFAbsoluteTimeGetCurrent()
+
+        guard shortcut.inputIndex < inputs.count else {
+            throw ExecutorError.inputMismatch(expected: shortcut.inputIndex + 1, got: inputs.count)
+        }
+        let input = inputs[shortcut.inputIndex]
+        let M = shortcut.rows
+        let N = shortcut.cols
+        let k = Swift.min(M, N)
+        let qCols = shortcut.qColumns
+
+        // Column-major work buffer wide enough for both the M×N factorization and
+        // the M×qCols Q materialization. lda = M throughout.
+        let storageCols = Swift.max(N, qCols)
+        var a = [Float](repeating: 0, count: M * storageCols)
+        input.withUnsafeBytes { raw in
+            let src = raw.bindMemory(to: Float.self)
+            // a[i + j*M] = A[i, j]  (row-major src index i*N + j)
+            for i in 0..<M {
+                for j in 0..<N {
+                    a[i + j * M] = src[i * N + j]
+                }
+            }
+        }
+
+        var lm = __CLPK_integer(M)
+        var ln = __CLPK_integer(N)
+        var lda = __CLPK_integer(M)
+        var lk = __CLPK_integer(k)
+        var tau = [Float](repeating: 0, count: Swift.max(1, k))
+        var info = __CLPK_integer(0)
+
+        // sgeqrf workspace query + factorization.
+        var wkopt = Float(0)
+        var lwork = __CLPK_integer(-1)
+        sgeqrf_(&lm, &ln, &a, &lda, &tau, &wkopt, &lwork, &info)
+        lwork = __CLPK_integer(wkopt)
+        var work = [Float](repeating: 0, count: Int(max(1, lwork)))
+        sgeqrf_(&lm, &ln, &a, &lda, &tau, &work, &lwork, &info)
+        guard info == 0 else {
+            throw ExecutorError.generalError("LAPACK sgeqrf failed with info=\(info)")
+        }
+
+        // Extract R (qCols×N, row-major) from the upper triangle of the factored
+        // column-major matrix BEFORE sorgqr overwrites it with Q.
+        var r = [Float](repeating: 0, count: qCols * N)
+        for row in 0..<qCols {
+            for col in 0..<N where row <= col {
+                r[row * N + col] = a[row + col * M]   // row < qCols ≤ M, col < N
+            }
+        }
+
+        // sorgqr: materialize the first qCols columns of Q in place. Number of
+        // reflectors is k = min(M, N).
+        var lqcols = __CLPK_integer(qCols)
+        wkopt = 0
+        lwork = __CLPK_integer(-1)
+        sorgqr_(&lm, &lqcols, &lk, &a, &lda, &tau, &wkopt, &lwork, &info)
+        lwork = __CLPK_integer(wkopt)
+        work = [Float](repeating: 0, count: Int(max(1, lwork)))
+        sorgqr_(&lm, &lqcols, &lk, &a, &lda, &tau, &work, &lwork, &info)
+        guard info == 0 else {
+            throw ExecutorError.generalError("LAPACK sorgqr failed with info=\(info)")
+        }
+
+        // Transpose Q back to row-major: Q[i, j] = a[i + j*M], shape M×qCols.
+        var q = [Float](repeating: 0, count: M * qCols)
+        for i in 0..<M {
+            for j in 0..<qCols {
+                q[i * qCols + j] = a[i + j * M]
+            }
+        }
+
+        let qStorage = BufferStorage(floatData: q, shape: [M, qCols], device: device)
+        let rStorage = BufferStorage(floatData: r, shape: [qCols, N], device: device)
+
+        // Emit outputs in the exact order the function returns them.
+        var outputs: [BufferStorage] = []
+        for comp in shortcut.outputComponents {
+            switch comp {
+            case 0: outputs.append(qStorage)   // Q
+            case 1: outputs.append(rStorage)   // R
+            default:
+                throw ExecutorError.generalError("Host QR: unknown output component \(comp)")
             }
         }
 

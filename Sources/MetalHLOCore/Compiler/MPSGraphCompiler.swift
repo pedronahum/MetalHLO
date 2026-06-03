@@ -54,6 +54,15 @@ public final class MPSGraphCompiler {
             return try buildHostSvdGraph(function: function, shortcut: svdShortcut)
         }
 
+        // Detect host-QR shortcut: a `jnp.linalg.qr` function lowers to a
+        // `@lapack_sgeqrf_ffi` + `@lapack_sorgqr_ffi` pair (routed to native `.qr`
+        // ops by the parser) plus a slice/select wrapper that forms R. MPSGraph has
+        // no QR kernel, so the whole function — Q and R — is computed host-side via
+        // Accelerate LAPACK against the shared unified-memory input buffer.
+        if let qrShortcut = Self.detectHostQrShortcut(function: function) {
+            return try buildHostLinalgGraph(function: function, hostQrShortcut: qrShortcut)
+        }
+
         // Detect Flash Attention shortcut: if the function is a single SDPA op with
         // direct function inputs, we can bypass MPSGraph at execution time and run
         // FlashAttentionTiledKernel directly against the input MTLBuffers.
@@ -226,14 +235,30 @@ public final class MPSGraphCompiler {
         )
     }
 
-    /// Builds a CompiledGraph for a host-executed SVD. The MPSGraph itself is a
-    /// trivial identity (the input passed straight to a single output) purely to
-    /// satisfy the non-optional `executable` field; MetalExecutor bypasses it via
-    /// `hostSvdShortcut` before the graph is ever run.
+    /// Builds a CompiledGraph for a host-executed SVD.
     private func buildHostSvdGraph(
         function: HLOFunction,
         shortcut: HostSvdShortcut
     ) throws -> CompiledGraph {
+        return try buildHostLinalgGraph(
+            function: function,
+            inputIndex: shortcut.inputIndex,
+            hostSvdShortcut: shortcut
+        )
+    }
+
+    /// Builds a CompiledGraph for a host-executed linear-algebra decomposition
+    /// (SVD or QR). The MPSGraph itself is a trivial identity (the input matrix
+    /// passed straight to a single output) purely to satisfy the non-optional
+    /// `executable` field; MetalExecutor bypasses it via the host shortcut before
+    /// the graph is ever run.
+    private func buildHostLinalgGraph(
+        function: HLOFunction,
+        inputIndex: Int? = nil,
+        hostSvdShortcut: HostSvdShortcut? = nil,
+        hostQrShortcut: HostQrShortcut? = nil
+    ) throws -> CompiledGraph {
+        let matrixIndex = inputIndex ?? hostQrShortcut?.inputIndex ?? 0
         var inputTensors: [MPSGraphTensor] = []
         for input in function.inputs {
             let placeholder = graph.placeholder(
@@ -244,7 +269,7 @@ public final class MPSGraphCompiler {
             inputTensors.append(placeholder)
         }
         // A trivial target so MPSGraph has something to compile.
-        let dummyOutput = graph.identity(with: inputTensors[shortcut.inputIndex], name: "svd_dummy")
+        let dummyOutput = graph.identity(with: inputTensors[matrixIndex], name: "linalg_dummy")
 
         let mpsDevice = MPSGraphDevice(mtlDevice: device)
         var feeds: [MPSGraphTensor: MPSGraphShapedType] = [:]
@@ -274,8 +299,91 @@ public final class MPSGraphCompiler {
             elementwiseShortcut: nil,
             embeddedAttentionSplit: nil
         )
-        compiled.hostSvdShortcut = shortcut
+        compiled.hostSvdShortcut = hostSvdShortcut
+        compiled.hostQrShortcut = hostQrShortcut
         return compiled
+    }
+
+    /// Detects whether the function is a `jnp.linalg.qr` decomposition that can be
+    /// executed host-side via Accelerate LAPACK.
+    ///
+    /// Conditions (mirroring the SVD detector):
+    /// - The body contains `.qr` ops (parser-routed from `@lapack_sgeqrf_ffi` /
+    ///   `@lapack_sorgqr_ffi`).
+    /// - All `.qr` ops read the same single direct function input (matrix A).
+    /// - Every function return value traces back — through the R-forming
+    ///   slice/select/pad/broadcast/iota-free wrapper — to one of the `.qr`
+    ///   results, so the program output is exactly (Q, R) in some order.
+    private static func detectHostQrShortcut(function: HLOFunction) -> HostQrShortcut? {
+        let qrOps = function.operations.filter { $0.kind == .qr }
+        guard !qrOps.isEmpty else { return nil }
+
+        // All QR components must read the same input operand.
+        guard let inputName = qrOps.first?.operands.first,
+              qrOps.allSatisfy({ $0.operands.first == inputName })
+        else { return nil }
+
+        // That operand must be a direct function input.
+        let inputNames = function.inputs.map { $0.name }
+        guard let inputIndex = inputNames.firstIndex(of: inputName) else { return nil }
+
+        // Input matrix shape (M×N).
+        let inShape = function.inputs[inputIndex].type.shape
+        guard inShape.count == 2 else { return nil }
+        let rows = inShape[0]
+        let cols = inShape[1]
+
+        // The Q `.qr` op (component 0) carries Q's result shape, whose column
+        // count distinguishes reduced (min(M,N)) from complete (M).
+        guard let qOp = qrOps.first(where: { ($0.attributes.tupleIndex ?? 1) == 0 }),
+              qOp.resultType.shape.count == 2
+        else { return nil }
+        let qCols = qOp.resultType.shape[1]
+
+        // Map each `.qr` result name → its component (0 = Q, 1 = factored matrix).
+        var qrResultComponent: [String: Int] = [:]
+        for op in qrOps { qrResultComponent[op.result] = op.attributes.tupleIndex ?? 1 }
+
+        // Producer index for tracing return values back to a `.qr` result.
+        var producer: [String: HLOOperation] = [:]
+        for op in function.operations { producer[op.result] = op }
+
+        // Trace a value back through the R-forming wrapper. The R path is
+        // select(GE-mask, 0, factored) over an optional slice of the factored
+        // matrix; the Q path is the raw `.qr` Q result. select/slice/pad/
+        // broadcast/convert/reshape/transpose are identity on the value path here.
+        func componentFor(_ name: String, depth: Int = 0) -> Int? {
+            if depth > 64 { return nil }
+            if let comp = qrResultComponent[name] { return comp }
+            guard let op = producer[name] else { return nil }
+            switch op.kind {
+            case .select:
+                // select(pred, on_true=0-fill, on_false=factored): the real value
+                // is on_false (operand index 2).
+                guard op.operands.count >= 3 else { return nil }
+                return componentFor(op.operands[2], depth: depth + 1)
+            case .slice, .pad, .broadcastInDim, .convert, .reshape, .transpose:
+                guard let first = op.operands.first else { return nil }
+                return componentFor(first, depth: depth + 1)
+            default:
+                return nil
+            }
+        }
+
+        var outputComponents: [Int] = []
+        for ret in function.returnValues {
+            guard let comp = componentFor(ret) else { return nil }
+            outputComponents.append(comp)
+        }
+        guard !outputComponents.isEmpty else { return nil }
+
+        return HostQrShortcut(
+            inputIndex: inputIndex,
+            rows: rows,
+            cols: cols,
+            qColumns: qCols,
+            outputComponents: outputComponents
+        )
     }
 
     /// Detects whether the function qualifies for direct Flash Attention Metal kernel execution.
@@ -542,6 +650,13 @@ public final class MPSGraphCompiler {
             // not match the expected shape. Fail loudly rather than emit wrong math.
             throw CompilationError.unsupportedOperation(
                 "svd reached MPSGraph compile — expected host-SVD shortcut to handle the whole function")
+        case .qr:
+            // QR runs host-side via the hostQrShortcut path; the whole function is
+            // detected and bypassed before the graph is built, so reaching the
+            // MPSGraph compiler here means the surrounding R-forming wrapper did not
+            // match the expected shape. Fail loudly rather than emit wrong math.
+            throw CompilationError.unsupportedOperation(
+                "qr reached MPSGraph compile — expected host-QR shortcut to handle the whole function")
 
         // Normalization
         case .batchNormInference:
@@ -5270,6 +5385,10 @@ public struct CompiledGraph: @unchecked Sendable {
     /// If non-nil, the function is a `jnp.linalg.svd` decomposition executed
     /// host-side via Accelerate LAPACK. MetalExecutor bypasses MPSGraph entirely.
     public var hostSvdShortcut: HostSvdShortcut? = nil
+
+    /// If non-nil, the function is a `jnp.linalg.qr` decomposition executed
+    /// host-side via Accelerate LAPACK. MetalExecutor bypasses MPSGraph entirely.
+    public var hostQrShortcut: HostQrShortcut? = nil
 }
 
 // MARK: - HostSvdShortcut
@@ -5293,6 +5412,33 @@ public struct HostSvdShortcut: Sendable {
     /// Output ordering: for each function return value, which SVD component
     /// (0 = U, 1 = S, 2 = Vh) it carries. Lets the executor emit outputs in the
     /// exact order the program returns them.
+    public let outputComponents: [Int]
+}
+
+// MARK: - HostQrShortcut
+
+/// Metadata for executing a `jnp.linalg.qr` function host-side via Accelerate
+/// LAPACK (`sgeqrf` + `sorgqr`), bypassing MPSGraph (which has no QR kernel).
+///
+/// JAX lowers `jnp.linalg.qr(A)` to a `@lapack_sgeqrf_ffi` factorization plus a
+/// `@lapack_sorgqr_ffi` call to materialize Q (both routed to native `.qr` ops by
+/// the parser), wrapped in a slice/select chain that zeroes the lower triangle to
+/// form R. The whole function reduces to: read A, run QR, return Q / R.
+public struct HostQrShortcut: Sendable {
+    /// Index into the executor's input array for the matrix A.
+    public let inputIndex: Int
+    /// Number of rows of A (row-major).
+    public let rows: Int
+    /// Number of columns of A (row-major).
+    public let cols: Int
+    /// Q's column count: `min(M,N)` for reduced mode, `M` for complete mode.
+    /// Derived from the materialized-Q result shape; selects how many Householder
+    /// reflectors `sorgqr` accumulates and the shapes of Q (M×qColumns) and
+    /// R (qColumns×N).
+    public let qColumns: Int
+    /// Output ordering: for each function return value, which QR component
+    /// (0 = Q, 1 = R) it carries. Lets the executor emit outputs in the exact
+    /// order the program returns them.
     public let outputComponents: [Int]
 }
 
