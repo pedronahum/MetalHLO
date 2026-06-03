@@ -374,11 +374,11 @@ struct PopcntOpsTests {
 @Suite("Reduce Precision Operations", .serialized)
 struct ReducePrecisionOpsTests {
 
-    @Test("Reduce precision compiles and runs (identity implementation)")
+    @Test("Reduce precision rounds the mantissa to the target width")
     func reducePrecision() throws {
-        // Note: reduce_precision currently returns identity because MPSGraph
-        // doesn't have true bitcast operations. This test verifies the operation
-        // compiles and runs without error.
+        // reduce_precision narrows to fp16 precision (e5m10), rounding the
+        // mantissa to 10 bits via round-to-nearest-even. Reference values match
+        // jax.lax.reduce_precision(x, exponent_bits=5, mantissa_bits=10).
         let client = try Client.create()
         let mlir = """
         module @reduce_precision {
@@ -392,12 +392,12 @@ struct ReducePrecisionOpsTests {
         let a = try client.createBuffer([1.0, 1.5, 2.0, 3.14159] as [Float], shape: [4], elementType: .float32)
         let outputs = try executable.execute([a])
         let result = try outputs[0].toFloatArray()
-        // Current implementation is identity - values are preserved exactly
+        // 1.0/1.5/2.0 are exactly representable; 3.14159 rounds to 3.140625.
         #expect(result.count == 4)
         #expect(result[0] == 1.0)
         #expect(result[1] == 1.5)
         #expect(result[2] == 2.0)
-        #expect(abs(result[3] - 3.14159) < 0.0001)
+        #expect(result[3] == 3.140625)
     }
 
     @Test("Reduce precision with full precision is identity")

@@ -898,12 +898,126 @@ public final class CodeGenerator: @unchecked Sendable {
                 metalType: metalType
             )
 
+        // Reduce precision: round a float to a target exponent/mantissa width
+        // (e.g. emulate fp16/bf16 rounding from fp32) via IEEE-754 bit surgery.
+        case .reducePrecision:
+            source += generateReducePrecisionKernel(
+                entryPoint: entryPoint,
+                exponentBits: attributes.exponentBits ?? 8,
+                mantissaBits: attributes.mantissaBits ?? 23,
+                metalType: metalType
+            )
+
         default:
             // Fallback to copy kernel for unsupported ops
             source += generateCopyKernel(entryPoint: entryPoint, metalType: metalType)
         }
 
         return (source, entryPoint, nil)
+    }
+
+    /// Generates a kernel for `stablehlo.reduce_precision`.
+    ///
+    /// Rounds each fp32 element to the dynamic range and precision of a target
+    /// float format with `exponentBits` exponent bits and `mantissaBits`
+    /// mantissa bits, using round-to-nearest-even — matching XLA / JAX
+    /// `jax.lax.reduce_precision`. The two halves are independent:
+    ///   - Mantissa reduction rounds the 23-bit fp32 mantissa down to
+    ///     `mantissaBits` bits (RNE), exactly as bf16/fp16 narrowing would.
+    ///   - Exponent reduction clamps the dynamic range: values above the target
+    ///     max become +/-inf, values below the target min-normal flush to zero.
+    ///     The target format's subnormals are NOT produced (XLA semantics).
+    /// NaN and infinity pass through unchanged. When the target widths equal
+    /// fp32's own (8/23) the op is an exact identity.
+    private func generateReducePrecisionKernel(
+        entryPoint: String,
+        exponentBits: Int,
+        mantissaBits: Int,
+        metalType: String
+    ) -> String {
+        // fp32 layout constants.
+        let srcMantissaBits = 23
+        let srcExponentBits = 8
+        let srcExponentBias = 127
+
+        // How many low mantissa bits to discard, and the RNE rounding setup.
+        let bitsToRound = max(0, srcMantissaBits - mantissaBits)
+        // Reductions in the exponent range are only needed when the target has
+        // fewer exponent bits than fp32.
+        let reduceExponent = exponentBits < srcExponentBits
+
+        // Target exponent bias and the clamped [min,max] biased-exponent range,
+        // expressed in fp32's biased-exponent encoding.
+        let targetBias = (1 << (exponentBits - 1)) - 1
+        // Largest finite target exponent (unbiased) -> fp32 biased value.
+        let maxExp = ((1 << exponentBits) - 2) - targetBias + srcExponentBias
+        // Smallest normal target exponent (unbiased = 1 - bias) -> fp32 biased.
+        let minExp = (1 - targetBias) + srcExponentBias
+
+        // Stores compute a float result then cast to the output element type.
+        let storeBits = "output[tid] = \(metalType)(as_type<float>(sign | absBits)); return;"
+        let storeInf = "output[tid] = \(metalType)(as_type<float>(sign | 0x7F800000u)); return;"
+        let storeZero = "output[tid] = \(metalType)(as_type<float>(sign)); return;"
+        let storePass = "output[tid] = \(metalType)(x); return;"
+
+        // Build the per-element transform on a float `x`, operating on its bits.
+        var body = """
+            uint bits = as_type<uint>(x);
+            uint sign = bits & 0x80000000u;
+            uint absBits = bits & 0x7FFFFFFFu;
+            // NaN and infinity (exponent all-ones) pass through unchanged.
+            if (absBits >= 0x7F800000u) { \(storePass) }
+
+        """
+
+        if bitsToRound > 0 {
+            // Round-to-nearest-even on the mantissa: add a bias of (half the LSB
+            // we drop minus one) plus the kept-LSB so exact halves go to even,
+            // then mask off the discarded low bits.
+            body += """
+                {
+                    uint mask = (1u << \(bitsToRound)) - 1u;
+                    uint lsb = (absBits >> \(bitsToRound)) & 1u;
+                    absBits = (absBits + ((1u << \(bitsToRound - 1)) - 1u) + lsb) & ~mask;
+                }
+
+            """
+        }
+
+        if reduceExponent {
+            // Clamp the dynamic range of the (already mantissa-rounded) value.
+            body += """
+                // Mantissa rounding can carry into the exponent; re-check overflow.
+                if (absBits >= 0x7F800000u) { \(storeInf) }
+                {
+                    uint exp = absBits >> 23;
+                    // Overflow above the target's largest finite -> signed inf.
+                    if (exp > \(maxExp)u) { \(storeInf) }
+                    // Underflow below the target's smallest normal -> +/-0.
+                    // (Target subnormals are not represented, per XLA.)
+                    if (exp < \(minExp)u) { \(storeZero) }
+                }
+
+            """
+        }
+
+        body += "    \(storeBits)"
+
+        // reduce_precision is defined on floating-point types; the JAX/XLA
+        // lowerings only ever feed fp32 here. We compute on the fp32 bits and
+        // cast the result back to the output element type.
+        return """
+        kernel void \(entryPoint)(
+            device const \(metalType)* input [[buffer(0)]],
+            device \(metalType)* output [[buffer(1)]],
+            constant uint& count [[buffer(2)]],
+            uint tid [[thread_position_in_grid]])
+        {
+            if (tid >= count) return;
+            float x = float(input[tid]);
+        \(body)
+        }
+        """
     }
 
     /// Generates a unary kernel with configurable element type.

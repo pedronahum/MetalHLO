@@ -3848,30 +3848,97 @@ public final class MPSGraphCompiler {
     }
 
     private func compileReducePrecision(_ op: HLOOperation) throws -> MPSGraphTensor {
-        // Reduce precision by truncating mantissa/exponent bits
-        // IEEE 754 float32 format: 1 sign bit + 8 exponent bits + 23 mantissa bits
+        // Rounds each fp32 element to the dynamic range and precision of a target
+        // float format (exponentBits exponent bits, mantissaBits mantissa bits)
+        // using round-to-nearest-even, matching XLA / jax.lax.reduce_precision.
         //
-        // LIMITATION: MPSGraph doesn't have true bitcast operations (cast performs
-        // numeric conversion, not bit reinterpretation). Implementing reduce_precision
-        // correctly requires bit manipulation on the IEEE 754 representation, which
-        // would need a custom Metal kernel.
-        //
-        // Current behavior: Returns input unchanged (identity operation).
-        // This is a valid but suboptimal implementation - the precision is not
-        // actually reduced, but the operation compiles and runs without error.
-        //
-        // For applications that require actual precision reduction, consider:
-        // 1. Using a custom Metal kernel for bit manipulation
-        // 2. Converting to/from half precision using convert operations
-        // 3. Implementing quantize/dequantize with appropriate scales
+        // We operate on the IEEE-754 bit pattern via reinterpretCast (a true
+        // bit reinterpretation, unlike `cast` which converts numerically):
+        //   - Mantissa: RNE-round the 23-bit fp32 mantissa to mantissaBits bits.
+        //   - Exponent: clamp the range — overflow -> +/-inf, underflow below the
+        //     target's smallest normal -> +/-0 (target subnormals are not
+        //     produced, matching XLA). NaN/inf pass through unchanged.
+        // The graph is branchless: all cases are expressed with `select`.
         let input = try getOperand(op.operands[0])
 
-        // Log the attributes for debugging (not used in current identity impl)
-        _ = op.attributes.exponentBits ?? 8
-        _ = op.attributes.mantissaBits ?? 23
+        let mantissaBits = op.attributes.mantissaBits ?? 23
+        let exponentBits = op.attributes.exponentBits ?? 8
 
-        // Return identity - precision reduction requires custom Metal kernel
-        return graph.identity(with: input, name: op.result)
+        // fp32 layout constants.
+        let srcMantissaBits = 23
+        let srcExponentBits = 8
+        let srcExponentBias = 127
+        let bitsToRound = max(0, srcMantissaBits - mantissaBits)
+        let reduceExponent = exponentBits < srcExponentBits
+
+        // Fast path: exact fp32 -> nothing to do.
+        if bitsToRound == 0 && !reduceExponent {
+            return graph.identity(with: input, name: op.result)
+        }
+
+        func u32(_ v: UInt32) -> MPSGraphTensor {
+            graph.constant(Double(v), dataType: .uInt32)
+        }
+
+        // reinterpretCast requires rank >= 1, so promote rank-0 scalars to [1]
+        // for the bit surgery and restore the original rank at the end.
+        let isScalar = op.resultType.shape.isEmpty
+        let work = isScalar ? graph.reshape(input, shape: [1], name: nil) : input
+
+        // Reinterpret the float bits as uint32 and split sign / magnitude.
+        let bits = graph.reinterpretCast(work, to: .uInt32, name: nil)
+        let sign = graph.bitwiseAND(bits, u32(0x8000_0000), name: nil)
+        let origAbs = graph.bitwiseAND(bits, u32(0x7FFF_FFFF), name: nil)
+
+        // NaN / infinity: exponent all ones (absBits >= 0x7F800000) -> passthrough.
+        let infBits = u32(0x7F80_0000)
+        let isNanOrInf = graph.greaterThanOrEqualTo(origAbs, infBits, name: nil)
+
+        var absBits = origAbs
+        if bitsToRound > 0 {
+            // RNE: absBits = (absBits + ((1<<(bitsToRound-1)) - 1) + keptLSB) & ~mask
+            let mask = u32((UInt32(1) << UInt32(bitsToRound)) - 1)
+            let shifted = graph.bitwiseRightShift(absBits, u32(UInt32(bitsToRound)), name: nil)
+            let keptLSB = graph.bitwiseAND(shifted, u32(1), name: nil)
+            let bias = u32((UInt32(1) << UInt32(bitsToRound - 1)) - 1)
+            var rounded = graph.addition(absBits, bias, name: nil)
+            rounded = graph.addition(rounded, keptLSB, name: nil)
+            let invMask = u32(~((UInt32(1) << UInt32(bitsToRound)) - 1))
+            absBits = graph.bitwiseAND(rounded, invMask, name: nil)
+        }
+
+        // Recombine sign + magnitude as the default (mantissa-narrowed) result.
+        var resultBits = graph.bitwiseOR(sign, absBits, name: nil)
+
+        if reduceExponent {
+            // Target exponent range mapped into fp32 biased-exponent encoding.
+            let targetBias = (1 << (exponentBits - 1)) - 1
+            let maxExp = UInt32(((1 << exponentBits) - 2) - targetBias + srcExponentBias)
+            let minExp = UInt32((1 - targetBias) + srcExponentBias)
+
+            // exp = absBits >> 23
+            let exp = graph.bitwiseRightShift(absBits, u32(23), name: nil)
+            // Rounding can carry into the exponent: overflow if exp > maxExp OR
+            // the rounded magnitude itself reached the inf encoding.
+            let overflowExp = graph.greaterThan(exp, u32(maxExp), name: nil)
+            let overflowCarry = graph.greaterThanOrEqualTo(absBits, infBits, name: nil)
+            let overflow = graph.logicalOR(overflowExp, overflowCarry, name: nil)
+            let underflow = graph.lessThan(exp, u32(minExp), name: nil)
+
+            let signedInf = graph.bitwiseOR(sign, infBits, name: nil)
+            // Underflow flushes to signed zero (== sign bits alone).
+            resultBits = graph.select(predicate: underflow, trueTensor: sign, falseTensor: resultBits, name: nil)
+            resultBits = graph.select(predicate: overflow, trueTensor: signedInf, falseTensor: resultBits, name: nil)
+        }
+
+        // Restore NaN/inf inputs unchanged, then reinterpret back to the float type.
+        let finalBits = graph.select(predicate: isNanOrInf, trueTensor: bits, falseTensor: resultBits, name: nil)
+        let floatResult = graph.reinterpretCast(finalBits, to: work.dataType, name: nil)
+        // Drop the synthetic leading dim for rank-0 inputs.
+        if isScalar {
+            return graph.reshape(floatResult, shape: [], name: op.result)
+        }
+        return graph.identity(with: floatResult, name: op.result)
     }
 
     // MARK: - Dynamic Shape Operations

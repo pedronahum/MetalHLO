@@ -449,7 +449,7 @@ extension HLOOpKind {
              .not, .clz, .convert, .reshape, .transpose, .broadcastInDim,
              .iota, .tan, .logistic, .isFinite, .reverse, .fft, .sort,
              .expm1, .log1p, .cbrt, .roundNearestAfz, .roundNearestEven,
-             .popcnt, .real, .imag, .cholesky, .bitcastConvert:
+             .popcnt, .real, .imag, .cholesky, .bitcastConvert, .reducePrecision:
             return .exactly(1)
 
         // Binary
@@ -462,7 +462,7 @@ extension HLOOpKind {
             return .exactly(2)
 
         // Ternary
-        case .select, .clamp, .reducePrecision:
+        case .select, .clamp:
             return .exactly(3)
 
         // Variable

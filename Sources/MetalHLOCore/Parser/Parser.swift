@@ -1646,7 +1646,20 @@ public final class Parser {
         var attributes = HLOAttributes()
 
         while !check(.colon) && !check(.eof) {
-            if checkIdentifier("exponent_bits") {
+            if checkIdentifier("format") {
+                // JAX 0.10 lowers reduce_precision as `format = eNmM`
+                // (e.g. e8m7, e5m10) — a single identifier token encoding the
+                // target exponent/mantissa widths. Parse the N and M out of it.
+                try expectIdentifier("format")
+                try expect(.equal)
+                guard currentToken.kind == .identifier else {
+                    throw ParseError.unexpectedToken(expected: "eNmM format", got: currentToken)
+                }
+                let (eb, mb) = try parseExponentMantissaFormat(currentToken.text)
+                attributes.exponentBits = eb
+                attributes.mantissaBits = mb
+                advance()
+            } else if checkIdentifier("exponent_bits") {
                 try expectIdentifier("exponent_bits")
                 try expect(.equal)
                 attributes.exponentBits = try parseInteger()
@@ -1661,6 +1674,19 @@ public final class Parser {
         }
 
         return attributes
+    }
+
+    /// Parses an `eNmM` format string (e.g. "e8m7") into (exponentBits, mantissaBits).
+    private func parseExponentMantissaFormat(_ text: String) throws -> (Int, Int) {
+        guard text.hasPrefix("e"), let mIndex = text.firstIndex(of: "m") else {
+            throw ParseError.invalidOperation("Invalid reduce_precision format: \(text)", location: currentToken.location)
+        }
+        let expPart = text[text.index(after: text.startIndex)..<mIndex]
+        let mantPart = text[text.index(after: mIndex)...]
+        guard let eb = Int(expPart), let mb = Int(mantPart) else {
+            throw ParseError.invalidOperation("Invalid reduce_precision format: \(text)", location: currentToken.location)
+        }
+        return (eb, mb)
     }
 
     // MARK: - RNG Bit Generator Attribute Parsing
