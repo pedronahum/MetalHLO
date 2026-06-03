@@ -221,6 +221,10 @@ public struct HLOAttributes: Sendable {
     /// If conditional regions (then and else).
     public var ifRegions: IfRegions?
 
+    /// Case branch regions, one per branch (jax.lax.switch). Branch `i` is
+    /// selected when the integer index operand equals `i`.
+    public var caseRegions: [Region]?
+
     // MARK: - Tuple Attributes
 
     /// Index for get_tuple_element operation.

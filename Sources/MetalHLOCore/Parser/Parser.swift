@@ -306,6 +306,106 @@ public final class Parser {
                     resultType: op.resultType,
                     attributes: op.attributes
                 ))
+            } else if op.kind == .caseOp, let branches = op.attributes.caseRegions {
+                // stablehlo.case (jax.lax.switch): an integer index operand selects
+                // among N branch regions. The fast CodeGenerator path has no runtime
+                // branch dispatch, so expand the case into a flat op sequence:
+                //   1. Inline every branch's operations (renamed to avoid SSA
+                //      collisions); branch-local references are rewritten, outer
+                //      references (function args / earlier results) pass through.
+                //   2. Build an index-select chain over the branch results:
+                //        acc = result[N-1]                       (default = last)
+                //        for b in (N-2 ... 0):
+                //          pred_b = compare(idx == b)
+                //          acc    = select(pred_b, result[b], acc)
+                //      The index is already clamped to [0, N-1] by JAX, so the
+                //      last branch is the correct default and "first match wins".
+                // The selection is branch-free (every branch is always computed and
+                // the right value picked), matching how the codegen lowers select.
+                let resolvedIndex = resolveAlias(op.operands.first ?? "", aliases: valueAliases)
+                let indexType = TensorType(shape: [], elementType: .int32)
+
+                // Inline each branch and record the name carrying its return value.
+                var branchResults: [String] = []
+                for (b, branch) in branches.enumerated() {
+                    let prefix = "\(op.result)_case\(b)_"
+
+                    // Names defined locally inside this branch. Only these are
+                    // renamed; anything else is an outer SSA value left untouched.
+                    var localDefs = Set(branch.operations.map { $0.result })
+                    for arg in branch.arguments { localDefs.insert(arg.name) }
+
+                    func rename(_ name: String) -> String {
+                        // Resolve outer aliases first, then prefix branch-local names.
+                        if localDefs.contains(name) { return prefix + name }
+                        return resolveAlias(name, aliases: valueAliases)
+                    }
+
+                    for branchOp in branch.operations {
+                        operations.append(HLOOperation(
+                            result: prefix + branchOp.result,
+                            kind: branchOp.kind,
+                            operands: branchOp.operands.map(rename),
+                            resultType: branchOp.resultType,
+                            attributes: branchOp.attributes,
+                            resultCount: branchOp.resultCount
+                        ))
+                    }
+
+                    // A branch returns its single result value (multi-result
+                    // switch is not emitted by jax.lax.switch in the common case).
+                    let ret = branch.returnValues.first ?? ""
+                    branchResults.append(rename(ret))
+                }
+
+                // Index-select chain, last branch as the default accumulator.
+                var acc = branchResults.last ?? resolvedIndex
+                if branchResults.count >= 2 {
+                    for b in stride(from: branchResults.count - 2, through: 0, by: -1) {
+                        // Constant b (scalar i32) matching the index type.
+                        var constAttrs = HLOAttributes()
+                        constAttrs.constantValue = .scalar(Double(b))
+                        let constName = "\(op.result)_caseidx\(b)"
+                        operations.append(HLOOperation(
+                            result: constName,
+                            kind: .constant,
+                            operands: [],
+                            resultType: indexType,
+                            attributes: constAttrs
+                        ))
+
+                        // pred_b = (idx == b), scalar i1.
+                        var cmpAttrs = HLOAttributes()
+                        cmpAttrs.comparisonDirection = .eq
+                        cmpAttrs.inputElementTypes = [.int32, .int32]
+                        let predName = "\(op.result)_casecmp\(b)"
+                        operations.append(HLOOperation(
+                            result: predName,
+                            kind: .compare,
+                            operands: [resolvedIndex, constName],
+                            resultType: TensorType(shape: [], elementType: .int1),
+                            attributes: cmpAttrs
+                        ))
+
+                        // acc = select(pred_b, result[b], acc). The scalar
+                        // predicate is broadcast across the result by codegen.
+                        var selAttrs = HLOAttributes()
+                        let valueElem = op.resultType.elementType
+                        selAttrs.inputElementTypes = [.int1, valueElem, valueElem]
+                        let selName = (b == 0) ? op.result : "\(op.result)_casesel\(b)"
+                        operations.append(HLOOperation(
+                            result: selName,
+                            kind: .select,
+                            operands: [predName, branchResults[b], acc],
+                            resultType: op.resultType,
+                            attributes: selAttrs
+                        ))
+                        acc = selName
+                    }
+                } else {
+                    // Single-branch case: result aliases the only branch output.
+                    valueAliases[op.result] = acc
+                }
             } else {
                 // Substitute aliases in operands for regular operations
                 let resolvedOperands = op.operands.map { resolveAlias($0, aliases: valueAliases) }
@@ -1074,7 +1174,22 @@ public final class Parser {
         // Parse region if present: ({^bb0(%arg0: type, %arg1: type): ops... })
         // This appears between operands and attributes for ops like scatter and reduce.
         // The region body determines the computation kind (e.g., identity, add, max).
-        if kind == .map && check(.leftParen) {
+        if kind == .caseOp && check(.leftParen) {
+            // stablehlo.case carries one full region per branch:
+            //   "stablehlo.case"(%idx) ({...}, {...}, {...}) : (tensor<i32>) -> T
+            // Capture every branch region; the main parse loop expands them into
+            // inlined ops plus an index-select chain (no runtime branch dispatch
+            // exists on the fast path).
+            try expect(.leftParen)
+            var branches: [Region] = []
+            repeat {
+                branches.append(try parseRegion())
+                skipNewlines()
+            } while match(.comma)
+            try expect(.rightParen)
+            attributes.caseRegions = branches
+            skipNewlines()
+        } else if kind == .map && check(.leftParen) {
             // stablehlo.map carries a full per-element computation region, not a
             // single reduction kind. Capture the whole region so codegen can
             // inline its body over the broadcasted element-wise inputs.

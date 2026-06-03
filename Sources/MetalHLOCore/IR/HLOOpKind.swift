@@ -307,6 +307,11 @@ public enum HLOOpKind: String, CaseIterable, Sendable {
     /// Conditional (deferred).
     case ifOp = "if"
 
+    /// Multi-way branch selected by an integer index (jax.lax.switch).
+    /// Expanded into inlined branches + an index-select chain in the parser,
+    /// so it never reaches codegen.
+    case caseOp = "case"
+
     // MARK: - Iota (2 ops)
 
     /// Iota - fills tensor with increasing values.
@@ -460,7 +465,7 @@ extension HLOOpKind {
     /// Whether this is a control flow operation.
     public var isControlFlow: Bool {
         switch self {
-        case .whileOp, .ifOp:
+        case .whileOp, .ifOp, .caseOp:
             return true
         default:
             return false
@@ -519,7 +524,7 @@ extension HLOOpKind {
         case .slice:
             return .exactly(1)
 
-        case .whileOp, .ifOp:
+        case .whileOp, .ifOp, .caseOp:
             return .atLeast(1)
 
         case .rngBitGenerator:

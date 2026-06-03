@@ -480,6 +480,10 @@ public final class MPSGraphCompiler {
             return try compileWhile(op)
         case .ifOp:
             return try compileIf(op)
+        case .caseOp:
+            // stablehlo.case is expanded into inlined branches + an index-select
+            // chain in the parser, so it never reaches the MPSGraph backend.
+            throw CompilationError.unsupportedOperation("case (should be expanded by the parser)")
 
         case .clz:
             return try compileCLZ(op)
