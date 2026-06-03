@@ -506,7 +506,7 @@ MetalHLO's optimization pipeline runs in phases, inspired by XLA's approach:
 
 ## Supported Operations
 
-### Fully Implemented (92 ops)
+### Fully Implemented (98 ops)
 
 | Category | Operations |
 |----------|------------|
@@ -841,7 +841,7 @@ let exe = try client.compile(mlir, config: .release)
 
 ### Quick Start
 
-Run the core unit tests (fast, ~600 tests):
+Run the core unit tests (fast, ~764 tests):
 
 ```bash
 swift test --filter 'MetalHLOCoreTests'
@@ -886,7 +886,7 @@ swift test --filter 'scatter'
 
 | Target | Description | Test Count |
 |--------|-------------|------------|
-| `MetalHLOCoreTests` | Core compiler and optimizer tests | ~586 |
+| `MetalHLOCoreTests` | Core compiler and optimizer tests | ~764 |
 | `MetalHLOTests` | Integration and conformance tests | ~400+ |
 | `PJRTMetalHLOTests` | PJRT plugin API and execution tests | 10 |
 
@@ -952,7 +952,6 @@ Some operations only support floating-point types in MPSGraph:
 | `dynamic_slice` | Working | Works when slice_sizes equal input dims (start indices clamped) |
 | `reduce_window` | Partial | Works for common patterns; complex regions limited |
 | `convolution` | Partial | Standard patterns work; complex dimension permutations may fail |
-| `scatter` (region form) | Not supported | Parser does not handle the generic-form region syntax `({ ^bb0(...): ... })` required for scatter's update computation body |
 | `stablehlo.while` | Partial | Small loop counts (≤ 1000 iterations) are unrolled inline; large loops fall back to MPSGraph which may crash on complex loop bodies (see below) |
 
 **Scatter computation modes:**
