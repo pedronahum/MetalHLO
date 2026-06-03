@@ -69,6 +69,37 @@ def initialize():
     )
 
     _register_host_callback_lowerings()
+    _register_linalg_lowerings()
+
+
+def _register_linalg_lowerings():
+    """Make JAX emit the LAPACK-FFI StableHLO for linear-algebra primitives on
+    the metalhlo platform, reusing JAX's own CPU lowering rules.
+
+    jnp.linalg.svd lowers to `@lapack_sgesdd_ffi` only on the cpu/cuda/rocm
+    platforms; for a custom plugin platform like "metalhlo" JAX has no rule and
+    falls back to a generic `eigh`-based path (which itself has no metalhlo rule),
+    so a jit'd svd raises NotImplementedError at trace time. The MetalHLO Swift
+    compiler routes `@lapack_sgesdd_ffi` to a host-side Accelerate LAPACK call, so
+    we want exactly the CPU lowering. JAX's `register_lowering` refuses unknown
+    platforms, so we copy the CPU lowering entry directly into the per-platform
+    lowering table for "metalhlo".
+    """
+    try:
+        from jax._src.interpreters import mlir
+        from jax._src.lax import linalg as lax_linalg
+    except Exception:
+        return
+
+    cpu_table = mlir._platform_specific_lowerings.get("cpu", {})
+    metal_table = mlir._platform_specific_lowerings["metalhlo"]
+    for prim_name in ("svd_p",):
+        prim = getattr(lax_linalg, prim_name, None)
+        if prim is None:
+            continue
+        entry = cpu_table.get(prim)
+        if entry is not None:
+            metal_table[prim] = entry
 
 
 def _register_host_callback_lowerings():

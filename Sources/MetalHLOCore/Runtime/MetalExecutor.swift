@@ -6,6 +6,7 @@
 import Foundation
 import Metal
 @preconcurrency import MetalPerformanceShadersGraph
+import Accelerate
 
 /// Global semaphore to serialize Metal shader compilation.
 /// Metal shader compilation can crash when multiple instances compile concurrently.
@@ -204,6 +205,13 @@ public final class MetalExecutor: @unchecked Sendable {
         compiled: CompiledGraph,
         inputs: [BufferStorage]
     ) throws -> ([BufferStorage], ExecutionTiming) {
+        // Host path: jnp.linalg.svd executed via Accelerate LAPACK (sgesdd).
+        // MPSGraph has no SVD kernel, so the whole function runs host-side against
+        // the shared (unified-memory) input buffer.
+        if let svd = compiled.hostSvdShortcut {
+            return try executeHostSvd(shortcut: svd, inputs: inputs)
+        }
+
         // Fast path: embedded attention split — pre MPSGraph → Flash Attention → post MPSGraph.
         if let split = compiled.embeddedAttentionSplit {
             if let result = try? executeEmbeddedAttentionSplit(split: split, inputs: inputs) {
@@ -437,6 +445,98 @@ public final class MetalExecutor: @unchecked Sendable {
         let end = CFAbsoluteTimeGetCurrent()
         let timing = ExecutionTiming(encodeTime: 0, gpuTime: end - start, totalTime: end - start)
         return (finalOutputs, timing)
+    }
+
+    /// Executes a `jnp.linalg.svd` decomposition host-side via Accelerate LAPACK
+    /// (`sgesdd`), mirroring how JAX-CPU itself lowers SVD.
+    ///
+    /// Marshalling: StableHLO buffers are row-major, LAPACK is column-major. A
+    /// row-major M×N matrix, read as a column-major matrix, is exactly Aᵀ (N×M).
+    /// We therefore call `sgesdd` with the dimensions swapped (`m = N`, `n = M`) on
+    /// the untouched input bytes, which decomposes Aᵀ = U_t·Σ·Vt_t. Since
+    /// A = Vt_tᵀ·Σ·U_tᵀ:
+    ///   - LAPACK's `VT` output buffer (column-major) is exactly JAX's U in
+    ///     row-major order — written through verbatim.
+    ///   - LAPACK's `U` output buffer (column-major) is exactly JAX's Vh in
+    ///     row-major order — written through verbatim.
+    ///   - The singular values Σ are returned directly.
+    /// This avoids any explicit transpose of the U/Vh buffers.
+    private func executeHostSvd(
+        shortcut: HostSvdShortcut,
+        inputs: [BufferStorage]
+    ) throws -> ([BufferStorage], ExecutionTiming) {
+        let start = CFAbsoluteTimeGetCurrent()
+
+        guard shortcut.inputIndex < inputs.count else {
+            throw ExecutorError.inputMismatch(expected: shortcut.inputIndex + 1, got: inputs.count)
+        }
+        let input = inputs[shortcut.inputIndex]
+        let M = shortcut.rows
+        let N = shortcut.cols
+        let minMN = Swift.min(M, N)
+        let full = shortcut.fullMatrices
+
+        // LAPACK overwrites the input, so work on a private copy of the row-major
+        // bytes. Treated as a column-major N×M matrix (= Aᵀ).
+        var a = [Float](repeating: 0, count: M * N)
+        input.withUnsafeBytes { raw in
+            let src = raw.bindMemory(to: Float.self)
+            for i in 0..<(M * N) { a[i] = src[i] }
+        }
+
+        // Swapped dimensions: decompose Aᵀ (dims N×M in LAPACK's view).
+        var lm = __CLPK_integer(N)          // rows of Aᵀ
+        var ln = __CLPK_integer(M)          // cols of Aᵀ
+        var lda = __CLPK_integer(N)
+        var jobz = Int8(UInt8(ascii: full ? "A" : "S"))
+
+        var s = [Float](repeating: 0, count: minMN)
+        // U_t is lm × (lm or min); VT_t is (ln or min) × ln.
+        let uCols = full ? Int(lm) : minMN
+        let vtRows = full ? Int(ln) : minMN
+        var u = [Float](repeating: 0, count: Int(lm) * uCols)
+        var ldu = __CLPK_integer(lm)
+        var vt = [Float](repeating: 0, count: vtRows * Int(ln))
+        var ldvt = __CLPK_integer(vtRows)
+        var iwork = [__CLPK_integer](repeating: 0, count: 8 * minMN)
+        var info = __CLPK_integer(0)
+
+        // Workspace query (lwork = -1) then the real factorization.
+        var wkopt = Float(0)
+        var lwork = __CLPK_integer(-1)
+        sgesdd_(&jobz, &lm, &ln, &a, &lda, &s, &u, &ldu, &vt, &ldvt, &wkopt, &lwork, &iwork, &info)
+        lwork = __CLPK_integer(wkopt)
+        var work = [Float](repeating: 0, count: Int(max(1, lwork)))
+        sgesdd_(&jobz, &lm, &ln, &a, &lda, &s, &u, &ldu, &vt, &ldvt, &work, &lwork, &iwork, &info)
+
+        guard info == 0 else {
+            throw ExecutorError.generalError("LAPACK sgesdd failed with info=\(info)")
+        }
+
+        // Map LAPACK outputs to JAX components (see method doc):
+        //   JAX U  (row-major) == LAPACK VT buffer; shape M×M (full) or M×min (thin)
+        //   JAX Vh (row-major) == LAPACK U  buffer; shape N×N (full) or min×N (thin)
+        let uShape  = [M, full ? M : minMN]
+        let vhShape = [full ? N : minMN, N]
+        let uStorage  = BufferStorage(floatData: vt, shape: uShape,  device: device)
+        let sStorage  = BufferStorage(floatData: s,  shape: [minMN], device: device)
+        let vhStorage = BufferStorage(floatData: u,  shape: vhShape, device: device)
+
+        // Emit outputs in the exact order the function returns them.
+        var outputs: [BufferStorage] = []
+        for comp in shortcut.outputComponents {
+            switch comp {
+            case 0: outputs.append(uStorage)
+            case 1: outputs.append(sStorage)
+            case 2: outputs.append(vhStorage)
+            default:
+                throw ExecutorError.generalError("Host SVD: unknown output component \(comp)")
+            }
+        }
+
+        let end = CFAbsoluteTimeGetCurrent()
+        let timing = ExecutionTiming(encodeTime: 0, gpuTime: end - start, totalTime: end - start)
+        return (outputs, timing)
     }
 
     /// Executes a single elementwise op directly via a Metal kernel, bypassing MPSGraph.

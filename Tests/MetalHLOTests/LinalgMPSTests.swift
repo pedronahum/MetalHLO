@@ -100,4 +100,128 @@ struct LinalgMPSTests {
             #expect(abs(got - want) < 1e-4, "map got \(got), want \(want)")
         }
     }
+
+    // SVD of a 3×3 matrix, full_matrices = true. Lowered exactly as JAX-CPU emits
+    // it: a single @lapack_sgesdd_ffi custom_call (mode 65 = 'A') wrapped in the
+    // info-check select chain. Routed to the native .svd op and executed host-side
+    // via Accelerate LAPACK. Verified by reconstruction U·diag(S)·Vh ≈ A and the
+    // singular values (sign-unambiguous, descending).
+    @Test("svd full_matrices of a 3x3 matrix (host LAPACK)")
+    func svdFull3x3() throws {
+        let client = try Client.create()
+        let mlir = """
+        module @jit_svd {
+          func.func public @main(%arg0: tensor<3x3xf32>) -> (tensor<3x3xf32>, tensor<3xf32>, tensor<3x3xf32>) {
+            %0:5 = stablehlo.custom_call @lapack_sgesdd_ffi(%arg0) {backend_config = "", mhlo.backend_config = {mode = 65 : ui8}, operand_layouts = [dense<[0, 1]> : tensor<2xindex>], result_layouts = [dense<[0, 1]> : tensor<2xindex>, dense<0> : tensor<1xindex>, dense<[0, 1]> : tensor<2xindex>, dense<[0, 1]> : tensor<2xindex>, dense<> : tensor<0xindex>]} : (tensor<3x3xf32>) -> (tensor<3x3xf32>, tensor<3xf32>, tensor<3x3xf32>, tensor<3x3xf32>, tensor<i32>)
+            %c = stablehlo.constant dense<0> : tensor<i32>
+            %1 = stablehlo.broadcast_in_dim %c, dims = [] : (tensor<i32>) -> tensor<i32>
+            %2 = stablehlo.compare EQ, %0#4, %1, SIGNED : (tensor<i32>, tensor<i32>) -> tensor<i1>
+            %3 = stablehlo.broadcast_in_dim %2, dims = [] : (tensor<i1>) -> tensor<1xi1>
+            %cst = stablehlo.constant dense<0x7FC00000> : tensor<f32>
+            %4 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<3xf32>
+            %5 = stablehlo.broadcast_in_dim %3, dims = [0] : (tensor<1xi1>) -> tensor<3xi1>
+            %6 = stablehlo.select %5, %0#1, %4 : tensor<3xi1>, tensor<3xf32>
+            %7 = stablehlo.broadcast_in_dim %2, dims = [] : (tensor<i1>) -> tensor<1x1xi1>
+            %cst_0 = stablehlo.constant dense<0x7FC00000> : tensor<f32>
+            %8 = stablehlo.broadcast_in_dim %cst_0, dims = [] : (tensor<f32>) -> tensor<3x3xf32>
+            %9 = stablehlo.broadcast_in_dim %7, dims = [0, 1] : (tensor<1x1xi1>) -> tensor<3x3xi1>
+            %10 = stablehlo.select %9, %0#2, %8 : tensor<3x3xi1>, tensor<3x3xf32>
+            %11 = stablehlo.broadcast_in_dim %2, dims = [] : (tensor<i1>) -> tensor<1x1xi1>
+            %cst_1 = stablehlo.constant dense<0x7FC00000> : tensor<f32>
+            %12 = stablehlo.broadcast_in_dim %cst_1, dims = [] : (tensor<f32>) -> tensor<3x3xf32>
+            %13 = stablehlo.broadcast_in_dim %11, dims = [0, 1] : (tensor<1x1xi1>) -> tensor<3x3xi1>
+            %14 = stablehlo.select %13, %0#3, %12 : tensor<3x3xi1>, tensor<3x3xf32>
+            return %10, %6, %14 : tensor<3x3xf32>, tensor<3xf32>, tensor<3x3xf32>
+          }
+        }
+        """
+        let executable = try client.compile(mlir)
+        // Row-major A (3×3).
+        let aData: [Float] = [1, 2, 3, 4, 5, 6, 7, 8, 10]
+        let a = try client.createBuffer(aData, shape: [3, 3], elementType: .float32)
+        let outputs = try executable.execute([a])
+        let U = try outputs[0].toFloatArray()   // 3×3
+        let S = try outputs[1].toFloatArray()   // 3
+        let Vh = try outputs[2].toFloatArray()  // 3×3
+        #expect(U.count == 9 && S.count == 3 && Vh.count == 9)
+
+        // Singular values are positive and sorted descending.
+        #expect(S[0] >= S[1] && S[1] >= S[2])
+        #expect(S.allSatisfy { $0 >= -1e-5 })
+
+        // Reconstruct A = U · diag(S) · Vh (all 3×3, row-major).
+        var recon = [Float](repeating: 0, count: 9)
+        for i in 0..<3 {
+            for j in 0..<3 {
+                var acc: Float = 0
+                for k in 0..<3 {
+                    acc += U[i * 3 + k] * S[k] * Vh[k * 3 + j]
+                }
+                recon[i * 3 + j] = acc
+            }
+        }
+        for idx in 0..<9 {
+            #expect(abs(recon[idx] - aData[idx]) < 1e-3,
+                    "svd 3x3 recon[\(idx)] got \(recon[idx]), want \(aData[idx])")
+        }
+    }
+
+    // SVD of a non-square 4×3 matrix, full_matrices = false (mode 83 = 'S').
+    // U is 4×3 (thin), S is length-3, Vh is 3×3. Reconstruction U·diag(S)·Vh ≈ A.
+    @Test("svd thin (full_matrices=false) of a 4x3 matrix (host LAPACK)")
+    func svdThin4x3() throws {
+        let client = try Client.create()
+        let mlir = """
+        module @jit_svd {
+          func.func public @main(%arg0: tensor<4x3xf32>) -> (tensor<4x3xf32>, tensor<3xf32>, tensor<3x3xf32>) {
+            %0:5 = stablehlo.custom_call @lapack_sgesdd_ffi(%arg0) {backend_config = "", mhlo.backend_config = {mode = 83 : ui8}, operand_layouts = [dense<[0, 1]> : tensor<2xindex>], result_layouts = [dense<[0, 1]> : tensor<2xindex>, dense<0> : tensor<1xindex>, dense<[0, 1]> : tensor<2xindex>, dense<[0, 1]> : tensor<2xindex>, dense<> : tensor<0xindex>]} : (tensor<4x3xf32>) -> (tensor<4x3xf32>, tensor<3xf32>, tensor<4x3xf32>, tensor<3x3xf32>, tensor<i32>)
+            %c = stablehlo.constant dense<0> : tensor<i32>
+            %1 = stablehlo.broadcast_in_dim %c, dims = [] : (tensor<i32>) -> tensor<i32>
+            %2 = stablehlo.compare EQ, %0#4, %1, SIGNED : (tensor<i32>, tensor<i32>) -> tensor<i1>
+            %3 = stablehlo.broadcast_in_dim %2, dims = [] : (tensor<i1>) -> tensor<1xi1>
+            %cst = stablehlo.constant dense<0x7FC00000> : tensor<f32>
+            %4 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<3xf32>
+            %5 = stablehlo.broadcast_in_dim %3, dims = [0] : (tensor<1xi1>) -> tensor<3xi1>
+            %6 = stablehlo.select %5, %0#1, %4 : tensor<3xi1>, tensor<3xf32>
+            %7 = stablehlo.broadcast_in_dim %2, dims = [] : (tensor<i1>) -> tensor<1x1xi1>
+            %cst_0 = stablehlo.constant dense<0x7FC00000> : tensor<f32>
+            %8 = stablehlo.broadcast_in_dim %cst_0, dims = [] : (tensor<f32>) -> tensor<4x3xf32>
+            %9 = stablehlo.broadcast_in_dim %7, dims = [0, 1] : (tensor<1x1xi1>) -> tensor<4x3xi1>
+            %10 = stablehlo.select %9, %0#2, %8 : tensor<4x3xi1>, tensor<4x3xf32>
+            %11 = stablehlo.broadcast_in_dim %2, dims = [] : (tensor<i1>) -> tensor<1x1xi1>
+            %cst_1 = stablehlo.constant dense<0x7FC00000> : tensor<f32>
+            %12 = stablehlo.broadcast_in_dim %cst_1, dims = [] : (tensor<f32>) -> tensor<3x3xf32>
+            %13 = stablehlo.broadcast_in_dim %11, dims = [0, 1] : (tensor<1x1xi1>) -> tensor<3x3xi1>
+            %14 = stablehlo.select %13, %0#3, %12 : tensor<3x3xi1>, tensor<3x3xf32>
+            return %10, %6, %14 : tensor<4x3xf32>, tensor<3xf32>, tensor<3x3xf32>
+          }
+        }
+        """
+        let executable = try client.compile(mlir)
+        // Row-major A (4×3).
+        let aData: [Float] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13]
+        let a = try client.createBuffer(aData, shape: [4, 3], elementType: .float32)
+        let outputs = try executable.execute([a])
+        let U = try outputs[0].toFloatArray()   // 4×3
+        let S = try outputs[1].toFloatArray()   // 3
+        let Vh = try outputs[2].toFloatArray()  // 3×3
+        #expect(U.count == 12 && S.count == 3 && Vh.count == 9)
+        #expect(S[0] >= S[1] && S[1] >= S[2])
+
+        // Reconstruct A (4×3) = U(4×3) · diag(S) · Vh(3×3).
+        var recon = [Float](repeating: 0, count: 12)
+        for i in 0..<4 {
+            for j in 0..<3 {
+                var acc: Float = 0
+                for k in 0..<3 {
+                    acc += U[i * 3 + k] * S[k] * Vh[k * 3 + j]
+                }
+                recon[i * 3 + j] = acc
+            }
+        }
+        for idx in 0..<12 {
+            #expect(abs(recon[idx] - aData[idx]) < 1e-3,
+                    "svd 4x3 recon[\(idx)] got \(recon[idx]), want \(aData[idx])")
+        }
+    }
 }

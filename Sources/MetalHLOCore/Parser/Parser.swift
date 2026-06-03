@@ -306,6 +306,76 @@ public final class Parser {
                     resultType: op.resultType,
                     attributes: op.attributes
                 ))
+            } else if op.kind == .customCall,
+                      let target = op.attributes.callTargetName,
+                      target.hasPrefix("lapack_sgesdd") || target.hasPrefix("lapack_dgesdd") {
+                // SVD LAPACK FFI: `@lapack_sgesdd_ffi(%a)` returns a 5-tuple
+                //   (#0 input-scratch, #1 S, #2 U, #3 Vt, #4 info).
+                // JAX's `@svd` wrapper masks U/S/Vt to NaN when info != 0 and
+                // returns (U, S, Vh). The decomposition itself runs host-side via
+                // Accelerate LAPACK (see MetalExecutor's host-SVD shortcut), so the
+                // job here is to route the consumed results (#1 S, #2 U, #3 Vt) to
+                // native `.svd` ops and emit info = 0 for #4 (LAPACK always
+                // succeeds for the well-conditioned inputs SVD targets; the wrapper
+                // passes value through untouched when info == 0).
+                //
+                // Result-component encoding (op.attributes.tupleIndex):
+                //   0 = U, 1 = S, 2 = Vh. Shapes are derived from the input M×N
+                //   matrix and the `full_matrices` flag decoded from the mode byte.
+                let resolvedOperands = op.operands.map { resolveAlias($0, aliases: valueAliases) }
+                let inputShape = op.resultType.shape   // result #0 == input shape M×N
+                let m = inputShape.count >= 1 ? inputShape[0] : 0
+                let n = inputShape.count >= 2 ? inputShape[1] : 0
+                let minMN = Swift.min(m, n)
+                let full = op.attributes.fullMatrices ?? true
+                let elem = op.resultType.elementType
+
+                // U: M×M (full) or M×min (thin)  -> custom_call result #2
+                var uAttrs = op.attributes
+                uAttrs.tupleIndex = 0
+                operations.append(HLOOperation(
+                    result: "\(op.result).2",
+                    kind: .svd,
+                    operands: resolvedOperands,
+                    resultType: TensorType(shape: [m, full ? m : minMN], elementType: elem),
+                    attributes: uAttrs
+                ))
+                // S: [min]  -> custom_call result #1
+                var sAttrs = op.attributes
+                sAttrs.tupleIndex = 1
+                operations.append(HLOOperation(
+                    result: "\(op.result).1",
+                    kind: .svd,
+                    operands: resolvedOperands,
+                    resultType: TensorType(shape: [minMN], elementType: elem),
+                    attributes: sAttrs
+                ))
+                // Vh: N×N (full) or min×N (thin)  -> custom_call result #3
+                var vAttrs = op.attributes
+                vAttrs.tupleIndex = 2
+                operations.append(HLOOperation(
+                    result: "\(op.result).3",
+                    kind: .svd,
+                    operands: resolvedOperands,
+                    resultType: TensorType(shape: [full ? n : minMN, n], elementType: elem),
+                    attributes: vAttrs
+                ))
+                // info = 0 (success), tensor<i32>. The wrapper compares this to 0.
+                var infoAttrs = HLOAttributes()
+                infoAttrs.constantValue = .scalar(0)
+                operations.append(HLOOperation(
+                    result: "\(op.result).4",
+                    kind: .constant,
+                    operands: [],
+                    resultType: TensorType(shape: [], elementType: .int32),
+                    attributes: infoAttrs
+                ))
+                // #0 is the input-aliased scratch buffer (output_operand_alias to
+                // operand 0); nothing consumes it, but alias it to the input so any
+                // stray reference resolves.
+                if let firstOperand = resolvedOperands.first {
+                    valueAliases["\(op.result).0"] = firstOperand
+                }
             } else if op.kind == .caseOp, let branches = op.attributes.caseRegions {
                 // stablehlo.case (jax.lax.switch): an integer index operand selects
                 // among N branch regions. The fast CodeGenerator path has no runtime
@@ -552,6 +622,22 @@ public final class Parser {
 
         // Parse operands and attributes based on operation
         let (operands, attributes, resultType) = try parseOperationBody(kind: kind)
+
+        // Result-producing host callbacks (jax.pure_callback / io_callback) lower
+        // to a host-callback custom_call that DOES have an SSA result the graph
+        // consumes. We have no host round-trip to satisfy it, so silently
+        // compiling would corrupt numerics — reject it loudly here. (The
+        // result-less, side-effecting variants are dropped earlier in
+        // parseResultlessStatement.)
+        if kind == .customCall,
+           let target = attributes.callTargetName,
+           Parser.droppableHostCallbackTargets.contains(target) {
+            throw ParseError.invalidOperation(
+                "result-producing host callback custom_call '@\(target)' is not "
+                + "supported (jax.pure_callback / io_callback require a host "
+                + "round-trip the MetalHLO backend does not implement)",
+                location: currentToken.location)
+        }
 
         return HLOOperation(
             result: result,
@@ -1083,9 +1169,15 @@ public final class Parser {
                         try parseLapackBackendConfig(into: &attributes)
                     }
                 } else {
-                    // Skip unknown attributes (original behavior): advance one
-                    // token at a time.
-                    advance()
+                    // Skip an unknown attribute value, balancing nested brackets.
+                    // StableHLO attribute values can contain commas/colons inside
+                    // `<...>`, `[...]`, `(...)`, `{...}` (e.g.
+                    // `output_operand_aliases = [#stablehlo.output_operand_alias<
+                    // output_tuple_indices = [0], operand_index = 0, ...>]` or
+                    // `result_layouts = [dense<[0, 1]> : tensor<2xindex>, ...]`),
+                    // so a naive token-at-a-time skip stops at the first inner
+                    // comma and corrupts the parse. Skip whole balanced groups.
+                    skipBalancedAttributeValue()
                 }
                 _ = match(.comma)
                 skipNewlines()
@@ -1094,6 +1186,30 @@ public final class Parser {
         }
 
         return (operands, attributes)
+    }
+
+    /// Skips a single unknown attribute value (identifier/value up to the next
+    /// top-level `,` or `}`), consuming any nested `<...>`, `[...]`, `(...)`,
+    /// `{...}` groups as balanced units so embedded commas/colons don't terminate
+    /// the skip early. Stops with the cursor on the delimiting `,`/`}`.
+    private func skipBalancedAttributeValue() {
+        var depth = 0
+        while !check(.eof) {
+            switch currentToken.kind {
+            case .leftAngle, .leftBracket, .leftParen, .leftBrace:
+                depth += 1
+            case .rightAngle, .rightBracket, .rightParen:
+                if depth > 0 { depth -= 1 }
+            case .rightBrace:
+                if depth == 0 { return }   // end of the attribute block
+                depth -= 1
+            case .comma:
+                if depth == 0 { return }   // attribute separator
+            default:
+                break
+            }
+            advance()
+        }
     }
 
     /// Parses a LAPACK FFI `mhlo.backend_config` dict `{ flag = N : ui8, ... }`
@@ -1142,6 +1258,9 @@ public final class Parser {
         case "diag":
             // 'U' unit diagonal, 'N' non-unit.
             attributes.unitDiagonal = (ch == "U")
+        case "mode":
+            // sgesdd jobz: 'A' (65) full_matrices, 'S' (83) reduced/thin.
+            attributes.fullMatrices = (ch == "A")
         default:
             break
         }

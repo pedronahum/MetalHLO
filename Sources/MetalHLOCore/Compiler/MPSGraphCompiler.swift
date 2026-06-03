@@ -44,6 +44,16 @@ public final class MPSGraphCompiler {
         currentModule = module
         let function = module.function
 
+        // Detect host-SVD shortcut: a `jnp.linalg.svd` function lowers to one
+        // `@lapack_sgesdd_ffi` custom_call (routed to native `.svd` ops by the
+        // parser) wrapped in an info-check that is a no-op when info == 0. MPSGraph
+        // has no SVD kernel, so the whole function is executed host-side via
+        // Accelerate LAPACK. When detected we build a trivial valid graph (to
+        // satisfy the executable field) and let MetalExecutor bypass it entirely.
+        if let svdShortcut = Self.detectHostSvdShortcut(function: function) {
+            return try buildHostSvdGraph(function: function, shortcut: svdShortcut)
+        }
+
         // Detect Flash Attention shortcut: if the function is a single SDPA op with
         // direct function inputs, we can bypass MPSGraph at execution time and run
         // FlashAttentionTiledKernel directly against the input MTLBuffers.
@@ -136,6 +146,136 @@ public final class MPSGraphCompiler {
             elementwiseShortcut: elementwiseShortcut,
             embeddedAttentionSplit: embeddedAttentionSplit
         )
+    }
+
+    /// Detects whether the function is a `jnp.linalg.svd` decomposition that can
+    /// be executed host-side via Accelerate LAPACK.
+    ///
+    /// Conditions:
+    /// - The body contains `.svd` ops (parser-routed from `@lapack_sgesdd_ffi`).
+    /// - All `.svd` ops read the same single direct function input (matrix A).
+    /// - Every function return value traces back (through the info-check select /
+    ///   broadcast wrapper) to one of the `.svd` results, so the program output is
+    ///   exactly (some ordering of) U / S / Vh.
+    private static func detectHostSvdShortcut(function: HLOFunction) -> HostSvdShortcut? {
+        let svdOps = function.operations.filter { $0.kind == .svd }
+        guard !svdOps.isEmpty else { return nil }
+
+        // All SVD components must read the same input operand.
+        guard let inputName = svdOps.first?.operands.first,
+              svdOps.allSatisfy({ $0.operands.first == inputName })
+        else { return nil }
+
+        // That operand must be a direct function input.
+        let inputNames = function.inputs.map { $0.name }
+        guard let inputIndex = inputNames.firstIndex(of: inputName) else { return nil }
+
+        // Input matrix shape (M×N) and full_matrices flag.
+        let inShape = function.inputs[inputIndex].type.shape
+        guard inShape.count == 2 else { return nil }
+        let rows = inShape[0]
+        let cols = inShape[1]
+        let full = svdOps.first?.attributes.fullMatrices ?? true
+
+        // Map each .svd result name → its component (0=U, 1=S, 2=Vh).
+        var svdResultComponent: [String: Int] = [:]
+        for op in svdOps {
+            svdResultComponent[op.result] = op.attributes.tupleIndex ?? 0
+        }
+
+        // Build a producer index for tracing return values back to a .svd result.
+        var producer: [String: HLOOperation] = [:]
+        for op in function.operations { producer[op.result] = op }
+
+        // Trace a value back through the info-check wrapper (select / broadcast /
+        // convert / reshape — all identity on the value path here) to the SVD
+        // component it ultimately carries.
+        func componentFor(_ name: String, depth: Int = 0) -> Int? {
+            if depth > 64 { return nil }
+            if let comp = svdResultComponent[name] { return comp }
+            guard let op = producer[name] else { return nil }
+            switch op.kind {
+            case .select:
+                // select(pred, on_true, on_false): the real value is on_true;
+                // on_false is the NaN fill used only when info != 0.
+                guard op.operands.count >= 2 else { return nil }
+                return componentFor(op.operands[1], depth: depth + 1)
+            case .broadcastInDim, .convert, .reshape, .transpose:
+                guard let first = op.operands.first else { return nil }
+                return componentFor(first, depth: depth + 1)
+            default:
+                return nil
+            }
+        }
+
+        var outputComponents: [Int] = []
+        for ret in function.returnValues {
+            guard let comp = componentFor(ret) else { return nil }
+            outputComponents.append(comp)
+        }
+        // Must produce exactly the three components (in some order); reject
+        // anything that mixes SVD with other unrelated outputs.
+        guard !outputComponents.isEmpty else { return nil }
+
+        return HostSvdShortcut(
+            inputIndex: inputIndex,
+            rows: rows,
+            cols: cols,
+            fullMatrices: full,
+            outputComponents: outputComponents
+        )
+    }
+
+    /// Builds a CompiledGraph for a host-executed SVD. The MPSGraph itself is a
+    /// trivial identity (the input passed straight to a single output) purely to
+    /// satisfy the non-optional `executable` field; MetalExecutor bypasses it via
+    /// `hostSvdShortcut` before the graph is ever run.
+    private func buildHostSvdGraph(
+        function: HLOFunction,
+        shortcut: HostSvdShortcut
+    ) throws -> CompiledGraph {
+        var inputTensors: [MPSGraphTensor] = []
+        for input in function.inputs {
+            let placeholder = graph.placeholder(
+                shape: input.type.mpsShape,
+                dataType: input.type.elementType.mpsDataType,
+                name: input.name
+            )
+            inputTensors.append(placeholder)
+        }
+        // A trivial target so MPSGraph has something to compile.
+        let dummyOutput = graph.identity(with: inputTensors[shortcut.inputIndex], name: "svd_dummy")
+
+        let mpsDevice = MPSGraphDevice(mtlDevice: device)
+        var feeds: [MPSGraphTensor: MPSGraphShapedType] = [:]
+        for (tensor, input) in zip(inputTensors, function.inputs) {
+            feeds[tensor] = MPSGraphShapedType(
+                shape: input.type.mpsShape,
+                dataType: input.type.elementType.mpsDataType
+            )
+        }
+        let executable = graph.compile(
+            with: mpsDevice,
+            feeds: feeds,
+            targetTensors: [dummyOutput],
+            targetOperations: nil,
+            compilationDescriptor: nil
+        )
+
+        var compiled = CompiledGraph(
+            executable: executable,
+            graph: graph,
+            inputTensors: inputTensors,
+            outputTensors: [dummyOutput],
+            inputTypes: function.inputs.map { $0.type },
+            outputTypes: function.outputTypes,
+            device: device,
+            flashAttentionShortcut: nil,
+            elementwiseShortcut: nil,
+            embeddedAttentionSplit: nil
+        )
+        compiled.hostSvdShortcut = shortcut
+        return compiled
     }
 
     /// Detects whether the function qualifies for direct Flash Attention Metal kernel execution.
@@ -395,6 +535,13 @@ public final class MPSGraphCompiler {
             return try compileTriangularSolve(op)
         case .cholesky:
             return try compileCholesky(op)
+        case .svd:
+            // SVD runs host-side via the hostSvdShortcut path; the whole function
+            // is detected and bypassed before the graph is built, so reaching the
+            // MPSGraph compiler here means the surrounding info-check wrapper did
+            // not match the expected shape. Fail loudly rather than emit wrong math.
+            throw CompilationError.unsupportedOperation(
+                "svd reached MPSGraph compile — expected host-SVD shortcut to handle the whole function")
 
         // Normalization
         case .batchNormInference:
@@ -5119,6 +5266,34 @@ public struct CompiledGraph: @unchecked Sendable {
     /// If non-nil, the function contains an embedded SDPA op and execution is split into
     /// pre-graph → Flash Attention kernel → post-graph stages.
     public let embeddedAttentionSplit: EmbeddedAttentionSplit?
+
+    /// If non-nil, the function is a `jnp.linalg.svd` decomposition executed
+    /// host-side via Accelerate LAPACK. MetalExecutor bypasses MPSGraph entirely.
+    public var hostSvdShortcut: HostSvdShortcut? = nil
+}
+
+// MARK: - HostSvdShortcut
+
+/// Metadata for executing a `jnp.linalg.svd` function host-side via Accelerate
+/// LAPACK (`sgesdd`), bypassing MPSGraph (which has no SVD kernel).
+///
+/// JAX lowers `jnp.linalg.svd(A)` to a single `@lapack_sgesdd_ffi(A)` custom_call
+/// (routed to native `.svd` ops by the parser) wrapped in an info-check select
+/// chain that is a no-op for the well-conditioned inputs LAPACK succeeds on. The
+/// whole function reduces to: read A, run SVD, return U / S / Vh.
+public struct HostSvdShortcut: Sendable {
+    /// Index into the executor's input array for the matrix A.
+    public let inputIndex: Int
+    /// Number of rows of A (row-major).
+    public let rows: Int
+    /// Number of columns of A (row-major).
+    public let cols: Int
+    /// `full_matrices`: U is M×M and Vh is N×N when true; thin (M×min, min×N) when false.
+    public let fullMatrices: Bool
+    /// Output ordering: for each function return value, which SVD component
+    /// (0 = U, 1 = S, 2 = Vh) it carries. Lets the executor emit outputs in the
+    /// exact order the program returns them.
+    public let outputComponents: [Int]
 }
 
 // MARK: - TF32-aware matmul extension

@@ -185,6 +185,10 @@ public struct HLOAttributes: Sendable {
     /// Transpose operation to apply to A.
     public var transposeA: TransposeKind?
 
+    /// SVD `full_matrices` flag, decoded from the `@lapack_sgesdd_ffi` mode byte
+    /// (`mode = 65 ('A')` → full, `mode = 83 ('S')` → reduced/thin).
+    public var fullMatrices: Bool?
+
     // MARK: - RNG Bit Generator Attributes
 
     /// PRNG algorithm to use.

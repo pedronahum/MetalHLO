@@ -1788,6 +1788,11 @@ func pjrt_client_compile(
             || mlirSource.contains("lapack_dpotrf")
             || mlirSource.contains("lapack_strsm")
             || mlirSource.contains("lapack_dtrsm")
+            // jnp.linalg.svd lowers to @lapack_sgesdd_ffi, routed to the native
+            // .svd op and executed host-side via Accelerate LAPACK on the
+            // MPSGraph path (the fast CodeGenerator has no SVD).
+            || mlirSource.contains("lapack_sgesdd")
+            || mlirSource.contains("lapack_dgesdd")
         let hasCall = mlirSource.contains("call @")
             || mlirSource.contains("func.func private")
 

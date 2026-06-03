@@ -196,6 +196,11 @@ public enum HLOOpKind: String, CaseIterable, Sendable {
     /// Cholesky decomposition.
     case cholesky
 
+    /// Singular value decomposition (A = U·diag(S)·Vh). Routed from the
+    /// `@lapack_sgesdd_ffi` custom_call and executed host-side via Accelerate
+    /// LAPACK. Produces three results: `.0` = U, `.1` = S, `.2` = Vh.
+    case svd
+
     // MARK: - Normalization Operations (3 ops)
 
     /// Batch normalization for inference.
@@ -481,7 +486,7 @@ extension HLOOpKind {
              .not, .clz, .convert, .reshape, .transpose, .broadcastInDim,
              .iota, .tan, .logistic, .isFinite, .reverse, .fft, .sort,
              .expm1, .log1p, .cbrt, .roundNearestAfz, .roundNearestEven,
-             .popcnt, .real, .imag, .cholesky, .bitcastConvert, .reducePrecision,
+             .popcnt, .real, .imag, .cholesky, .svd, .bitcastConvert, .reducePrecision,
              .topKValues, .topKIndices, .reduceArg:
             return .exactly(1)
 
