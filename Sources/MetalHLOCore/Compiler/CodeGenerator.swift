@@ -629,6 +629,9 @@ public final class CodeGenerator: @unchecked Sendable {
             } else {
                 source += generateBinaryKernel(entryPoint: entryPoint, operation: "\(metalType)(pow(float(a), float(b)))", metalType: metalType)
             }
+        case .atan2:
+            // stablehlo.atan2 %y, %x -> atan2(y, x); float-only in JAX lowerings.
+            source += generateBinaryKernel(entryPoint: entryPoint, operation: "atan2(a, b)", metalType: metalType)
 
         // Bitwise operations (integer types)
         case .and:
@@ -6035,6 +6038,7 @@ public final class CodeGenerator: @unchecked Sendable {
         case .maximum:   return "max(\(lhs), \(rhs))"
         case .minimum:   return "min(\(lhs), \(rhs))"
         case .power:     return "pow(\(lhs), \(rhs))"
+        case .atan2:     return "atan2(\(lhs), \(rhs))"
         case .negate:    return "-\(lhs)"
         case .abs:       return "abs(\(lhs))"
         case .exponential: return "exp(\(lhs))"
@@ -6058,7 +6062,7 @@ public final class CodeGenerator: @unchecked Sendable {
     /// Checks if an operation is binary.
     private func isBinaryOp(_ op: HLOOpKind) -> Bool {
         switch op {
-        case .add, .subtract, .multiply, .divide, .remainder, .maximum, .minimum, .power,
+        case .add, .subtract, .multiply, .divide, .remainder, .maximum, .minimum, .power, .atan2,
              .and, .or, .xor, .shiftLeft, .shiftRightLogical, .shiftRightArithmetic:
             return true
         default:
@@ -6086,6 +6090,8 @@ public final class CodeGenerator: @unchecked Sendable {
             return "\(prefix)min(\(left), \(right));\n"
         case .power:
             return "\(prefix)pow(\(left), \(right));\n"
+        case .atan2:
+            return "\(prefix)atan2(\(left), \(right));\n"
         case .and:
             return "\(prefix)\(left) & \(right);\n"
         case .or:
@@ -6995,7 +7001,7 @@ public final class CodeGenerator: @unchecked Sendable {
         case .original(let opKind):
             // Elementwise operations need count parameter
             switch opKind {
-            case .add, .subtract, .multiply, .divide, .remainder, .maximum, .minimum, .power,
+            case .add, .subtract, .multiply, .divide, .remainder, .maximum, .minimum, .power, .atan2,
                  .negate, .abs, .exponential, .log, .sqrt, .rsqrt, .ceil, .floor, .roundNearestEven,
                  .sine, .cosine, .tanh, .sign, .logistic, .expm1, .log1p, .cbrt,
                  .and, .or, .xor, .not,

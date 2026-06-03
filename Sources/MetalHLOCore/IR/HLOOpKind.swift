@@ -345,7 +345,7 @@ extension HLOOpKind {
     /// Whether this is a binary arithmetic operation.
     public var isBinaryArithmetic: Bool {
         switch self {
-        case .add, .subtract, .multiply, .divide, .remainder, .maximum, .minimum, .power:
+        case .add, .subtract, .multiply, .divide, .remainder, .maximum, .minimum, .power, .atan2:
             return true
         default:
             return false
