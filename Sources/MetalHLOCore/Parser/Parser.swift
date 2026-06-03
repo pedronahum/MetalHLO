@@ -51,14 +51,49 @@ public final class Parser {
         }
         // Optional module attribute dict: `attributes { ... }` (JAX emits
         // mhlo.num_partitions/num_replicas here). Skip the balanced braces.
+        //
+        // While skipping, watch for `mhlo.num_partitions` / `mhlo.num_replicas`.
+        // MetalHLO is single-device by design: pjit-with-mesh / shard_map /
+        // nn.partitioning are supported only when they collapse to a single
+        // device (num_partitions == num_replicas == 1, which is what JAX emits
+        // for a 1-device mesh — the sharding annotations are then no-ops and we
+        // ignore them safely). A module that XLA partitioned across multiple
+        // devices (num_partitions > 1 or num_replicas > 1) would otherwise be
+        // executed as a full, unpartitioned computation on one device — a
+        // silently wrong result. Reject it early and loudly instead.
         if checkIdentifier("attributes") {
             advance()
             if check(.leftBrace) {
                 advance()
                 var depth = 1
+                // Name of the partition/replica attribute whose integer value we
+                // are about to read (`= N : i32`), or nil when not inside one.
+                var pendingShardingAttr: String?
+                let attrStart = currentToken.location
                 while depth > 0 && !check(.eof) {
                     if check(.leftBrace) { depth += 1 }
                     else if check(.rightBrace) { depth -= 1 }
+                    else if currentToken.kind == .identifier
+                                && (currentToken.text == "mhlo.num_partitions"
+                                    || currentToken.text == "mhlo.num_replicas") {
+                        pendingShardingAttr = currentToken.text
+                    } else if let attr = pendingShardingAttr,
+                              case .integer(let count) = currentToken.kind {
+                        // First integer after the attribute name is its value.
+                        if count > 1 {
+                            let kind = attr == "mhlo.num_partitions"
+                                ? "partitions" : "replicas"
+                            throw ParseError.unsupportedFeature(
+                                "module declares \(attr) = \(count); MetalHLO is "
+                                + "single-device only and cannot execute a program "
+                                + "partitioned across \(count) \(kind). Run this "
+                                + "computation on a single device (a 1-device mesh, "
+                                + "or without pjit in/out_shardings / shard_map over "
+                                + "multiple devices).",
+                                location: attrStart)
+                        }
+                        pendingShardingAttr = nil
+                    }
                     advance()
                 }
             }

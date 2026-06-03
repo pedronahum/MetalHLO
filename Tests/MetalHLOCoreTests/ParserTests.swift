@@ -237,4 +237,63 @@ struct ParserTests {
             try parser.parse()
         }
     }
+
+    // MARK: - Single-device (sharding) guards
+
+    @Test("Single-device mesh (num_partitions = 1) parses fine")
+    func singleDevicePartitionsParse() throws {
+        // What JAX emits for a 1-device mesh: sdy.sharding annotations + a
+        // num_partitions = 1 module attribute. The annotations are no-ops on a
+        // single device, so this must parse and run normally.
+        let mlir = """
+        module @jit_f attributes {mhlo.num_partitions = 1 : i32, mhlo.num_replicas = 1 : i32} {
+          sdy.mesh @mesh = <["x"=1, "y"=1]>
+          func.func public @main(%arg0: tensor<8x8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}, {"y"}]>}) -> (tensor<8x8xf32> {jax.result_info = "result"}) {
+            return %arg0 : tensor<8x8xf32>
+          }
+        }
+        """
+
+        let parser = Parser(source: mlir)
+        let module = try parser.parse()
+        #expect(module.function.name == "main")
+    }
+
+    @Test("Multi-partition module (num_partitions > 1) fails loudly")
+    func multiPartitionRejected() {
+        // A program XLA partitioned across 4 devices. The ops are individually
+        // supported, so without the guard this would silently run the full,
+        // unpartitioned computation on one device — a wrong result. It must
+        // instead throw an unsupportedFeature error.
+        let mlir = """
+        module @jit_f attributes {mhlo.num_partitions = 4 : i32, mhlo.num_replicas = 1 : i32} {
+          sdy.mesh @mesh = <["x"=4]>
+          func.func public @main(%arg0: tensor<8x8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}, {}]>}, %arg1: tensor<8x8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}, {}]>}) -> (tensor<8x8xf32> {jax.result_info = "result"}) {
+            %0 = stablehlo.dot_general %arg0, %arg1, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : (tensor<8x8xf32>, tensor<8x8xf32>) -> tensor<8x8xf32>
+            return %0 : tensor<8x8xf32>
+          }
+        }
+        """
+
+        let parser = Parser(source: mlir)
+        #expect(throws: ParseError.self) {
+            try parser.parse()
+        }
+    }
+
+    @Test("Multi-replica module (num_replicas > 1) fails loudly")
+    func multiReplicaRejected() {
+        let mlir = """
+        module @jit_f attributes {mhlo.num_partitions = 1 : i32, mhlo.num_replicas = 2 : i32} {
+          func.func public @main(%arg0: tensor<4xf32>) -> (tensor<4xf32>) {
+            return %arg0 : tensor<4xf32>
+          }
+        }
+        """
+
+        let parser = Parser(source: mlir)
+        #expect(throws: ParseError.self) {
+            try parser.parse()
+        }
+    }
 }

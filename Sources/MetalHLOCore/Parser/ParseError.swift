@@ -36,6 +36,10 @@ public enum ParseError: Error, Sendable, CustomStringConvertible {
     /// Undefined value reference.
     case undefinedValue(String, location: SourceLocation)
 
+    /// A feature that is intentionally unsupported (e.g. multi-device / SPMD
+    /// partitioning). The message explains the limitation to the user.
+    case unsupportedFeature(String, location: SourceLocation)
+
     // MARK: - CustomStringConvertible
 
     public var description: String {
@@ -60,6 +64,8 @@ public enum ParseError: Error, Sendable, CustomStringConvertible {
             return "Duplicate definition of '\(name)' at \(location)"
         case .undefinedValue(let name, let location):
             return "Undefined value '\(name)' at \(location)"
+        case .unsupportedFeature(let message, let location):
+            return "Unsupported feature at \(location): \(message)"
         }
     }
 
@@ -77,7 +83,8 @@ public enum ParseError: Error, Sendable, CustomStringConvertible {
              .invalidConstant(_, let location),
              .missingAttribute(_, _, let location),
              .duplicateDefinition(_, let location),
-             .undefinedValue(_, let location):
+             .undefinedValue(_, let location),
+             .unsupportedFeature(_, let location):
             return location
         }
     }
