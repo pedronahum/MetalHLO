@@ -697,6 +697,34 @@ public final class CodeGenerator: @unchecked Sendable {
                 indexType: elementType
             )
 
+        case .sort:
+            // Single-operand stable sort along `axis` (jnp.sort). Multi-operand
+            // sort (argsort/lexsort) is split by the parser into `sortResult`
+            // ops; see generateSortResultSource.
+            let inShape = inputShapes.first ?? []
+            return generateSortSource(
+                inputShape: inShape,
+                axis: attributes.axis ?? (inShape.count - 1),
+                descending: attributes.sortDescending ?? false,
+                valueType: elementType
+            )
+
+        case .sortResult:
+            // One result of a multi-operand sort: inputs are [key0..keyK-1, payload].
+            // Rank lexicographically by the K keys (stably), scatter the payload to
+            // those ranks. Output type == payload type.
+            let inShape = inputShapes.first ?? []
+            let numKeys = max(1, inputShapes.count - 1)
+            let allTypes = attributes.inputElementTypes ?? []
+            let keyTypes = (0..<numKeys).map { allTypes.indices.contains($0) ? allTypes[$0] : ElementType.float32 }
+            return generateSortResultSource(
+                inputShape: inShape,
+                axis: attributes.axis ?? (inShape.count - 1),
+                descending: attributes.sortDescending ?? false,
+                keyTypes: keyTypes,
+                payloadType: elementType
+            )
+
         // Shape operations
         case .reshape:
             source += generateCopyKernel(entryPoint: entryPoint, metalType: metalType)
@@ -2790,6 +2818,138 @@ public final class CodeGenerator: @unchecked Sendable {
     /// One thread per output element (the flattened non-reduced dims). Buffer
     /// layout mirrors generateIntegerReductionSource: buffer(0) = input values,
     /// buffer(1) = output indices, then outputCount / reduceSize / innerSize.
+    /// Stable sort along one axis via per-element rank-scatter. Each thread owns
+    /// one element, counts how many elements of its row are ordered before it
+    /// (with a `j < i` tiebreak for stability), and scatters its value to that
+    /// rank. Ranks are a permutation, so writes never collide. NaN is treated as
+    /// the largest value (matching JAX's TOTALORDER, NaN last ascending).
+    /// O(axisLen) per element; fine for typical sort lengths.
+    private func generateSortSource(
+        inputShape: [Int], axis: Int, descending: Bool, valueType: ElementType
+    ) -> (String, String, TuningConfig?) {
+        let metal = metalTypeName(for: valueType)
+        let rank = inputShape.count
+        let ax = axis < 0 ? axis + rank : axis
+        let axisLen = (ax >= 0 && ax < rank) ? inputShape[ax] : 1
+        var innerSize = 1
+        if ax + 1 < rank { for i in (ax + 1)..<rank { innerSize *= inputShape[i] } }
+        let total = max(inputShape.reduce(1, *), 1)
+        // `c` = order(kj, ki): -1 if kj before ki by value, +1 if after, 0 equal.
+        let beforeExpr = descending
+            ? "(c > 0) || (c == 0 && j < i)"
+            : "(c < 0) || (c == 0 && j < i)"
+        let source = """
+        #include <metal_stdlib>
+        using namespace metal;
+
+        kernel void kernel_sort(
+            device const \(metal)* input [[buffer(0)]],
+            device \(metal)* output [[buffer(1)]],
+            constant uint& axisLen [[buffer(2)]],
+            constant uint& innerSize [[buffer(3)]],
+            constant uint& total [[buffer(4)]],
+            uint tid [[thread_position_in_grid]])
+        {
+            if (tid >= total) return;
+            uint inner = tid % innerSize;
+            uint tmp = tid / innerSize;
+            uint i = tmp % axisLen;
+            uint outer = tmp / axisLen;
+            uint base = outer * axisLen * innerSize + inner;
+
+            \(metal) ki = input[base + i * innerSize];
+            uint rank = 0;
+            for (uint j = 0; j < axisLen; j++) {
+                \(metal) kj = input[base + j * innerSize];
+                bool an = (kj != kj), bn = (ki != ki);   // NaN tests
+                int c;
+                if (an && bn) c = 0;
+                else if (an) c = 1;                      // NaN is largest
+                else if (bn) c = -1;
+                else if (kj < ki) c = -1;
+                else if (kj > ki) c = 1;
+                else c = 0;
+                if (\(beforeExpr)) rank++;
+            }
+            output[base + rank * innerSize] = ki;
+        }
+        """
+        _ = axisLen; _ = innerSize; _ = total
+        return (source, "kernel_sort", nil)
+    }
+
+    /// Multi-operand sort result: ranks each element by lexicographic comparison
+    /// of the K keys (stably, with a j<i tiebreak) and scatters the matching
+    /// `payload` element to that rank. argsort uses K=1 (payload = iota); lexsort
+    /// uses K>1. Buffers: key0..keyK-1, payload, output, then axisLen/innerSize/total.
+    private func generateSortResultSource(
+        inputShape: [Int], axis: Int, descending: Bool,
+        keyTypes: [ElementType], payloadType: ElementType
+    ) -> (String, String, TuningConfig?) {
+        let k = max(1, keyTypes.count)
+        let payMetal = metalTypeName(for: payloadType)
+        let rank = inputShape.count
+        let ax = axis < 0 ? axis + rank : axis
+        let axisLen = (ax >= 0 && ax < rank) ? inputShape[ax] : 1
+        var innerSize = 1
+        if ax + 1 < rank { for i in (ax + 1)..<rank { innerSize *= inputShape[i] } }
+        let total = max(inputShape.reduce(1, *), 1)
+        let beforeExpr = descending
+            ? "(c > 0) || (c == 0 && j < i)"
+            : "(c < 0) || (c == 0 && j < i)"
+
+        // Key buffer params (buffers 0..K-1) and the lexicographic comparison:
+        // compare key0; only if equal fall through to key1; etc. `c` ends as the
+        // total-order comparison of element j vs i over the keys (NaN = largest).
+        let keyParams = (0..<k).map { m in
+            "    device const \(metalTypeName(for: keyTypes.indices.contains(m) ? keyTypes[m] : .float32))* key\(m) [[buffer(\(m))]],"
+        }.joined(separator: "\n")
+        var keyCompare = "                int c = 0;\n"
+        for m in 0..<k {
+            let km = metalTypeName(for: keyTypes.indices.contains(m) ? keyTypes[m] : .float32)
+            let cmp = """
+                            { \(km) a = key\(m)[base + j * innerSize]; \(km) b = key\(m)[base + i * innerSize];
+                              bool an = (a != a), bn = (b != b);
+                              if (an && bn) c = 0; else if (an) c = 1; else if (bn) c = -1;
+                              else if (a < b) c = -1; else if (a > b) c = 1; else c = 0; }
+                """
+            if m == 0 { keyCompare += cmp + "\n" }
+            else { keyCompare += "                if (c == 0) {\n" + cmp + "\n                }\n" }
+        }
+
+        let payIdx = k, outIdx = k + 1, aIdx = k + 2, iIdx = k + 3, tIdx = k + 4
+        let source = """
+        #include <metal_stdlib>
+        using namespace metal;
+
+        kernel void kernel_sort_result(
+        \(keyParams)
+            device const \(payMetal)* payload [[buffer(\(payIdx))]],
+            device \(payMetal)* output [[buffer(\(outIdx))]],
+            constant uint& axisLen [[buffer(\(aIdx))]],
+            constant uint& innerSize [[buffer(\(iIdx))]],
+            constant uint& total [[buffer(\(tIdx))]],
+            uint tid [[thread_position_in_grid]])
+        {
+            if (tid >= total) return;
+            uint inner = tid % innerSize;
+            uint tmp = tid / innerSize;
+            uint i = tmp % axisLen;
+            uint outer = tmp / axisLen;
+            uint base = outer * axisLen * innerSize + inner;
+
+            uint rk = 0;
+            for (uint j = 0; j < axisLen; j++) {
+        \(keyCompare)
+                if (\(beforeExpr)) rk++;
+            }
+            output[base + rk * innerSize] = payload[base + i * innerSize];
+        }
+        """
+        _ = (axisLen, innerSize, total)
+        return (source, "kernel_sort_result", nil)
+    }
+
     private func generateArgReduceSource(
         inputShape: [Int],
         reduceDims: [Int],
@@ -6943,6 +7103,10 @@ public final class CodeGenerator: @unchecked Sendable {
                 // axis. totalElements is already the output count.
                 return DispatchConfig.dispatch1D(elements: totalElements, threadgroupSize: 256)
 
+            case .sort, .sortResult:
+                // One thread per element; each ranks its element within the row.
+                return DispatchConfig.dispatch1D(elements: totalElements, threadgroupSize: 256)
+
             case .reduce:
                 // Check for specialized reduction kernels
                 if let tuning = tuning, (tuning.useRowReduction || tuning.useColumnReduction) {
@@ -7391,6 +7555,26 @@ public final class CodeGenerator: @unchecked Sendable {
                 size: MemoryLayout<UInt32>.size,
                 access: .read
             ))
+        }
+
+        // sort: after input (0) and output (1) — or key (0), payload (1),
+        // output (2) for sortResult — bind axisLen / innerSize / total. The sort
+        // axis length comes from input 0 (the key), the same shape as the output.
+        if case .original(let opKind) = op.type, opKind == .sort || opKind == .sortResult,
+           let inputShape = op.inputs.first.flatMap({ tensors[$0]?.shape }), !inputShape.isEmpty {
+            let rank = inputShape.count
+            let axisAttr = op.attributes.axis ?? (rank - 1)
+            let ax = axisAttr < 0 ? axisAttr + rank : axisAttr
+            let axisLen = (ax >= 0 && ax < rank) ? inputShape[ax] : 1
+            var innerSize = 1
+            if ax + 1 < rank { for i in (ax + 1)..<rank { innerSize *= inputShape[i] } }
+            let total = max(inputShape.reduce(1, *), 1)
+            for value in [axisLen, innerSize, total] {
+                bindings.append(BufferBinding(
+                    index: index, source: .scalar(UInt32(value)),
+                    size: MemoryLayout<UInt32>.size, access: .read))
+                index += 1
+            }
         }
 
         return bindings

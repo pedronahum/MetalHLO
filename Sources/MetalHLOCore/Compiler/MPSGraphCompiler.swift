@@ -790,6 +790,12 @@ public final class MPSGraphCompiler {
         case .sort:
             return try compileSort(op)
 
+        case .sortResult:
+            // Multi-operand sort is split into per-result rank-scatter kernels on
+            // the fast CodeGenerator path; it does not run on the MPSGraph path.
+            throw CompilationError.unsupportedOperation(
+                "sort_result is a fast-path-only op and should not reach MPSGraph")
+
         // Top-k over the last axis (jax.lax.top_k), split into a values op and
         // an indices op by the parser.
         case .topKValues:

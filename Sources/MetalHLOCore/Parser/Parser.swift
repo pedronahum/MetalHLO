@@ -158,6 +158,15 @@ public final class Parser {
         // whole QR decomposition recomputed host-side from the original matrix.
         var lastGeqrfInput: String? = nil
 
+        // Resolve the tensor type of an already-defined value (last op writing it,
+        // or a function input). Used to give each split sort result the dtype of
+        // its source operand.
+        func typeOf(_ name: String) -> TensorType? {
+            if let op = operations.last(where: { $0.result == name }) { return op.resultType }
+            if let arg = inputs.first(where: { $0.name == name }) { return arg.type }
+            return nil
+        }
+
         while !check(.rightBrace) && !check(.eof) {
             if checkKeyword(.return) {
                 returnValues = try parseReturn()
@@ -256,6 +265,34 @@ public final class Parser {
                         resultType: indexType,
                         attributes: op.attributes
                     ))
+                }
+            } else if op.kind == .sort && op.resultCount >= 2 {
+                // Multi-operand sort (argsort / lexsort): `%r:N = sort(o0..oN-1)`
+                // sorts every operand by the comparator on the keys and returns
+                // each reordered. Split into N `sortResult` ops — result i ranks
+                // by the shared key (operand 0) and reorders operand i. Result i's
+                // dtype == operand i's dtype (sort preserves dtype). Downstream
+                // %r#i refs resolve to %r.i directly.
+                let resolvedOperands = op.operands.map { resolveAlias($0, aliases: valueAliases) }
+                let n = resolvedOperands.count
+                if n >= 2 {
+                    // JAX appends an iota index as the LAST operand for arg/lex
+                    // sorts; the leading operands are the comparison keys. So the
+                    // rank is lexicographic over keys[0..K-1] = operands[0..N-2]
+                    // (argsort: K=1; lexsort: K=N-1). Each sortResult carries all
+                    // K keys plus its own payload operand.
+                    let k = max(1, n - 1)
+                    let keys = Array(resolvedOperands.prefix(k))
+                    for i in 0..<n {
+                        let payload = resolvedOperands[i]
+                        operations.append(HLOOperation(
+                            result: "\(op.result).\(i)",
+                            kind: .sortResult,
+                            operands: keys + [payload],
+                            resultType: typeOf(payload) ?? op.resultType,
+                            attributes: op.attributes
+                        ))
+                    }
                 }
             } else if op.kind == .getTupleElement {
                 // Resolve get_tuple_element to the actual tensor
@@ -1414,6 +1451,27 @@ public final class Parser {
                     attributes.convPadding = windowAttrs.convPadding
                     attributes.baseDilations = windowAttrs.baseDilations
                     attributes.windowDilations = windowAttrs.windowDilations
+                } else if kind == .sort {
+                    // JAX lowers jnp.sort/argsort/lexsort to the generic form
+                    //   "stablehlo.sort"(ops) <{dimension = N : i64, is_stable = b}> ({comparator})
+                    // Capture the sort axis (into `axis`) and stability; the
+                    // direction comes from the comparator region (handled below).
+                    while !check(.rightBrace) && !check(.eof) {
+                        if checkIdentifier("dimension") {
+                            try expectIdentifier("dimension")
+                            try expect(.equal)
+                            attributes.axis = try parseInteger()
+                            if match(.colon) { advance() }  // skip ': i64' type suffix
+                        } else if checkIdentifier("is_stable") {
+                            try expectIdentifier("is_stable")
+                            try expect(.equal)
+                            if checkBool(true) { attributes.isStable = true; advance() }
+                            else if checkBool(false) { attributes.isStable = false; advance() }
+                        } else {
+                            advance()
+                        }
+                        _ = match(.comma)
+                    }
                 }
                 // Skip any remaining/unknown attributes up to the closing brace.
                 while !check(.rightBrace) && !check(.eof) {
@@ -1450,6 +1508,27 @@ public final class Parser {
             // inline its body over the broadcasted element-wise inputs.
             try expect(.leftParen)
             attributes.mapComputation = try parseRegion()
+            try expect(.rightParen)
+            skipNewlines()
+        } else if kind == .sort && check(.leftParen) {
+            // stablehlo.sort's comparator region returns true when arg1 should
+            // precede arg2. We don't execute the region; we only need the sort
+            // DIRECTION. JAX wraps it in NaN/zero canonicalization (FLOAT EQ/NE
+            // compares) followed by the order-determining compare over the
+            // canonicalized values, tagged TOTALORDER: LT => ascending,
+            // GT => descending. Scan the region for that compare.
+            try expect(.leftParen)
+            let comparator = try parseRegion()
+            var descending = false
+            for regionOp in comparator.operations where regionOp.kind == .compare {
+                if let dir = regionOp.attributes.comparisonDirection {
+                    // The canonicalization compares are EQ/NE; the order compare
+                    // is LT or GT — the last such one decides direction.
+                    if dir == .gt || dir == .ge { descending = true }
+                    else if dir == .lt || dir == .le { descending = false }
+                }
+            }
+            attributes.sortDescending = descending
             try expect(.rightParen)
             skipNewlines()
         } else if check(.leftParen) {
@@ -2402,11 +2481,16 @@ public final class Parser {
     private func parseSortAttributes() throws -> HLOAttributes {
         var attributes = HLOAttributes()
 
-        while !check(.colon) && !check(.eof) {
+        // `dimension = N : i64, is_stable = bool`. The `: i64` type suffix must
+        // be consumed here — it is NOT the op's result-type colon (the old
+        // `while !check(.colon)` guard stopped on it, leaving `i64,...` to be
+        // mis-read as the result type).
+        while true {
             if checkIdentifier("dimension") {
                 try expectIdentifier("dimension")
                 try expect(.equal)
                 attributes.axis = try parseInteger()
+                if match(.colon) { advance() }  // consume `: i64`
             } else if checkIdentifier("is_stable") {
                 try expectIdentifier("is_stable")
                 try expect(.equal)
@@ -2421,6 +2505,24 @@ public final class Parser {
                 break
             }
             _ = match(.comma)
+        }
+
+        // Comparator region `({ ^bb0(...): ...; stablehlo.return %p })`. We do
+        // not execute it — only the sort DIRECTION matters. JAX canonicalizes
+        // NaN/±0 (FLOAT EQ/NE compares) then does the order compare over the
+        // canonicalized values (LT => ascending, GT => descending, TOTALORDER).
+        if check(.leftParen) {
+            advance()  // consume `(`
+            let comparator = try parseRegion()
+            var descending = false
+            for regionOp in comparator.operations where regionOp.kind == .compare {
+                if let dir = regionOp.attributes.comparisonDirection {
+                    if dir == .gt || dir == .ge { descending = true }
+                    else if dir == .lt || dir == .le { descending = false }
+                }
+            }
+            attributes.sortDescending = descending
+            try expect(.rightParen)
         }
 
         return attributes

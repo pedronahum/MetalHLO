@@ -237,6 +237,12 @@ public enum HLOOpKind: String, CaseIterable, Sendable {
     /// Sort along dimension.
     case sort
 
+    /// One result of a multi-operand sort (argsort/lexsort). Inputs are
+    /// [key, payload]; the kernel ranks elements by `key` (stably) and scatters
+    /// `payload` to those ranks. The parser splits `%r:N = stablehlo.sort(...)`
+    /// into N of these (result i carries operand i as its payload).
+    case sortResult = "sort_result"
+
     // MARK: - Top-K (2 ops)
     //
     // jax.lax.top_k lowers to a single chlo.top_k that the bytecode
@@ -511,7 +517,7 @@ extension HLOOpKind {
              .convolution, .uniformQuantize, .uniformDequantize,
              .shiftLeft, .shiftRightArithmetic, .shiftRightLogical,
              .complex, .triangularSolve, .dynamicReshape, .dynamicBroadcastInDim,
-             .dynamicIota, .atan2:
+             .dynamicIota, .atan2, .sortResult:
             return .exactly(2)
 
         // Ternary
