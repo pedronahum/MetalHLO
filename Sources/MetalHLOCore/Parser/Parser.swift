@@ -126,6 +126,19 @@ public final class Parser {
                 returnValues = returnValues.map { resolveAlias($0, aliases: valueAliases) }
                 break
             }
+            // Result-less side-effecting statement (no `%result =` prefix), e.g.
+            //   stablehlo.custom_call @xla_ffi_python_cpu_callback(%x) {...} : (...) -> ()
+            // JAX lowers host callbacks (jax.debug.print / debug_callback) to such
+            // ops. They have no SSA result and produce no value the program depends
+            // on, so dropping them is numerically exact — only the host-side
+            // side effect (the print) is lost. parseResultlessStatement consumes
+            // the statement and returns true if it was a known-droppable callback;
+            // anything else still throws loudly.
+            if !check(.percentIdentifier) {
+                try parseResultlessStatement()
+                skipNewlines()
+                continue
+            }
             let op = try parseOperation()
 
             if op.kind == .tuple {
@@ -367,6 +380,134 @@ public final class Parser {
             attributes: attributes,
             resultCount: resultCount
         )
+    }
+
+    /// Host-callback custom_call targets that JAX emits for side-effecting host
+    /// callbacks (jax.debug.print, jax.debug.callback). These produce no SSA
+    /// result and the computation never consumes their (absent) output, so the
+    /// device program is numerically identical with them removed — only the
+    /// host-side effect (the print) is dropped. We do NOT silently swallow
+    /// result-producing callbacks (pure_callback / io_callback): those feed real
+    /// values back into the graph and require host round-trip infrastructure we
+    /// don't have, so they are left to fail loudly elsewhere.
+    private static let droppableHostCallbackTargets: Set<String> = [
+        "xla_ffi_python_cpu_callback",
+        "xla_python_cpu_callback",
+        "xla_python_gpu_callback",
+        "xla_ffi_python_gpu_callback",
+    ]
+
+    /// Parses a result-less (no `%result =`) operation statement. The only such
+    /// statements JAX emits are side-effecting custom_calls — chiefly host
+    /// callbacks like jax.debug.print, which lower to
+    ///   stablehlo.custom_call @xla_ffi_python_cpu_callback(%x) {has_side_effect = true, ...} : (...) -> ()
+    /// When the target is a known droppable host callback we consume and discard
+    /// the statement (the print is dropped; numerics are unchanged). Any other
+    /// result-less operation throws ParseError.invalidOperation so genuinely
+    /// unsupported side effects still surface loudly.
+    private func parseResultlessStatement() throws {
+        let location = currentToken.location
+        let opName = try parseOperationName()
+        let kind = try parseOpKind(from: opName)
+
+        guard kind == .customCall else {
+            throw ParseError.invalidOperation(
+                "unsupported result-less operation '\(opName)' (no SSA result)",
+                location: location
+            )
+        }
+
+        // Capture the target name: @target_name.
+        var target = ""
+        if check(.atIdentifier) {
+            target = String(currentToken.text.dropFirst())  // drop '@'
+            advance()
+        }
+
+        // Skip the operand list: (%op1, %op2, ...).
+        if check(.leftParen) {
+            try skipBalancedParens()
+        }
+
+        // Skip the attribute block: { ... }. JAX host callbacks carry nested
+        // attribute dicts (e.g. `mhlo.backend_config = {index = 0 : ui64}`), so
+        // track brace depth rather than stopping at the first `}`.
+        if check(.leftBrace) {
+            try skipBalancedBraces()
+        }
+
+        // Consume the trailing type signature, including the `-> ()` empty result
+        // list that parseTypeSignature does not handle.
+        try expect(.colon)
+        try skipResultlessTypeSignature()
+
+        guard Parser.droppableHostCallbackTargets.contains(target) else {
+            throw ParseError.invalidOperation(
+                "unsupported side-effecting custom_call target '@\(target)'. "
+                + "Host callbacks that return values (jax.pure_callback / io_callback) "
+                + "require host round-trip support that is not implemented.",
+                location: location
+            )
+        }
+        // Known host-callback side effect: drop it. The computation is unchanged.
+    }
+
+    /// Skips the type signature of a result-less custom_call. Same operand-list
+    /// form as parseTypeSignature, but the return is the empty tuple `()` (or, in
+    /// principle, a normal type) rather than a tensor. parseTypeSignature would
+    /// choke on the `()`, so handle the empty result list explicitly.
+    private func skipResultlessTypeSignature() throws {
+        if check(.leftParen) {
+            try expect(.leftParen)
+            var depth = 1
+            while depth > 0 && !check(.eof) {
+                if check(.leftParen) { depth += 1 }
+                if check(.rightParen) { depth -= 1 }
+                advance()
+            }
+            try expect(.arrow)
+            // Empty result list: `-> ()`. Consume the parens and return.
+            if check(.leftParen) {
+                try expect(.leftParen)
+                var rdepth = 1
+                while rdepth > 0 && !check(.eof) {
+                    if check(.leftParen) { rdepth += 1 }
+                    if check(.rightParen) { rdepth -= 1 }
+                    advance()
+                }
+                return
+            }
+            // Non-empty result: a normal type follows; consume it.
+            _ = try parseTensorType()
+            return
+        }
+        // Bare return type (no parenthesised operand list).
+        _ = try parseTensorType()
+    }
+
+    /// Consumes a balanced `( ... )` group, including nested parens. Assumes the
+    /// current token is the opening `(`.
+    private func skipBalancedParens() throws {
+        try expect(.leftParen)
+        var depth = 1
+        while depth > 0 && !check(.eof) {
+            if check(.leftParen) { depth += 1 }
+            if check(.rightParen) { depth -= 1 }
+            advance()
+        }
+    }
+
+    /// Consumes a balanced `{ ... }` group, including nested braces. Assumes the
+    /// current token is the opening `{`. Used to skip attribute dictionaries that
+    /// contain nested dicts (e.g. `mhlo.backend_config = {index = 0 : ui64}`).
+    private func skipBalancedBraces() throws {
+        try expect(.leftBrace)
+        var depth = 1
+        while depth > 0 && !check(.eof) {
+            if check(.leftBrace) { depth += 1 }
+            if check(.rightBrace) { depth -= 1 }
+            advance()
+        }
     }
 
     /// Tracks whether the last parsed operation name was in generic form (quoted)

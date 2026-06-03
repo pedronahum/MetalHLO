@@ -67,3 +67,51 @@ def initialize():
         library_path=library_path,
         options=None,
     )
+
+    _register_host_callback_lowerings()
+
+
+def _register_host_callback_lowerings():
+    """Make JAX emit StableHLO for side-effecting host callbacks on metalhlo.
+
+    JAX only registers the lowering rules for jax.debug.print / jax.debug.callback
+    on the built-in cpu/gpu/tpu platforms. For a custom PJRT plugin platform like
+    "metalhlo", a jit'd function containing jax.debug.print otherwise raises
+    NotImplementedError at trace time ("MLIR translation rule for primitive
+    'debug_print' not found for platform metalhlo") — before any StableHLO exists.
+
+    On cpu/gpu/tpu these lower to a side-effecting host callback. JAX's own
+    lowering rule routes through `emit_python_callback`, which hard-rejects any
+    platform outside {cpu, cuda, rocm, tpu}, so it cannot be reused here. Instead
+    we register a no-op lowering: both primitives produce no SSA results
+    (multiple_results = True, zero outputs), so emitting nothing is a valid
+    lowering. The print/callback is silently dropped and the device computation is
+    numerically unchanged.
+
+    (The MetalHLO Swift compiler additionally drops the equivalent
+    `stablehlo.custom_call @xla_ffi_python_cpu_callback` host-callback op should it
+    ever appear in StableHLO fed in directly — e.g. a module lowered for cpu.)
+
+    Result-producing callbacks (jax.pure_callback / io_callback) are intentionally
+    NOT touched: they feed real values back into the graph and need a host
+    round-trip the plugin does not implement, so they continue to fail loudly.
+    """
+    try:
+        from jax._src.interpreters import mlir
+        from jax._src import debugging
+    except Exception:
+        return
+
+    def _noop_host_callback_lowering(ctx, *args, **params):
+        # debug_print / debug_callback have no results; drop the side effect.
+        return []
+
+    for prim_name in ("debug_print_p", "debug_callback_p"):
+        prim = getattr(debugging, prim_name, None)
+        if prim is None:
+            continue
+        try:
+            mlir.register_lowering(prim, _noop_host_callback_lowering, platform="metalhlo")
+        except Exception:
+            # Lowering registration is best-effort; never block plugin load.
+            pass
