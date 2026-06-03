@@ -1652,7 +1652,9 @@ public final class CodeGenerator: @unchecked Sendable {
     ///
     /// The scatter kernel first copies the operand to the output, then writes updates
     /// at the positions specified by indices. Supports set (replace) and add (accumulate) modes.
-    private func generateScatterKernel(
+    // `internal` (not private) so kernel-contract regression tests can assert the
+    // generated source directly — see ScatterTests.generatedAddScatterSeedsOperand.
+    func generateScatterKernel(
         entryPoint: String,
         operandShape: [Int],
         indicesShape: [Int],
@@ -1833,29 +1835,57 @@ public final class CodeGenerator: @unchecked Sendable {
             """
         }
 
-        // Accumulating scatter (add/max/min/mul): one thread per UPDATE element
-        // into a fresh-zero operand (the executor memsets the slab and the
-        // planner gives the output an untouched region). atomic add avoids the
-        // RMW race for repeated indices (embedding-gradient backward).
-        let updateOp: String
+        // Accumulating scatter (add/max/min/mul), float32 atomic-add fast path:
+        // one thread per UPDATE element. atomic_fetch_add avoids the RMW race for
+        // repeated indices (embedding-gradient backward, where many tokens map to
+        // the same row). The operand here is the reduction identity (broadcast(0)
+        // for add) and the planner currently hands this result an untouched region
+        // (the executor's one-time slab memset leaves it fresh-zero), so the
+        // per-update atomic accumulation is correct as-is. Left unchanged to keep
+        // the embedding-backward path (and the nanoGPT loss gate) exactly stable;
+        // the reuse-stale-byte hazard is fixed in the non-atomic output-centric
+        // path below, which is the one jnp.unique's i32 add-scatter takes.
         if useAtomicAdd {
-            updateOp = "atomic_fetch_add_explicit((device atomic_float*)(output + dstPos), updates[tid], memory_order_relaxed);"
-        } else {
-            switch computationKind {
-            case .add: updateOp = "output[dstPos] = output[dstPos] + updates[tid];"
-            case .max: updateOp = "output[dstPos] = max(output[dstPos], updates[tid]);"
-            case .min: updateOp = "output[dstPos] = min(output[dstPos], updates[tid]);"
-            case .mul: updateOp = "output[dstPos] = output[dstPos] * updates[tid];"
-            case .set: updateOp = "output[dstPos] = updates[tid];"  // handled above
+            return """
+            \(kernelHeader)
+            {
+                if (tid >= \(totalUpdateElements)) return;
+            \(dstPosBody("tid"))
+                if (oob) return;
+                atomic_fetch_add_explicit((device atomic_float*)(output + dstPos), updates[tid], memory_order_relaxed);
             }
+            """
+        }
+
+        // Non-atomic accumulating scatter (add/max/min/mul): OUTPUT-centric, mirroring
+        // the SET branch. One thread per OUTPUT element seeds `result = operand[tid]`
+        // (the operand is the reduction identity, e.g. broadcast(0) for add), then
+        // folds in every update that targets this position with the reduction op, and
+        // ALWAYS writes output[tid]. This guarantees every output position is written
+        // even when the memory planner reuses a slot whose stale bytes are nonzero —
+        // killing the previous hidden dependency on a fresh-zero slab (which broke
+        // jnp.unique: its i32 add-scatter was handed a reused slot still holding a
+        // bool-compare tensor's 0x01 bytes, so the unscattered positions read dirty).
+        // O(output × updates); these scatters are small in practice. No atomics needed
+        // because each output position is owned by exactly one thread.
+        let fold: String
+        switch computationKind {
+        case .add: fold = "result = result + updates[u];"
+        case .max: fold = "result = max(result, updates[u]);"
+        case .min: fold = "result = min(result, updates[u]);"
+        case .mul: fold = "result = result * updates[u];"
+        case .set: fold = "result = updates[u];"  // handled above
         }
         return """
         \(kernelHeader)
         {
-            if (tid >= \(totalUpdateElements)) return;
-        \(dstPosBody("tid"))
-            if (oob) return;
-            \(updateOp)
+            if (tid >= \(totalOperandElements)) return;
+            \(operandType) result = operand[tid];
+            for (uint u = 0; u < \(totalUpdateElements); u++) {
+        \(dstPosBody("u"))
+                if (!oob && dstPos == tid) { \(fold) }
+            }
+            output[tid] = result;
         }
         """
     }

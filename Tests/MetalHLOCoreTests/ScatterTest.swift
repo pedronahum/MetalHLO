@@ -7,8 +7,11 @@
 
 import Testing
 import Foundation
+import Metal
 @testable import MetalHLO
 @testable import MetalHLOCore
+
+enum ScatterTestError: Error { case noDevice }
 
 @Suite("Scatter Tests", .serialized)
 struct ScatterTests {
@@ -126,6 +129,114 @@ struct ScatterTests {
         #expect(result[3] == 4, "Row 1 col 1 should be 4, got \(result[3])")
         #expect(result[4] == 7, "Row 2 col 0 should be 7, got \(result[4])")
         #expect(result[5] == 8, "Row 2 col 1 should be 8, got \(result[5])")
+    }
+
+    @Test("Add-scatter seeds unscattered positions from operand (reuse-safe)")
+    func testScatterAddSeedsFromOperand() async throws {
+        // Regression for the jnp.unique corruption: the accumulating (non-SET)
+        // scatter must initialize EVERY output position from its operand, not
+        // just the positions it writes. The old kernel skipped the operand→output
+        // copy and assumed the output slab was fresh-zero — true only when the
+        // memory planner gives the result an untouched region. Under buffer reuse
+        // the slot holds another tensor's stale bytes, so unscattered positions
+        // came out dirty (unique([1..6],size=4) → [2,4,1,5] instead of [1,2,3,4]).
+        //
+        // i32 add-scatter takes the non-atomic accumulating path (the float32-only
+        // atomic fast path is bypassed). We give it a NONZERO operand and scatter a
+        // single update; the unscattered positions must equal the operand, proving
+        // the seed happens. Pre-fix this returns 0 at those positions (the executor
+        // memsets the slab to 0 and the kernel never wrote them) and FAILS.
+        let mlir = """
+        module @scatter_add_seed_test {
+          func.func @main(%operand: tensor<4xi32>, %indices: tensor<1x1xi32>, %updates: tensor<1xi32>) -> (tensor<4xi32>) {
+            %1 = "stablehlo.scatter"(%operand, %indices, %updates) ({
+            ^bb0(%arg0: tensor<i32>, %arg1: tensor<i32>):
+              %sum = stablehlo.add %arg0, %arg1 : tensor<i32>
+              stablehlo.return %sum : tensor<i32>
+            }) {
+              scatter_dimension_numbers = #stablehlo.scatter<
+                update_window_dims = [],
+                inserted_window_dims = [0],
+                scatter_dims_to_operand_dims = [0],
+                index_vector_dim = 1
+              >,
+              indices_are_sorted = false,
+              unique_indices = false
+            } : (tensor<4xi32>, tensor<1x1xi32>, tensor<1xi32>) -> tensor<4xi32>
+            return %1 : tensor<4xi32>
+          }
+        }
+        """
+
+        let client = try Client.create()
+        let executable = try client.compile(mlir)
+
+        // Nonzero operand standing in for a reused dirty slot.
+        let operandData: [Int32] = [10, 20, 30, 40]
+        let indicesData: [Int32] = [1]   // scatter at position 1
+        let updatesData: [Int32] = [7]   // add 7 there
+
+        let operandBuf = try client.createBuffer(operandData, shape: [4], elementType: .int32)
+        let indicesBuf = try client.createBuffer(indicesData, shape: [1, 1], elementType: .int32)
+        let updatesBuf = try client.createBuffer(updatesData, shape: [1], elementType: .int32)
+
+        let outputs = try executable.execute([operandBuf, indicesBuf, updatesBuf])
+        let result = try outputs[0].toInt32Array()
+
+        print("Add-scatter seed result: \(result)")
+        // Expected: operand with +7 at position 1 = [10, 27, 30, 40].
+        #expect(result.count == 4)
+        #expect(result[0] == 10, "Position 0 must keep operand value 10, got \(result[0])")
+        #expect(result[1] == 27, "Position 1 = 20+7 = 27, got \(result[1])")
+        #expect(result[2] == 30, "Position 2 must keep operand value 30, got \(result[2])")
+        #expect(result[3] == 40, "Position 3 must keep operand value 40, got \(result[3])")
+    }
+
+    @Test("Generated add-scatter kernel seeds every output from operand")
+    func generatedAddScatterSeedsOperand() throws {
+        // Kernel-contract regression for the jnp.unique corruption. The accumulating
+        // (non-SET) scatter must be OUTPUT-centric: one thread per output element
+        // seeds `result = operand[tid]` and ALWAYS writes `output[tid]`. The OLD
+        // per-update kernel only wrote the touched positions and assumed the output
+        // slab was fresh-zero — false under buffer reuse, which left unscattered
+        // positions holding a dead tensor's stale bytes (unique([1..6],size=4) →
+        // [2,4,1,5]). This asserts the generated Metal source directly so it fails
+        // deterministically if the fix is reverted, independent of planner reuse
+        // heuristics. i32 operand ⇒ the non-atomic accumulating path (the float32
+        // atomic fast path is bypassed).
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw ScatterTestError.noDevice
+        }
+        let gen = CodeGenerator(device: device)
+        let dims = ScatterDimensionNumbers(
+            updateWindowDims: [],
+            insertedWindowDims: [0],
+            scatterDimsToOperandDims: [0],
+            indexVectorDim: 1
+        )
+        let source = gen.generateScatterKernel(
+            entryPoint: "scatter_add_seed",
+            operandShape: [4],
+            indicesShape: [1, 1],
+            updatesShape: [1],
+            outputShape: [4],
+            dimNumbers: dims,
+            computationKind: .add,
+            operandType: "int",
+            indicesType: "int"
+        )
+
+        print("Generated add-scatter kernel:\n\(source)")
+        // The seed from operand and the unconditional per-output write are the
+        // exact lines the fix introduced; both are absent in the old per-update
+        // kernel (which has `if (tid >= 1) return;` over the single update and a
+        // bare `output[dstPos] = output[dstPos] + ...`).
+        #expect(source.contains("result = operand[tid]"),
+                "Accumulating scatter must seed result from operand[tid]")
+        #expect(source.contains("output[tid] = result"),
+                "Accumulating scatter must write every output position")
+        #expect(!source.contains("output[dstPos] = output[dstPos] + updates[tid]"),
+                "Accumulating scatter must not use the old per-update RMW that skips unscattered positions")
     }
 
     @Test("Scatter with identity update - O3")
