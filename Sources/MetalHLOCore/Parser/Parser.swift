@@ -918,7 +918,15 @@ public final class Parser {
         // Parse region if present: ({^bb0(%arg0: type, %arg1: type): ops... })
         // This appears between operands and attributes for ops like scatter and reduce.
         // The region body determines the computation kind (e.g., identity, add, max).
-        if check(.leftParen) {
+        if kind == .map && check(.leftParen) {
+            // stablehlo.map carries a full per-element computation region, not a
+            // single reduction kind. Capture the whole region so codegen can
+            // inline its body over the broadcasted element-wise inputs.
+            try expect(.leftParen)
+            attributes.mapComputation = try parseRegion()
+            try expect(.rightParen)
+            skipNewlines()
+        } else if check(.leftParen) {
             let computationKind = try parseOperationRegion()
             if kind == .scatter {
                 attributes.scatterComputationKind = computationKind

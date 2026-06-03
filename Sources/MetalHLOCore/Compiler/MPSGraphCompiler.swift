@@ -4335,22 +4335,78 @@ public final class MPSGraphCompiler {
     }
 
     private func compileCholesky(_ op: HLOOperation) throws -> MPSGraphTensor {
-        // Cholesky decomposition A = LL^T
-        // MPSGraph doesn't have direct Cholesky - requires MPSMatrixDecompositionCholesky
+        // Cholesky decomposition of a symmetric positive-definite matrix
+        // A = L·Lᵀ (lower) or A = Uᵀ·U (upper). MPSGraph has no native Cholesky
+        // kernel, but the Cholesky–Banachiewicz recurrence is a sequence of
+        // element-wise reductions that map cleanly onto MPSGraph ops, so we build
+        // the factor column-by-column without bridging out to MPSMatrix.
         //
-        // To implement properly, you would need to:
-        // 1. Extract MTLBuffer from MPSGraphTensorData
-        // 2. Create MPSMatrix object
-        // 3. Use MPSMatrixDecompositionCholesky
-        // 4. Wrap result back into MPSGraphTensor
-        //
-        // This requires breaking out of the pure MPSGraph compilation model.
-        _ = try getOperand(op.operands[0])  // input matrix
+        // For the lower factor L:
+        //   L[j,j] = sqrt(A[j,j] - Σ_{k<j} L[j,k]²)
+        //   L[i,j] = (A[i,j] - Σ_{k<j} L[i,k]·L[j,k]) / L[j,j]   (i > j)
+        // The upper factor is just Lᵀ, so we compute L and transpose when needed.
+        let a = try getOperand(op.operands[0])  // SPD matrix [N, N]
+        let lower = op.attributes.lower ?? true
 
-        throw CompilationError.unsupportedOperation(
-            "cholesky requires MPSMatrixDecompositionCholesky kernel bridging - " +
-            "not available in pure MPSGraph compilation"
+        guard let aShape = a.shape, aShape.count == 2 else {
+            throw CompilationError.unsupportedOperation("cholesky requires a 2D matrix")
+        }
+        let n = aShape[0].intValue
+        guard aShape[1].intValue == n else {
+            throw CompilationError.unsupportedOperation("cholesky requires a square matrix")
+        }
+
+        // Columns of L are accumulated as [N, 1] tensors. cols[j] holds column j;
+        // entries above the diagonal (row < j) are zero.
+        var cols: [MPSGraphTensor] = Array(
+            repeating: graph.constant(0.0, shape: [NSNumber(value: n), 1], dataType: a.dataType ?? .float32),
+            count: n
         )
+
+        for j in 0..<n {
+            // A[:, j] — full column of the input, shape [N, 1].
+            let aColJ = graph.sliceTensor(a, dimension: 1, start: j, length: 1, name: nil)
+
+            // running = A[:, j] - Σ_{k<j} L[:, k] * L[j, k]
+            // (L[j,k] is the j-th row entry of already-computed column k.)
+            var running = aColJ
+            for k in 0..<j {
+                let colK = cols[k]                               // [N, 1]
+                let ljk = graph.sliceTensor(colK, dimension: 0, start: j, length: 1, name: nil)  // [1,1] = L[j,k]
+                let term = graph.multiplication(colK, ljk, name: nil)  // broadcast [N,1]
+                running = graph.subtraction(running, term, name: nil)
+            }
+
+            // Diagonal pivot L[j,j] = sqrt(running[j]).
+            let pivotRaw = graph.sliceTensor(running, dimension: 0, start: j, length: 1, name: nil)  // [1,1]
+            let pivot = graph.squareRoot(with: pivotRaw, name: nil)                                  // [1,1]
+
+            // Below-diagonal entries L[i,j] = running[i] / pivot for i > j; the
+            // diagonal becomes pivot; rows above j stay zero.
+            // Build a per-row mask: 1 where row > j (scale by 1/pivot), and inject
+            // the diagonal separately.
+            let divided = graph.division(running, pivot, name: nil)  // [N,1], correct for i>j and i==j
+
+            // Zero out rows i < j (strict upper part of this column).
+            // rowIdx[i] = i ; keep where rowIdx >= j.
+            let rowIdx = graph.coordinate(alongAxis: 0, withShape: [NSNumber(value: n), 1], name: nil)
+            let rowIdxF = graph.cast(rowIdx, to: a.dataType ?? .float32, name: nil)
+            let jConst = graph.constant(Double(j), shape: [1, 1], dataType: a.dataType ?? .float32)
+            let keepMask = graph.greaterThanOrEqualTo(rowIdxF, jConst, name: nil)  // bool [N,1]
+            let zero = graph.constant(0.0, shape: [NSNumber(value: n), 1], dataType: a.dataType ?? .float32)
+            let colJ = graph.select(predicate: keepMask, trueTensor: divided, falseTensor: zero, name: nil)
+
+            cols[j] = colJ
+        }
+
+        // Assemble L = [col0 | col1 | ... ] → [N, N].
+        let lower_L = graph.concatTensors(cols, dimension: 1, name: lower ? op.result : nil)
+
+        if lower {
+            return lower_L
+        }
+        // Upper factor requested: return Lᵀ.
+        return graph.transposeTensor(lower_L, dimension: 0, withDimension: 1, name: op.result)
     }
 
     private func compileSelectAndScatter(_ op: HLOOperation) throws -> MPSGraphTensor {
@@ -4418,21 +4474,56 @@ public final class MPSGraphCompiler {
     // MARK: - Map Operation
 
     private func compileMap(_ op: HLOOperation) throws -> MPSGraphTensor {
-        // Map applies a computation element-wise over tensors
-        // The computation is defined by a region (lambda function)
-        //
-        // To implement properly, you would need to:
-        // 1. Parse and compile the computation region
-        // 2. Generate a custom Metal kernel that applies the computation
-        // 3. Execute element-wise across all inputs
-        //
-        // This requires JIT compilation capabilities not available in MPSGraph.
-        // For common patterns (like element-wise unary/binary ops), use the
-        // corresponding StableHLO operations directly instead of map.
-        throw CompilationError.unsupportedOperation(
-            "map requires JIT compilation of computation region - " +
-            "use explicit element-wise operations instead"
-        )
+        // stablehlo.map applies a scalar computation element-wise across one or
+        // more equally-shaped tensors. Each region argument is a rank-0 scalar
+        // bound to the corresponding input element. Because every op inside the
+        // region body is itself element-wise (add/mul/select/exp/...), we can
+        // inline the region directly over the full-rank input tensors: binding
+        // each scalar argument to its whole input tensor evaluates the body
+        // pointwise and yields the mapped result with no per-element loop.
+        guard let region = op.attributes.mapComputation else {
+            throw CompilationError.missingAttribute("mapComputation", operation: "map")
+        }
+
+        // Bind region arguments to the operand tensors (argument i ↔ operand i).
+        guard region.arguments.count == op.operands.count else {
+            throw CompilationError.unsupportedOperation(
+                "map region argument count (\(region.arguments.count)) does not " +
+                "match operand count (\(op.operands.count))"
+            )
+        }
+
+        var localValueMap: [String: MPSGraphTensor] = [:]
+        for (arg, operandName) in zip(region.arguments, op.operands) {
+            localValueMap[arg.name] = try getOperand(operandName)
+        }
+
+        // Compile the body operations in order, threading results through the
+        // local value map. compileRegionOperation handles the element-wise op
+        // vocabulary (arithmetic, compare, select, unary math, convert, ...).
+        var lastResult: MPSGraphTensor? = nil
+        for bodyOp in region.operations {
+            let result = try compileRegionOperation(bodyOp, localValueMap: &localValueMap)
+            localValueMap[bodyOp.result] = result
+            lastResult = result
+        }
+
+        // The mapped output is the region's return value.
+        if let returnName = region.returnValues.first {
+            if let returned = localValueMap[returnName] {
+                // Tag with the op's result name and ensure the declared shape.
+                return graph.reshape(returned, shape: op.resultType.mpsShape, name: op.result)
+            }
+            // A region that returns one of its arguments directly (identity map).
+            if let arg = localValueMap[returnName] {
+                return graph.reshape(arg, shape: op.resultType.mpsShape, name: op.result)
+            }
+        }
+
+        guard let result = lastResult else {
+            throw CompilationError.unsupportedOperation("map region produced no result")
+        }
+        return graph.reshape(result, shape: op.resultType.mpsShape, name: op.result)
     }
 
     // MARK: - Control Flow Compilation
