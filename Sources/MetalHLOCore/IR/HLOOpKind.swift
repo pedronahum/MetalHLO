@@ -309,6 +309,14 @@ public enum HLOOpKind: String, CaseIterable, Sendable {
     /// Tuple element extraction (eliminated during parsing via alias resolution).
     case getTupleElement = "get_tuple_element"
 
+    // MARK: - Scheduling Barriers (1 op - eliminated during parsing)
+
+    /// Optimization barrier — variadic identity that only constrains scheduling.
+    /// Result `i` aliases operand `i` (no value change). Emitted by
+    /// jax.checkpoint / jax.remat / jax.lax.optimization_barrier. Eliminated
+    /// during parsing via alias resolution (like tuple ops).
+    case optimizationBarrier = "optimization_barrier"
+
     // MARK: - Custom Calls (1 op)
 
     /// Custom call for fused operations.
@@ -500,6 +508,9 @@ extension HLOOpKind {
 
         case .call:
             return .atLeast(0)  // variable inputs — may have zero args
+
+        case .optimizationBarrier:
+            return .atLeast(1)  // variadic identity — result i aliases operand i
         }
     }
 }

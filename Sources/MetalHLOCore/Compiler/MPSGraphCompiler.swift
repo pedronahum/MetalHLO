@@ -485,6 +485,9 @@ public final class MPSGraphCompiler {
         case .tuple, .getTupleElement:
             throw CompilationError.unsupportedOperation("tuple operations should be eliminated during parsing")
 
+        case .optimizationBarrier:
+            throw CompilationError.unsupportedOperation("optimization_barrier should be eliminated during parsing")
+
         // Custom calls (fused operations from Magma)
         case .customCall:
             return try compileCustomCall(op)

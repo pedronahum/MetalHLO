@@ -116,6 +116,19 @@ public final class Parser {
                 // Record tuple composition — resolve any aliases in operands
                 let resolvedOperands = op.operands.map { resolveAlias($0, aliases: valueAliases) }
                 tupleOperands[op.result] = resolvedOperands
+            } else if op.kind == .optimizationBarrier {
+                // Identity barrier: result i aliases operand i. Resolve any
+                // aliases in the operands first, then map each result name to
+                // its corresponding input. Downstream references use %name#i,
+                // which the lexer rewrites to %name.i; the single-result form
+                // %name maps to operand 0.
+                let resolvedOperands = op.operands.map { resolveAlias($0, aliases: valueAliases) }
+                for (i, src) in resolvedOperands.enumerated() {
+                    valueAliases["\(op.result).\(i)"] = src
+                }
+                if let first = resolvedOperands.first {
+                    valueAliases[op.result] = first
+                }
             } else if op.kind == .getTupleElement {
                 // Resolve get_tuple_element to the actual tensor
                 let tupleRef = resolveAlias(op.operands.first ?? "", aliases: valueAliases)
@@ -346,6 +359,22 @@ public final class Parser {
         } else if kind == .iota {
             // Special handling for iota: dim = N : tensor<...>
             (operands, attributes) = try parseIotaOperandsAndAttributes()
+        } else if kind == .optimizationBarrier {
+            // optimization_barrier %a, %b : t0, t1  (variadic identity).
+            // Parse the operands, then consume the comma-separated type list
+            // (one type per result). The op is eliminated via alias resolution
+            // in the main loop, so the result type here is informational.
+            while check(.percentIdentifier) {
+                let operand = try parsePercentIdentifier()
+                operands.append(operand)
+                _ = match(.comma)
+            }
+            try expect(.colon)
+            let firstType = try parseTensorType()
+            while match(.comma) {
+                _ = try parseTensorType()
+            }
+            return (operands, attributes, firstType)
         } else if kind == .getTupleElement {
             // Special handling for get_tuple_element: %tuple[index]
             (operands, attributes) = try parseGetTupleElementOperandsAndAttributes()
