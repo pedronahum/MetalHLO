@@ -1725,15 +1725,6 @@ public final class CodeGenerator: @unchecked Sendable {
             ? indicesShape[ivd]
             : 1
 
-        // Build kernel body.
-        var body = ""
-
-        // Decompose tid into per-dim update coords.
-        for d in 0..<updatesShape.count {
-            body += "            uint uc\(d) = (tid / \(updatesStrides[d])) % \(updatesShape[d]);\n"
-        }
-
-        // Look up each scatter-index component.
         // indices position = Σ over non-IVD indices dims i of
         //   (uc[updateScatterDims[i]]) * indicesStrides[indicesNonIVDDims[i]]
         // + k * indicesStrides[ivd]  (when ivd is in-shape)
@@ -1743,15 +1734,6 @@ public final class CodeGenerator: @unchecked Sendable {
             baseTerms.append("uc\(updDim) * \(indicesStrides[sidxDim])")
         }
         let baseExpr = baseTerms.isEmpty ? "0" : baseTerms.joined(separator: " + ")
-        for k in 0..<numComps {
-            let ivdTerm: String
-            if ivd >= 0 && ivd < indicesShape.count {
-                ivdTerm = " + \(k) * \(indicesStrides[ivd])"
-            } else {
-                ivdTerm = ""
-            }
-            body += "            uint scatter_idx_\(k) = uint(indices[\(baseExpr)\(ivdTerm)]);\n"
-        }
 
         // Helper: scatter_indices dim → corresponding update scatter dim.
         func updateDimForIndicesDim(_ sidxDim: Int) -> Int? {
@@ -1761,7 +1743,6 @@ public final class CodeGenerator: @unchecked Sendable {
             return nil
         }
 
-        // Compute dstPos in operand.
         let insertedWindowSet = Set(dimNumbers.insertedWindowDims)
         let inputBatching = dimNumbers.inputBatchingDims
         let scatterIdxBatching = dimNumbers.scatterIndicesBatchingDims
@@ -1772,21 +1753,39 @@ public final class CodeGenerator: @unchecked Sendable {
             !inputBatching.contains($0) && !insertedWindowSet.contains($0)
         }
 
-        body += "            uint dstPos = 0;\n"
-        for d in 0..<operandShape.count {
-            if let k = inputBatching.firstIndex(of: d),
-               k < scatterIdxBatching.count,
-               let updDim = updateDimForIndicesDim(scatterIdxBatching[k]) {
-                body += "            dstPos += uc\(updDim) * \(operandStrides[d]);\n"
-            } else if let k = scatterToOperand.firstIndex(of: d) {
-                let dimSize = operandShape[d]
-                body += "            if (scatter_idx_\(k) >= \(dimSize)) return;\n"
-                body += "            dstPos += scatter_idx_\(k) * \(operandStrides[d]);\n"
-            } else if let i = operandWindowDims.firstIndex(of: d),
-                      i < dimNumbers.updateWindowDims.count {
-                let updWinDim = dimNumbers.updateWindowDims[i]
-                body += "            dstPos += uc\(updWinDim) * \(operandStrides[d]);\n"
+        // Emits the per-update-element `dstPos` computation, decomposing the
+        // update index `idx` into coords, reading the scatter-index components,
+        // and accumulating the operand offset. Per StableHLO an operand dim can
+        // get BOTH a scatter-index offset (window start) AND an in-window coord —
+        // they ADD; a dim with only one role gets 0 from the others. Sets `oob`
+        // if a scatter index is out of range (the caller skips that element).
+        func dstPosBody(_ idx: String) -> String {
+            var b = ""
+            for d in 0..<updatesShape.count {
+                b += "                uint uc\(d) = (\(idx) / \(updatesStrides[d])) % \(updatesShape[d]);\n"
             }
+            for k in 0..<numComps {
+                let ivdTerm = (ivd >= 0 && ivd < indicesShape.count) ? " + \(k) * \(indicesStrides[ivd])" : ""
+                b += "                uint scatter_idx_\(k) = uint(indices[\(baseExpr)\(ivdTerm)]);\n"
+            }
+            b += "                bool oob = false;\n"
+            b += "                uint dstPos = 0;\n"
+            for d in 0..<operandShape.count {
+                if let k = inputBatching.firstIndex(of: d),
+                   k < scatterIdxBatching.count,
+                   let updDim = updateDimForIndicesDim(scatterIdxBatching[k]) {
+                    b += "                dstPos += uc\(updDim) * \(operandStrides[d]);\n"
+                }
+                if let i = operandWindowDims.firstIndex(of: d), i < dimNumbers.updateWindowDims.count {
+                    let updWinDim = dimNumbers.updateWindowDims[i]
+                    b += "                dstPos += uc\(updWinDim) * \(operandStrides[d]);\n"
+                }
+                if let k = scatterToOperand.firstIndex(of: d) {
+                    b += "                if (scatter_idx_\(k) >= \(operandShape[d])) oob = true;\n"
+                    b += "                dstPos += scatter_idx_\(k) * \(operandStrides[d]);\n"
+                }
+            }
+            return b
         }
 
         // Embedding-style autograd backward scatters multiple updates to the
@@ -1801,12 +1800,45 @@ public final class CodeGenerator: @unchecked Sendable {
         let isFloat32Operand = (operandType == "float")
         let useAtomicAdd = isFloat32Operand && (computationKind == .add)
 
+        let kernelHeader = """
+        kernel void \(entryPoint)(
+            device const \(operandType)* operand [[buffer(0)]],
+            device const \(indicesType)* indices [[buffer(1)]],
+            device const \(operandType)* updates [[buffer(2)]],
+            device \(operandType)* output [[buffer(3)]],
+            uint tid [[thread_position_in_grid]])
+        """
+
+        // SET scatter: output-centric. One thread per OUTPUT element starts from
+        // the operand value, then overwrites from any update that targets this
+        // position. The accumulating path below skips the operand→output copy
+        // (it assumes a fresh-zero operand, true for autograd scatter-add); SET
+        // scatters into a NON-zero operand — e.g. jnp.unique builds its mask by
+        // scattering into broadcast(true) — and would otherwise leave the
+        // unscattered positions at the memset-0 value. unique_indices ⇒ at most
+        // one match; for general SET the last match wins, matching StableHLO.
+        // O(output × updates); SET scatters are small in practice.
+        if computationKind == .set {
+            return """
+            \(kernelHeader)
+            {
+                if (tid >= \(totalOperandElements)) return;
+                \(operandType) result = operand[tid];
+                for (uint u = 0; u < \(totalUpdateElements); u++) {
+            \(dstPosBody("u"))
+                    if (!oob && dstPos == tid) { result = updates[u]; }
+                }
+                output[tid] = result;
+            }
+            """
+        }
+
+        // Accumulating scatter (add/max/min/mul): one thread per UPDATE element
+        // into a fresh-zero operand (the executor memsets the slab and the
+        // planner gives the output an untouched region). atomic add avoids the
+        // RMW race for repeated indices (embedding-gradient backward).
         let updateOp: String
         if useAtomicAdd {
-            // device float* is bitcast to device atomic_float* (same storage).
-            // memory_order_relaxed is sufficient: each thread's contribution
-            // is independent and we only need eventual consistency by the
-            // end-of-encoder barrier the executor inserts.
             updateOp = "atomic_fetch_add_explicit((device atomic_float*)(output + dstPos), updates[tid], memory_order_relaxed);"
         } else {
             switch computationKind {
@@ -1814,43 +1846,15 @@ public final class CodeGenerator: @unchecked Sendable {
             case .max: updateOp = "output[dstPos] = max(output[dstPos], updates[tid]);"
             case .min: updateOp = "output[dstPos] = min(output[dstPos], updates[tid]);"
             case .mul: updateOp = "output[dstPos] = output[dstPos] * updates[tid];"
-            case .set: updateOp = "output[dstPos] = updates[tid];"
+            case .set: updateOp = "output[dstPos] = updates[tid];"  // handled above
             }
         }
-
-        // Two-phase scatter (copy operand → output, then scatter updates)
-        // races across threadgroups: Metal has no grid-wide barrier inside a
-        // kernel, so a copy in TG B can overwrite an atomic_fetch_add in
-        // TG A whenever the dispatch spans more than one threadgroup.
-        // Manifested in autograd backward at nanoGPT scale — `scatter_add`
-        // into (16, 256, 65) lost ~2/3 of the updates.
-        //
-        // Splitting into two separate dispatches would require multi-kernel
-        // ops in the executor (todo). For now we skip the in-kernel copy
-        // entirely and rely on two invariants:
-        //   1. IntegratedExecutor `memset(unifiedBuffer.contents(), 0, ...)`
-        //      at the start of every `execute()` — the buffer's bytes start
-        //      at zero.
-        //   2. The static memory planner places each output at an offset
-        //      that no earlier op has written to — for the autograd
-        //      patterns JAX emits (scatter into a freshly-broadcast zero
-        //      tensor), the output region was untouched.
-        //
-        // Under these invariants the "copy operand → output" step writes
-        // zeros where there are already zeros, so it can be dropped.
-        // Scatter ops whose operand is not a fresh zero will need the
-        // separate-dispatch fix.
-
         return """
-        kernel void \(entryPoint)(
-            device const \(operandType)* operand [[buffer(0)]],
-            device const \(indicesType)* indices [[buffer(1)]],
-            device const \(operandType)* updates [[buffer(2)]],
-            device \(operandType)* output [[buffer(3)]],
-            uint tid [[thread_position_in_grid]])
+        \(kernelHeader)
         {
             if (tid >= \(totalUpdateElements)) return;
-            \(body)
+        \(dstPosBody("tid"))
+            if (oob) return;
             \(updateOp)
         }
         """
