@@ -129,6 +129,40 @@ public final class Parser {
                 if let first = resolvedOperands.first {
                     valueAliases[op.result] = first
                 }
+            } else if op.kind == .reduce && op.resultCount >= 2
+                        && op.attributes.argReduceIndexType != nil {
+                // Multi-input argmax/argmin reduce: a single 2-result op
+                // (max/min value, argmax/argmin index). Split it into a normal
+                // value `.reduce` (result %name.0) and a `.reduceArg` index op
+                // (result %name.1). Both read operand 0 (the input values);
+                // downstream %name#0 / %name#1 refs resolve straight to these
+                // results. reductionKind (.max / .min, detected from the
+                // reducer body) selects argmax vs argmin.
+                let resolvedOperands = op.operands.map { resolveAlias($0, aliases: valueAliases) }
+                // Original operand order is (in_value, in_index, init_value,
+                // init_index). The value reduce matches the single-input reduce
+                // codegen which takes (input, init), so feed it the input values
+                // and the value init.
+                var valueReduceOperands = [resolvedOperands[0]]
+                if resolvedOperands.count > 2 { valueReduceOperands.append(resolvedOperands[2]) }
+                operations.append(HLOOperation(
+                    result: "\(op.result).0",
+                    kind: .reduce,
+                    operands: valueReduceOperands,
+                    resultType: op.resultType,
+                    attributes: op.attributes
+                ))
+                if let indexType = op.attributes.argReduceIndexType {
+                    // The index op only needs the input values (operand 0); it
+                    // scans the reduce axis and writes the argmax/argmin index.
+                    operations.append(HLOOperation(
+                        result: "\(op.result).1",
+                        kind: .reduceArg,
+                        operands: [resolvedOperands[0]],
+                        resultType: indexType,
+                        attributes: op.attributes
+                    ))
+                }
             } else if op.kind == .topKValues {
                 // top_k is a single 2-result op. Split it into a values op
                 // (result %name.0) and an indices op (result %name.1), both
@@ -530,7 +564,20 @@ public final class Parser {
 
         // Parse type signature
         try expect(.colon)
-        let resultType = try parseTypeSignature(for: kind)
+        let resultType: TensorType
+        if kind == .reduce && operands.count >= 4 {
+            // Multi-input reduce (argmax/argmin): the signature has two result
+            // types — the value type and the i32/i64 index type, e.g.
+            //   (tensor<4x8xf32>, tensor<4x8xi32>, tensor<f32>, tensor<i32>)
+            //       -> (tensor<4xf32>, tensor<4xi32>)
+            // Capture both so the main loop can split off the .reduceArg index
+            // op. parseTypeSignature would discard the index type.
+            let (valueType, indexType) = try parseReduceResultTypes()
+            resultType = valueType
+            attributes.argReduceIndexType = indexType
+        } else {
+            resultType = try parseTypeSignature(for: kind)
+        }
 
         // For reduce operations, skip the optional reducer block that follows the type.
         // Format: ... : (types) -> type\n  reducer(%args) (%args) { body }
@@ -2270,6 +2317,33 @@ public final class Parser {
         }
 
         return try parseTensorType()
+    }
+
+    /// Parses the type signature of a multi-input (argmax/argmin) reduce and
+    /// returns the (value, index) result types. Format:
+    ///   (in_value, in_index, init_value, init_index) -> (out_value, out_index)
+    /// The leading operand-type list is skipped; both return types are captured.
+    private func parseReduceResultTypes() throws -> (TensorType, TensorType) {
+        // Skip the parenthesised operand-type list.
+        try expect(.leftParen)
+        var depth = 1
+        while depth > 0 && !check(.eof) {
+            if check(.leftParen) { depth += 1 }
+            if check(.rightParen) { depth -= 1 }
+            advance()
+        }
+        try expect(.arrow)
+        // Return types: (value_type, index_type).
+        try expect(.leftParen)
+        let valueType = try parseTensorType()
+        try expect(.comma)
+        let indexType = try parseTensorType()
+        // Skip any further (unexpected) result types.
+        while match(.comma) {
+            _ = try parseTensorType()
+        }
+        try expect(.rightParen)
+        return (valueType, indexType)
     }
 
     /// Skips a `tuple<...>` type and returns a placeholder TensorType.

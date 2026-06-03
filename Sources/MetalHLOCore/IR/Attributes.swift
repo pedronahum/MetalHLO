@@ -161,6 +161,13 @@ public struct HLOAttributes: Sendable {
     /// the indices op can be split off from the same 2-result top_k op.
     public var topKIndexType: TensorType?
 
+    // MARK: - Arg-Reduce Attributes
+
+    /// Result type of the argmax/argmin index output (i32/i64), captured at
+    /// parse time so the index op (`.reduceArg`) can be split off from the same
+    /// 2-input, 2-result stablehlo.reduce that jnp.argmax/argmin lowers to.
+    public var argReduceIndexType: TensorType?
+
     /// Sort descending instead of ascending.
     public var sortDescending: Bool?
 

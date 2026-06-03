@@ -232,6 +232,18 @@ public enum HLOOpKind: String, CaseIterable, Sendable {
     /// Top-k indices along the last axis (positions of the k largest).
     case topKIndices = "top_k_indices"
 
+    // MARK: - Arg-Reduce (argmax / argmin index)
+    //
+    // jnp.argmax / jnp.argmin lower to a 2-input, 2-result stablehlo.reduce
+    // (value + iota index) whose reducer keeps the larger/smaller value and the
+    // smaller index on ties. The parser splits that op into a normal `.reduce`
+    // (the max/min value, result %name.0) and this `.reduceArg` op carrying the
+    // argmax/argmin index (result %name.1). The reductionKind attribute (.max /
+    // .min) selects argmax vs argmin.
+
+    /// Index of the max (argmax) or min (argmin) element along a reduce axis.
+    case reduceArg = "reduce_arg"
+
     // MARK: - Comparison Operations (2 ops)
 
     /// Comparison (EQ, NE, LT, LE, GT, GE).
@@ -465,7 +477,7 @@ extension HLOOpKind {
              .iota, .tan, .logistic, .isFinite, .reverse, .fft, .sort,
              .expm1, .log1p, .cbrt, .roundNearestAfz, .roundNearestEven,
              .popcnt, .real, .imag, .cholesky, .bitcastConvert, .reducePrecision,
-             .topKValues, .topKIndices:
+             .topKValues, .topKIndices, .reduceArg:
             return .exactly(1)
 
         // Binary

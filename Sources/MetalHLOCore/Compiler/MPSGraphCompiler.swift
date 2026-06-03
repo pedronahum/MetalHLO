@@ -383,6 +383,8 @@ public final class MPSGraphCompiler {
         // Reductions
         case .reduce:
             return try compileReduce(op)
+        case .reduceArg:
+            return try compileReduceArg(op)
         case .reduceWindow:
             return try compileReduceWindow(op)
         case .selectAndScatter:
@@ -1075,6 +1077,30 @@ public final class MPSGraphCompiler {
 
         // Broadcast to final shape
         return graph.broadcast(reshaped, shape: op.resultType.mpsShape, name: op.result)
+    }
+
+    /// Compiles the argmax/argmin index half of a multi-input reduce that the
+    /// parser split off into a `.reduceArg` op. reductionKind (.max / .min)
+    /// selects argmax vs argmin; the index is taken along the (single) reduce
+    /// axis and cast to the result int type, then reshaped to drop that axis.
+    private func compileReduceArg(_ op: HLOOperation) throws -> MPSGraphTensor {
+        let values = try getOperand(op.operands[0])
+        let axes = op.attributes.dimensions ?? [0]
+        let axis = axes.first ?? 0
+        let kind = op.attributes.reductionKind ?? .max
+
+        let argIndex: MPSGraphTensor
+        switch kind {
+        case .min:
+            argIndex = graph.reductionArgMinimum(with: values, axis: axis, name: nil)
+        default:
+            argIndex = graph.reductionArgMaximum(with: values, axis: axis, name: nil)
+        }
+
+        // reductionArgMaximum/Minimum keep the reduced axis as size 1; StableHLO
+        // drops it. Cast to the result int type and reshape to the result shape.
+        let casted = graph.cast(argIndex, to: op.resultType.elementType.mpsDataType, name: "\(op.result)_cast")
+        return graph.reshape(casted, shape: op.resultType.mpsShape, name: op.result)
     }
 
     private func compileReduce(_ op: HLOOperation) throws -> MPSGraphTensor {

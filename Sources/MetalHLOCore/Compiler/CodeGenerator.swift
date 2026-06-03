@@ -684,6 +684,19 @@ public final class CodeGenerator: @unchecked Sendable {
         case .reduce:
             return generateReductionSource(inputShapes: inputShapes, attributes: attributes, elementType: elementType)
 
+        // Arg-reduce (argmax/argmin index) — the index half of a multi-input
+        // reduce that the parser split off. `elementType` here is the i32/i64
+        // index type; the input values are read as their own float/int type.
+        case .reduceArg:
+            let valueType = attributes.inputElementTypes?.first ?? .float32
+            return generateArgReduceSource(
+                inputShape: inputShapes.first ?? [],
+                reduceDims: attributes.dimensions ?? [0],
+                reductionKind: attributes.reductionKind ?? .max,
+                valueType: valueType,
+                indexType: elementType
+            )
+
         // Shape operations
         case .reshape:
             source += generateCopyKernel(entryPoint: entryPoint, metalType: metalType)
@@ -2761,6 +2774,96 @@ public final class CodeGenerator: @unchecked Sendable {
         """
 
         return (source, "kernel_reduce", TuningConfig(blockSize: 1))
+    }
+
+    /// Generates an arg-reduce (argmax/argmin index) kernel. This is the index
+    /// half of a multi-input reduce that jnp.argmax/argmin lowers to: it scans
+    /// the reduce axis of the float/int input and writes the position of the
+    /// max (argmax) or min (argmin) element. Ties break toward the smaller
+    /// index, matching jnp.argmax/argmin (the reducer keeps the smaller index on
+    /// equal values). Strict `>` / `<` comparison gives that for free since the
+    /// best index is only updated on a strictly better value.
+    ///
+    /// One thread per output element (the flattened non-reduced dims). Buffer
+    /// layout mirrors generateIntegerReductionSource: buffer(0) = input values,
+    /// buffer(1) = output indices, then outputCount / reduceSize / innerSize.
+    private func generateArgReduceSource(
+        inputShape: [Int],
+        reduceDims: [Int],
+        reductionKind: ReductionKind,
+        valueType: ElementType,
+        indexType: ElementType
+    ) -> (String, String, TuningConfig?) {
+        let reduceDimSorted = reduceDims.sorted()
+
+        // reduceSize = product of reduced dims.
+        var reduceSize = 1
+        for d in reduceDimSorted where d < inputShape.count {
+            reduceSize *= inputShape[d]
+        }
+
+        // outputCount = product of non-reduced dims.
+        var outputShape: [Int] = []
+        for (i, s) in inputShape.enumerated() where !reduceDimSorted.contains(i) {
+            outputShape.append(s)
+        }
+        let outputCount = max(outputShape.reduce(1, *), 1)
+
+        // innerSize = product of dims after the last reduced dim, so the scan
+        // strides over the reduce axis correctly for non-trailing reductions.
+        let lastReduceDim = reduceDimSorted.last ?? 0
+        let innerSize = lastReduceDim + 1 < inputShape.count
+            ? inputShape.suffix(from: lastReduceDim + 1).reduce(1, *)
+            : 1
+
+        let valueMetal = metalTypeName(for: valueType)
+        let indexMetal = metalTypeName(for: indexType)
+
+        // argmax keeps the strictly-greater value; argmin the strictly-smaller.
+        // For NaN inputs JAX treats NaN as the largest (its reducer ORs in a
+        // `value != value` test), so on argmax a NaN wins. `!(val <= best)` is
+        // true when val is NaN, replicating that; for argmin NaN never wins.
+        let betterCond: String
+        switch reductionKind {
+        case .min:
+            betterCond = "val < best"
+        default:
+            // .max (argmax) and any non-min comparison kind.
+            betterCond = "!(val <= best)"
+        }
+
+        let source = """
+        #include <metal_stdlib>
+        using namespace metal;
+
+        kernel void kernel_arg_reduce(
+            device const \(valueMetal)* input [[buffer(0)]],
+            device \(indexMetal)* output [[buffer(1)]],
+            constant uint& outputCount [[buffer(2)]],
+            constant uint& reduceSize [[buffer(3)]],
+            constant uint& innerSize [[buffer(4)]],
+            uint tid [[thread_position_in_grid]])
+        {
+            if (tid >= outputCount) return;
+
+            uint outerIdx = tid / innerSize;
+            uint innerIdx = tid % innerSize;
+            uint baseIdx = outerIdx * reduceSize * innerSize + innerIdx;
+
+            \(valueMetal) best = input[baseIdx];
+            uint bestIdx = 0;
+            for (uint i = 1; i < reduceSize; i++) {
+                \(valueMetal) val = input[baseIdx + i * innerSize];
+                if (\(betterCond)) {
+                    best = val;
+                    bestIdx = i;
+                }
+            }
+            output[tid] = (\(indexMetal))bestIdx;
+        }
+        """
+
+        return (source, "kernel_arg_reduce", TuningConfig(blockSize: 256))
     }
 
     /// Generates a reduce_window (pooling) kernel.
@@ -6775,6 +6878,12 @@ public final class CodeGenerator: @unchecked Sendable {
                         )
                     }
                 }
+            case .reduceArg:
+                // argmax/argmin index kernel: one thread per output element
+                // (the flattened non-reduced dims), each scanning its reduce
+                // axis. totalElements is already the output count.
+                return DispatchConfig.dispatch1D(elements: totalElements, threadgroupSize: 256)
+
             case .reduce:
                 // Check for specialized reduction kernels
                 if let tuning = tuning, (tuning.useRowReduction || tuning.useColumnReduction) {
@@ -7162,8 +7271,11 @@ public final class CodeGenerator: @unchecked Sendable {
             }
         }
 
-        // Add reduce operation parameters: outputCount, reduceSize, innerSize
-        if case .original(let opKind) = op.type, opKind == .reduce {
+        // Add reduce operation parameters: outputCount, reduceSize, innerSize.
+        // Both the value reduce (.reduce) and the argmax/argmin index reduce
+        // (.reduceArg) take these three scalars after their buffers; .reduceArg
+        // has only one input (the values) and writes the index output.
+        if case .original(let opKind) = op.type, opKind == .reduce || opKind == .reduceArg {
             let inputShapes = op.inputs.compactMap { tensors[$0]?.shape }
             guard let inputShape = inputShapes.first, !inputShape.isEmpty else {
                 return bindings
