@@ -57,6 +57,39 @@ public struct HLOOperation: Sendable {
 extension HLOOperation: CustomStringConvertible {
     public var description: String {
         let operandsStr = operands.joined(separator: ", ")
-        return "\(result) = stablehlo.\(kind.rawValue) \(operandsStr) : \(resultType)"
+        let base = "\(result) = stablehlo.\(kind.rawValue) \(operandsStr) : \(resultType)"
+        // Append a compact signature of the attributes that change an op's
+        // semantics but are not otherwise reflected above. The MetalExecutor
+        // compilation cache keys on this description, so two modules that differ
+        // only in such attributes (e.g. triangular_solve with lower=true vs
+        // lower=false, or different transpose permutations) must produce
+        // distinct strings or the wrong compiled graph is returned from cache.
+        let attrSig = attributeSignature
+        return attrSig.isEmpty ? base : "\(base) {\(attrSig)}"
+    }
+
+    /// Compact, deterministic signature of the semantically-significant
+    /// attributes for cache-key disambiguation. Empty when the op carries no
+    /// such attributes.
+    private var attributeSignature: String {
+        var parts: [String] = []
+        switch kind {
+        case .triangularSolve:
+            if let v = attributes.leftSide { parts.append("ls=\(v)") }
+            if let v = attributes.lower { parts.append("lo=\(v)") }
+            if let v = attributes.unitDiagonal { parts.append("ud=\(v)") }
+            if let v = attributes.transposeA { parts.append("ta=\(v)") }
+        case .cholesky:
+            if let v = attributes.lower { parts.append("lo=\(v)") }
+        case .transpose:
+            if let p = attributes.dimensions { parts.append("p=\(p)") }
+        case .slice:
+            if let s = attributes.sliceStarts { parts.append("ss=\(s)") }
+            if let l = attributes.sliceLimits { parts.append("sl=\(l)") }
+            if let st = attributes.sliceStrides { parts.append("st=\(st)") }
+        default:
+            break
+        }
+        return parts.joined(separator: ",")
     }
 }

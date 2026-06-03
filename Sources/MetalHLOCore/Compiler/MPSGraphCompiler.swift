@@ -4257,17 +4257,28 @@ public final class MPSGraphCompiler {
     // MARK: - Linear Algebra Operations
 
     private func compileTriangularSolve(_ op: HLOOperation) throws -> MPSGraphTensor {
-        let a = try getOperand(op.operands[0])  // triangular matrix [N, N]
+        var a = try getOperand(op.operands[0])  // triangular matrix [N, N]
         let b = try getOperand(op.operands[1])  // right-hand side [N, M]
 
         let leftSide = op.attributes.leftSide ?? true
-        let lower = op.attributes.lower ?? true
+        var lower = op.attributes.lower ?? true
         let unitDiag = op.attributes.unitDiagonal ?? false
+        let transpose = op.attributes.transposeA ?? .noTranspose
 
         guard leftSide else {
             throw CompilationError.unsupportedOperation(
                 "triangular_solve with left_side=false not yet implemented"
             )
+        }
+
+        // Solve op(A)·X = B. For trans = T (or C; real inputs make adjoint == T),
+        // op(A) = Aᵀ. Since the transpose of a lower-triangular matrix is upper
+        // (and vice versa), materialize Aᵀ and flip the `lower` flag, then run the
+        // same forward/backward substitution. The unit-diagonal property is
+        // preserved by the transpose.
+        if transpose != .noTranspose {
+            a = graph.transposeTensor(a, dimension: 0, withDimension: 1, name: nil)
+            lower.toggle()
         }
 
         guard let aShape = a.shape, aShape.count == 2 else {

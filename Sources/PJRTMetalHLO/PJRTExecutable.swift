@@ -1778,6 +1778,16 @@ func pjrt_client_compile(
         let hasWhileLoop = mlirSource.contains("stablehlo.while")
         let hasLinAlg = mlirSource.contains("triangular_solve")
             || mlirSource.contains("cholesky")
+            // JAX-CPU lowers jax.scipy.linalg.cholesky / solve_triangular to
+            // LAPACK FFI custom_calls (@lapack_spotrf_ffi / @lapack_strsm_ffi),
+            // which the parser routes to the native MPSGraph cholesky /
+            // triangular_solve implementations. Keep these on the MPSGraph path
+            // even after the text inliner strips the surrounding `call @` so they
+            // are not sent to the fast CodeGenerator path (which has no linalg).
+            || mlirSource.contains("lapack_spotrf")
+            || mlirSource.contains("lapack_dpotrf")
+            || mlirSource.contains("lapack_strsm")
+            || mlirSource.contains("lapack_dtrsm")
         let hasCall = mlirSource.contains("call @")
             || mlirSource.contains("func.func private")
 

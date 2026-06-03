@@ -260,6 +260,52 @@ public final class Parser {
                 if let members = tupleOperands[tupleRef], index < members.count {
                     valueAliases[op.result] = members[index]
                 }
+            } else if op.kind == .customCall,
+                      let target = op.attributes.callTargetName,
+                      target.hasPrefix("lapack_spotrf") || target.hasPrefix("lapack_dpotrf") {
+                // Cholesky LAPACK FFI: `@lapack_spotrf_ffi(%a)` returns a 2-tuple
+                // (factor, info). JAX's `_cholesky` wrapper masks the factor to
+                // NaN when info != 0 and applies the upper/lower triangular mask
+                // itself, so the custom_call only needs to produce the raw factor
+                // and a success code. Route the factor to the native .cholesky
+                // op (result %name.0) and emit a constant info=0 (result %name.1).
+                // The native solver always returns a factor; for the SPD inputs
+                // Cholesky targets, info=0 is correct and the wrapper passes it
+                // through untouched.
+                let resolvedOperands = op.operands.map { resolveAlias($0, aliases: valueAliases) }
+                operations.append(HLOOperation(
+                    result: "\(op.result).0",
+                    kind: .cholesky,
+                    operands: resolvedOperands,
+                    resultType: op.resultType,
+                    attributes: op.attributes
+                ))
+                // info = 0 (success), tensor<i32>. The wrapper compares this to 0.
+                var infoAttrs = HLOAttributes()
+                infoAttrs.constantValue = .scalar(0)
+                operations.append(HLOOperation(
+                    result: "\(op.result).1",
+                    kind: .constant,
+                    operands: [],
+                    resultType: TensorType(shape: [], elementType: .int32),
+                    attributes: infoAttrs
+                ))
+            } else if op.kind == .customCall,
+                      let target = op.attributes.callTargetName,
+                      target.hasPrefix("lapack_strsm") || target.hasPrefix("lapack_dtrsm") {
+                // Triangular-solve LAPACK FFI: `@lapack_strsm_ffi(%a, %b)` returns
+                // the solution X of the triangular system. The uplo/side/trans/diag
+                // flags were decoded onto lower/leftSide/transposeA/unitDiagonal
+                // during custom_call parsing. Route straight to the native
+                // .triangularSolve op (single result, same name).
+                let resolvedOperands = op.operands.map { resolveAlias($0, aliases: valueAliases) }
+                operations.append(HLOOperation(
+                    result: op.result,
+                    kind: .triangularSolve,
+                    operands: resolvedOperands,
+                    resultType: op.resultType,
+                    attributes: op.attributes
+                ))
             } else {
                 // Substitute aliases in operands for regular operations
                 let resolvedOperands = op.operands.map { resolveAlias($0, aliases: valueAliases) }
@@ -879,6 +925,12 @@ public final class Parser {
             try expect(.rightParen)
         }
 
+        // Only LAPACK FFI custom_calls (@lapack_*_ffi) need their nested
+        // `mhlo.backend_config = {flag = N : ui8}` dict decoded. Every other
+        // custom_call is skipped with the original token-by-token logic so this
+        // change can't alter how unrelated targets parse.
+        let isLapackTarget = (attributes.callTargetName?.hasPrefix("lapack_") ?? false)
+
         // Parse attribute block: { backend_config = "..." }
         if match(.leftBrace) {
             skipNewlines()
@@ -890,8 +942,26 @@ public final class Parser {
                         attributes.backendConfig = value
                         advance()
                     }
+                } else if isLapackTarget
+                            && (currentToken.kind == .identifier)
+                            && (currentToken.text == "mhlo.backend_config") {
+                    // LAPACK FFI custom_calls carry their operation flags in a
+                    // nested `mhlo.backend_config = {uplo = 76 : ui8, ...}` dict.
+                    // The flags are single ASCII characters encoded as ui8:
+                    //   uplo  : 'L'(76) lower / 'U'(85) upper
+                    //   side  : 'L'(76) left  / 'R'(82) right
+                    //   trans : 'N'(78) none  / 'T'(84) transpose / 'C'(67) adjoint
+                    //   diag  : 'N'(78) non-unit / 'U'(85) unit diagonal
+                    // Decode them onto the existing triangular_solve / cholesky
+                    // attribute fields so the LAPACK calls route to the native
+                    // MPSGraph implementations.
+                    advance()
+                    if match(.equal), check(.leftBrace) {
+                        try parseLapackBackendConfig(into: &attributes)
+                    }
                 } else {
-                    // Skip unknown attributes
+                    // Skip unknown attributes (original behavior): advance one
+                    // token at a time.
                     advance()
                 }
                 _ = match(.comma)
@@ -901,6 +971,57 @@ public final class Parser {
         }
 
         return (operands, attributes)
+    }
+
+    /// Parses a LAPACK FFI `mhlo.backend_config` dict `{ flag = N : ui8, ... }`
+    /// and decodes the ASCII-coded flags onto triangular_solve / cholesky
+    /// attribute fields. Assumes the current token is the opening `{`.
+    private func parseLapackBackendConfig(into attributes: inout HLOAttributes) throws {
+        try expect(.leftBrace)
+        skipNewlines()
+        while !check(.rightBrace) && !check(.eof) {
+            if currentToken.kind == .identifier {
+                let flag = currentToken.text
+                advance()
+                if match(.equal), case .integer(let code) = currentToken.kind {
+                    advance()
+                    applyLapackFlag(flag, code: Int(code), into: &attributes)
+                    // Consume the trailing `: ui8` type annotation if present.
+                    if match(.colon) { advance() }
+                }
+            } else {
+                advance()
+            }
+            _ = match(.comma)
+            skipNewlines()
+        }
+        try expect(.rightBrace)
+    }
+
+    /// Maps a single decoded LAPACK flag (ASCII ui8 code) onto the matching
+    /// triangular_solve / cholesky attribute.
+    private func applyLapackFlag(_ flag: String, code: Int, into attributes: inout HLOAttributes) {
+        let ch = Character(UnicodeScalar(UInt8(truncatingIfNeeded: code)))
+        switch flag {
+        case "uplo":
+            // 'L' lower, 'U' upper.
+            attributes.lower = (ch == "L")
+        case "side":
+            // 'L' left, 'R' right.
+            attributes.leftSide = (ch == "L")
+        case "trans_x", "trans":
+            // 'N' none, 'T' transpose, 'C' conjugate-transpose.
+            switch ch {
+            case "T": attributes.transposeA = .transpose
+            case "C": attributes.transposeA = .adjoint
+            default:  attributes.transposeA = .noTranspose
+            }
+        case "diag":
+            // 'U' unit diagonal, 'N' non-unit.
+            attributes.unitDiagonal = (ch == "U")
+        default:
+            break
+        }
     }
 
     /// Parse generic form operands and attributes
