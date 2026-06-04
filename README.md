@@ -28,9 +28,12 @@ Tested against **JAX 0.10.0** and **Flax 0.12.7** with optax 0.2.8.
 
 ### Swift Package Manager
 
+There are no tagged releases yet, so depend on the `main` branch (or pin a specific
+commit):
+
 ```swift
 dependencies: [
-    .package(url: "https://github.com/pedronahum/MetalHLO.git", from: "0.2.0")
+    .package(url: "https://github.com/pedronahum/MetalHLO.git", branch: "main")
 ]
 ```
 
