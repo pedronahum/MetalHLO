@@ -131,7 +131,8 @@ public final class CodeGenerator: @unchecked Sendable {
                 op: op,
                 tensors: module.tensors,
                 viewMappings: viewMappings,
-                constantIDs: constantIDs
+                constantIDs: constantIDs,
+                inputIDs: inputNames
             ) {
                 // This is a view operation - store the view mapping
                 viewMappings[viewResult.outputID] = viewResult.view
@@ -185,7 +186,8 @@ public final class CodeGenerator: @unchecked Sendable {
         op: FusedOp,
         tensors: [TensorID: TensorInfo],
         viewMappings: [TensorID: StridedTensorView],
-        constantIDs: Set<TensorID>
+        constantIDs: Set<TensorID>,
+        inputIDs: Set<TensorID>
     ) -> ViewResult? {
         guard case .original(let opKind) = op.type else {
             return nil
@@ -196,7 +198,7 @@ public final class CodeGenerator: @unchecked Sendable {
         case .reshape:
             return tryGenerateReshapeView(
                 op: op, tensors: tensors, viewMappings: viewMappings,
-                constantIDs: constantIDs
+                constantIDs: constantIDs, inputIDs: inputIDs
             )
 
         // Transpose requires strided access patterns in downstream kernels
@@ -233,15 +235,19 @@ public final class CodeGenerator: @unchecked Sendable {
     /// Two cases:
     ///   1. Input is already a view (a prior reshape/slice in the chain) — reshape
     ///      the existing strided view; only valid while it stays contiguous.
-    ///   2. Input is a *base* tensor (a compute-kernel output or a function input).
-    ///      Kernels always write their output contiguously into the memory slab,
-    ///      and inputs are contiguous, so a reshape of either is a pure relabel:
-    ///      emit a fresh contiguous view over the base. This eliminates the
-    ///      reshape COPY kernel for the common reshape-of-compute-output case.
+    ///   2. Input is a *base* compute-kernel output. Kernels always write their
+    ///      output contiguously into the memory slab, so a reshape of one is a
+    ///      pure relabel: emit a fresh contiguous view over the base. This
+    ///      eliminates the reshape COPY kernel for the common
+    ///      reshape-of-compute-output case.
     ///
-    /// Constants are excluded — they live in separate constant buffers, not the
-    /// slab, so the executor's offset lookup (memoryPlan.tensorOffsets) can't
-    /// resolve a view whose base is a constant.
+    /// Constants AND function inputs are excluded — neither is slab-resident
+    /// (constants live in separate constant buffers; inputs are passed through
+    /// zero-copy as external MTLBuffers), so the executor's offset lookup
+    /// (memoryPlan.tensorOffsets) can't resolve a view whose base is one of
+    /// them — it would read zeroed slab memory. Reshaping those falls back to a
+    /// real reshape kernel (correct, and they are far rarer than
+    /// reshape-of-compute-output).
     ///
     /// The companion correctness requirement lives in StaticMemoryPlanner: the
     /// base tensor's lifetime must be extended to cover the view's readers, or
@@ -251,7 +257,8 @@ public final class CodeGenerator: @unchecked Sendable {
         op: FusedOp,
         tensors: [TensorID: TensorInfo],
         viewMappings: [TensorID: StridedTensorView],
-        constantIDs: Set<TensorID>
+        constantIDs: Set<TensorID>,
+        inputIDs: Set<TensorID>
     ) -> ViewResult? {
         guard let inputID = op.inputs.first,
               let outputInfo = op.outputs.first else {
@@ -267,8 +274,11 @@ public final class CodeGenerator: @unchecked Sendable {
             return ViewResult(outputID: outputInfo.id, view: reshapedView)
         }
 
-        // Case 2: input is a base tensor. Constants are not slab-resident — skip.
-        if constantIDs.contains(inputID) {
+        // Case 2: input is a base tensor. Constants and function inputs are not
+        // slab-resident (the executor's offset table can't resolve a view over
+        // them — it would read zeroed slab memory), so skip and fall back to a
+        // real reshape kernel.
+        if constantIDs.contains(inputID) || inputIDs.contains(inputID) {
             return nil
         }
         // Element type comes from the input's TensorInfo (reshape preserves it).

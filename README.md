@@ -144,7 +144,7 @@ MetalHLO is a fully-functional JAX backend. Each row links to the test that exer
 | LSTMCell, GRUCell | [flax_metalhlo_layers.py](Examples/FlaxExample/flax_metalhlo_layers.py) |
 | `flax.nnx`: Linear, Conv, LayerNorm, RMSNorm, Embed, MLP, MHA, Dropout, BatchNorm | [flax_metalhlo_nnx.py](Examples/FlaxExample/flax_metalhlo_nnx.py) |
 | End-to-end: Mini-BERT, Mini-ResNet, Mini-CNN, Autoencoder (multi-step Adam) | [flax_metalhlo_e2e.py](Examples/FlaxExample/flax_metalhlo_e2e.py) |
-| ResNet18 on CIFAR-10 (batch 256, fp32, Adam) — **8.48× over JAX CPU** (M5 Pro) | [Examples/Benchmarks/resnet_cifar10](Examples/Benchmarks/resnet_cifar10) |
+| ResNet18 on CIFAR-10 (batch 256, fp32, Adam) — **8.7× over JAX CPU** (M5 Pro) | [Examples/Benchmarks/resnet_cifar10](Examples/Benchmarks/resnet_cifar10) |
 | Karpathy's atomic GPT (1-layer, names dataset) | [Examples/Benchmarks/karpathy_gpt](Examples/Benchmarks/karpathy_gpt) |
 
 ## Optimization Levels
@@ -248,10 +248,16 @@ Two campaigns, full data in **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)**:
   0.91× via the MetalPerformancePrimitives matrix coprocessor. Attention fusion fires but
   MLX's hand-tuned kernel is still ~30% faster; reductions/convolution lack a fused path.
 
-**End-to-end training (nanoGPT, M5 Pro):** 74.4 ms/step vs MLX 59.5 ms (1.25×), loss exact
-against JAX CPU. GPU-busy (~60.8 ms) already ≈ MLX's entire step; the residual is host
-overhead and is bounded by reverse-mode autodiff making forward activations multi-use. Full
-investigation in [docs/BENCHMARKS.md](docs/BENCHMARKS.md#end-to-end-training-gap-nanogpt--investigation-status).
+**End-to-end training vs JAX CPU (M5 Pro):**
+
+- **ResNet18 / CIFAR-10** (batch 256, fp32, Adam, Flax NNX) — **0.276 s/step vs 2.40 s on
+  JAX CPU = 8.7×**, three runs at zero variance. Loss tracks the CPU reference (1.729 vs
+  1.725 at step 30). See [the benchmark](Examples/Benchmarks/resnet_cifar10).
+- **nanoGPT** (6L/384d, batch 16, seq 256) — 74.4 ms/step; here the yardstick is MLX
+  (59.5 ms, 1.25×) rather than CPU, since GPU-busy (~60.8 ms) already ≈ MLX's entire step.
+  The residual is host overhead, bounded by reverse-mode autodiff making forward activations
+  multi-use. Full investigation in
+  [docs/BENCHMARKS.md](docs/BENCHMARKS.md#end-to-end-training-gap-nanogpt--investigation-status).
 
 **Tips:** reuse executables (compile once, execute many), batch inputs to amortize launch
 overhead, enable caching, and profile with `executeWithTiming()`.

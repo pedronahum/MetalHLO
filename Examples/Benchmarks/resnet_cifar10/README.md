@@ -47,13 +47,15 @@ Measured on **Apple M5 Pro**, JAX 0.10.0 / Flax 0.12.7:
 
 | Backend | Time per step | Speedup |
 |---------|---------------|---------|
-| MetalHLO (GPU) | 0.275 s | **8.48×** |
-| CPU | 2.332 s | 1× |
+| MetalHLO (GPU) | 0.276 s | **8.7×** |
+| CPU | 2.40 s | 1× |
 
 (MetalHLO time is the mean of three back-to-back runs of 30 steps each
-— 0.275 / 0.275 / 0.275 s, zero variance to 3 decimals. Times averaged
-over the second half of each run. Loss converges identically on both
-backends — 2.367 at init, 1.728 at step 30, bit-equal with CPU.)
+— 0.276 / 0.276 / 0.276 s, zero variance to 3 decimals. Times averaged
+over the second half of each run. Loss tracks the CPU reference closely:
+1.729 (MetalHLO) vs 1.725 (CPU) at step 30 — GPU/CPU floating-point
+accumulation differs slightly over 30 steps, so it is numerically
+equivalent rather than bit-exact.)
 
 For comparison, the upstream `jax-mps` benchmark on an M4 MacBook Air
 reports CPU 3.2s vs MPS 0.7s (4.7×). Numbers aren't directly

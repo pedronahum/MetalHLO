@@ -1013,6 +1013,14 @@ final class BatchNormFusionPass: OptimizationPass, @unchecked Sendable {
     let invalidates: Set<AnalysisType> = [.lifetimes, .patterns]
 
     func run(on function: HLOFunction, analysis: AnalysisResults) -> PassResult {
+        // Opt-out escape hatch. This fusion is correct and ~7% faster on
+        // ResNet18 (the all-zero ResNet output that looked like a BN bug was
+        // actually the reshape-of-input view regression, fixed in
+        // CodeGenerator.tryGenerateReshapeView). Set METALHLO_FUSE_BATCHNORM=0
+        // to fall back to the unfused primitive chain for debugging.
+        if ProcessInfo.processInfo.environment["METALHLO_FUSE_BATCHNORM"] == "0" {
+            return .unchanged(function)
+        }
         let bnPatterns = analysis.patterns.filter { $0.type == .batchNorm }
         if bnPatterns.isEmpty {
             return .unchanged(function)

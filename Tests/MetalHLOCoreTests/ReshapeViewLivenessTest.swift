@@ -105,4 +105,42 @@ struct ReshapeViewLivenessTests {
         let expected = xin.map { xv -> Float in 2 * xv + xv * xv * xv + xv * xv }
         #expect(result == expected, "reshape-view produced wrong values: \(result) vs \(expected)")
     }
+
+    // Regression: reshape of a FUNCTION INPUT must not be folded into a slab
+    // view. Function inputs are passed zero-copy (not slab-resident), so a view
+    // over them resolves to zeroed slab memory and the reshape reads all zeros.
+    // This silently broke ResNet18 training: the BatchNorm scale/bias params are
+    // 1-D inputs reshaped to [1,1,1,C], and the zeroed reshape made the whole
+    // network output 0 (loss flat, no learning). The fix excludes inputs from
+    // the reshape-as-view fold (CodeGenerator.tryGenerateReshapeView), falling
+    // back to a real reshape kernel. Several target shapes are covered because
+    // the bug hit every shape-changing reshape of an input, not just one.
+    @Test("Reshape of a function input is numerically correct (not zeroed)")
+    func reshapeOfFunctionInputCorrect() async throws {
+        let shapes: [(out: String, dims: [Int])] = [
+            ("tensor<1x1x1x16xf32>", [1, 1, 1, 16]),
+            ("tensor<2x8xf32>", [2, 8]),
+            ("tensor<4x4xf32>", [4, 4]),
+            ("tensor<1x16xf32>", [1, 16]),
+        ]
+        let xin: [Float] = (0..<16).map { Float($0) }
+        let client = try Client.create()
+
+        for shape in shapes {
+            let mlir = """
+            module @reshape_input {
+              func.func @main(%p: tensor<16xf32>) -> (\(shape.out)) {
+                %r = stablehlo.reshape %p : (tensor<16xf32>) -> \(shape.out)
+                return %r : \(shape.out)
+              }
+            }
+            """
+            let executable = try client.compile(mlir, config: CompilationConfig(optimizationLevel: .O2))
+            let p = try client.createBuffer(xin, shape: [16], elementType: .float32)
+            let result = try executable.execute([p])[0].toFloatArray()
+            // Reshape is a pure relabel — values and order are preserved.
+            #expect(result == xin,
+                    "reshape(input[16])->\(shape.dims) zeroed/corrupted values: \(result)")
+        }
+    }
 }
