@@ -1,195 +1,32 @@
 # MetalHLO
 
-**StableHLO Execution on Apple Metal**
+**StableHLO execution on Apple Metal.**
 
-MetalHLO is a standalone library that compiles and executes [StableHLO](https://github.com/openxla/stablehlo) MLIR programs on Apple Silicon GPUs. It provides Swift, C, and [PJRT](https://github.com/openxla/xla/tree/main/xla/pjrt/c) APIs, enabling integration with JAX, XLA, and any project that emits StableHLO IR.
+MetalHLO compiles and executes [StableHLO](https://github.com/openxla/stablehlo) MLIR
+programs on Apple Silicon GPUs. It ships Swift, C, and
+[PJRT](https://github.com/openxla/xla/tree/main/xla/pjrt/c) APIs, so it works as a JAX
+backend or as a standalone library for anything that emits StableHLO.
 
-## JAX & Flax Compatibility
+- **JAX backend** via the standard PJRT plugin — `import jax` runs on the Apple GPU.
+- **Three execution backends** — MPSGraph (broad compatibility), custom Metal kernels
+  (peak performance), and heterogeneous GPU+ANE+CPU (parallel execution across all three
+  compute units that share unified memory).
+- **XLA-style optimizer** — simplification, canonicalization, and pattern fusion
+  (attention, FFN, LayerNorm, GELU, softmax) at O0–O3.
+- **Training support** — full forward and backward passes; verified end-to-end against
+  JAX CPU on ResNet18, nanoGPT, and Flax models.
 
-MetalHLO is a fully-functional JAX backend for Apple Silicon. **130 tests across 9 test suites verify the supported surface** — the table below summarises what's covered. Each row links to the test file that exercises it.
-
-### JAX primitives
-
-| Capability | Test |
-|---|---|
-| `jit`, `value_and_grad`, full training step with optax (SGD, Adam) | [flax_metalhlo_training.py](Examples/FlaxExample/flax_metalhlo_training.py) |
-| `vmap`, `vmap` of `grad` (per-example gradients), nested `vmap`, non-default `in_axes`/`out_axes` | [flax_metalhlo_vmap.py](Examples/FlaxExample/flax_metalhlo_vmap.py) |
-| `jax.lax.scan`, `flax.linen.scan` forward, `nn.scan` + `grad` (RNN training) | [flax_metalhlo_scan.py](Examples/FlaxExample/flax_metalhlo_scan.py) |
-| `jax.checkpoint` / `jax.remat`, `jax.lax.optimization_barrier` | [OptimizationBarrierTest.swift](Tests/MetalHLOCoreTests/OptimizationBarrierTest.swift) |
-| `jax.lax.top_k`, `jnp.argmax` / `argmin` (in-`jit`), `jnp.cumsum` / `cumprod` / `cummax` / `cumlogsumexp`, `jnp.arctan2`, `jax.lax.reduce_precision`, `jnp.searchsorted`, `jnp.unique(size=K)` | [Tests/MetalHLOCoreTests](Tests/MetalHLOCoreTests) |
-| `jax.lax.switch` (multi-branch), `jax.lax.cond` | [CaseSwitchTest.swift](Tests/MetalHLOCoreTests/CaseSwitchTest.swift) |
-| `jax.scipy.linalg.cholesky` / `solve_triangular`, `jnp.linalg.svd` / `qr` / `eigh` (routed from JAX's LAPACK FFI to Accelerate), `jax.lax.lgamma` / `digamma` / `erf` | [LapackRoutingTest.swift](Tests/MetalHLOCoreTests/LapackRoutingTest.swift) |
-| `jax.random` — bit-exact threefry2x32 (`bits`/`uniform` match JAX CPU exactly) | [ThreefryRngTest.swift](Tests/MetalHLOCoreTests/ThreefryRngTest.swift) |
-| `jax.debug.print` / `jax.debug.callback` (side-effect-only host callbacks) | [HostCallbackTest.swift](Tests/MetalHLOCoreTests/HostCallbackTest.swift) |
-
-### Dtypes
-
-| Dtype | Forward | Grad | Mixed precision | Test |
-|---|---|---|---|---|
-| `float32` | ✓ | ✓ | n/a | all suites |
-| `float16` | ✓ | ✓ | ✓ (fp32 params + fp16 compute) | [flax_metalhlo_fp16.py](Examples/FlaxExample/flax_metalhlo_fp16.py) |
-| `bfloat16` | ✓ | ✓ | ✓ (fp32 params + bf16 compute), Adam step | [flax_metalhlo_bf16.py](Examples/FlaxExample/flax_metalhlo_bf16.py) |
-
-### Flax layers (`nn.compact` and `nnx` APIs)
-
-| Layer family | Verified |
-|---|---|
-| Dense, MLP, Sequential, ReLU/Tanh/SiLU/GELU, Softmax, Embed, Classifier | [flax_metalhlo_example.py](Examples/FlaxExample/flax_metalhlo_example.py) |
-| Conv1D/2D, ConvTranspose, depthwise conv, grouped conv, max/avg pool | [flax_metalhlo_example.py](Examples/FlaxExample/flax_metalhlo_example.py), [flax_metalhlo_layers.py](Examples/FlaxExample/flax_metalhlo_layers.py) |
-| BatchNorm (train + inference), LayerNorm, RMSNorm, GroupNorm, Dropout | [flax_metalhlo_layers.py](Examples/FlaxExample/flax_metalhlo_layers.py) |
-| MultiHeadDotProductAttention (forward + causal masking), Transformer block | [flax_metalhlo_example.py](Examples/FlaxExample/flax_metalhlo_example.py), [flax_metalhlo_layers.py](Examples/FlaxExample/flax_metalhlo_layers.py) |
-| LSTMCell, GRUCell | [flax_metalhlo_layers.py](Examples/FlaxExample/flax_metalhlo_layers.py) |
-| `flax.nnx` API: Linear, Conv, LayerNorm, RMSNorm, Embed, MLP, MHA, Dropout, BatchNorm, jit, grad | [flax_metalhlo_nnx.py](Examples/FlaxExample/flax_metalhlo_nnx.py) |
-| End-to-end: Mini-BERT (forward), Mini-ResNet (eval + train step), Mini-CNN (3-step Adam training), Autoencoder (5-step Adam training) | [flax_metalhlo_e2e.py](Examples/FlaxExample/flax_metalhlo_e2e.py) |
-| Full ResNet18 on CIFAR-10 (batch 256, fp32, Adam) — **8.48× over JAX CPU** on M5 Pro | [Examples/Benchmarks/resnet_cifar10](Examples/Benchmarks/resnet_cifar10) |
-| Karpathy's atomic GPT (1-layer, 4192 params, names dataset) — pure Python vs JAX (CPU vs MetalHLO) | [Examples/Benchmarks/karpathy_gpt](Examples/Benchmarks/karpathy_gpt) |
-
-### Known limitations
-
-- **`jax.random.normal`**: the underlying threefry2x32 *bits* match JAX bit-for-bit (so `jax.random.bits`/`uniform` are exact), but `normal` diverges by ~2.4e-7 from the downstream `ndtri` inverse-CDF rounding in fp32 — not the RNG itself.
-- **`jnp.linalg.qr` feeding a downstream op inside `jit`**: the host-LAPACK shortcut fires only when the Q/R factors are the function output; using them within the same `jit` (e.g. reconstructing `Q @ R`) falls through to the unsupported MPSGraph path. Returning the factors works. `triangular_solve` with `left_side=false` (`x·A=b`) is also not yet implemented.
-- **Sharding** (`pjit` with mesh, `shard_map`, `nn.partitioning`): not supported — MetalHLO is single-device. Multi-device SPMD modules (`num_partitions`/`num_replicas > 1`) now fail loudly at parse time rather than silently running unpartitioned; single-device meshes pass through.
-- **Host callbacks**: `jax.debug.print` / `jax.debug.callback` work (the side effect is dropped, numerics are exact); `pure_callback` / `io_callback` are unsupported (they feed host values back into the graph and need round-trip infrastructure) and fail loudly.
-- **Multi-step CNN training**: step 0 matches CPU exactly; subsequent steps may drift up to ~0.1 absolute (test absorbs with `rtol=1e-1`). Residual is in MPSGraph's internal small-op fusion. (The RNG path is now JAX-bit-exact, removing one prior source of divergence.)
-- **Quantization, `nn.custom_vjp`**: not tested.
-
-### Compatibility
-
-Tested against **JAX 0.10.0** and **Flax 0.12.7** with optax 0.2.8. See [Building from Source](#building-from-source) for environment setup.
-
-## Design Philosophy
-
-MetalHLO draws inspiration from both [OpenXLA](https://github.com/openxla/xla) and [MLX](https://github.com/ml-explore/mlx), combining the best of both worlds:
-
-**From OpenXLA:**
-- **StableHLO as the IR** — A stable, portable intermediate representation for ML workloads
-- **Multi-phase optimization pipeline** — Simplification → Canonicalization → Fusion → Layout → Scheduling
-- **Pattern-based fusion** — Recognizing and fusing common patterns like attention, depth attention ([Attention Residuals](https://github.com/MoonshotAI/Attention-Residuals)), layer norm, GELU
-- **Cost-model driven decisions** — Using analytical cost models to guide fusion decisions
-
-**From MLX:**
-- **Lazy graph compilation** — Build the computation graph, compile once, execute many times
-- **Unified memory architecture** — Zero-copy data sharing between CPU and GPU on Apple Silicon
-- **Simplicity first** — Clean APIs that make common cases easy and complex cases possible
-- **Single-device focus** — Optimized for one GPU rather than distributed execution
-
-**MetalHLO's unique contribution:**
-- **Three execution backends** — MPSGraph for broad compatibility, custom Metal kernels for peak performance, and heterogeneous GPU+ANE+CPU for parallel execution
-- **Heterogeneous GPU+ANE+CPU execution** — Automatically partitions profitable workloads across GPU, MPS/ANE, and CPU using a profitability-gated 4-pass pipeline (see [how it works](#how-heterogeneous-execution-works) below)
-- **Progressive optimization levels** — O0 to O3 matching compiler conventions
-- **PJRT plugin for JAX** — Standard OpenXLA plugin interface enables `import jax; jax.numpy` on Apple GPUs
-- **C API for portability** — Integrate with any language that can call C functions
-
-### How Heterogeneous Execution Works
-
-Every Apple Silicon chip contains a GPU, a Neural Engine (ANE, accessible via MPS), and high-performance CPU cores — three independent compute units that share unified memory. Most ML frameworks only use the GPU. MetalHLO is the first StableHLO runtime to use all three simultaneously.
-
-```
-                  StableHLO Program
-                        │
-               ┌────────▼────────┐
-               │  4-Pass Graph   │
-               │  Pipeline       │
-               └────────┬────────┘
-                        │
-         Pass 1: Eligibility Annotation
-              (ProfitabilityGuard)
-                        │
-         Pass 2: Op Fusion
-              (chain + attention absorption)
-                        │
-         Pass 3: Heterogeneous Partitioning
-              (optimal split per cluster)
-                        │
-         Pass 4: Sequential Scheduling
-              (serial between clusters,
-               parallel within)
-                        │
-         ┌──────────────┼──────────────┐
-         ▼              ▼              ▼
-  ┌────────────┐ ┌────────────┐ ┌────────────┐
-  │  GPU       │ │  MPS/ANE   │ │  CPU       │
-  │  (Metal)   │ │            │ │ (Accelerate│
-  │            │ │  • matmul  │ │  /vDSP)    │
-  │  • matmul  │ │  • conv    │ │            │
-  │  • elem.   │ │  (routes   │ │  • matmul  │
-  │  • softmax │ │   to ANE)  │ │  • elem.   │
-  │  • layerN. │ │            │ │  • layerN. │
-  └──────┬─────┘ └──────┬─────┘ └──────┬─────┘
-         │              │              │
-         │       Unified Memory        │  ← Zero-copy: all three units
-         │       (shared)              │    read/write the same buffers
-         └──────────────┴──────────────┘
-                        ▼
-                     Results
-```
-
-The key insight is that Apple Silicon's unified memory eliminates data transfer cost between compute units — GPU, MPS/ANE, and CPU all read and write the same physical memory. The system uses a **profitability-gated** cost model: rather than partitioning every operation, a compound gate filters out shapes where the overhead of multi-unit dispatch exceeds the benefit, ensuring zero regressions on unprofitable workloads.
-
-#### Profitability Guard (Compound Gate)
-
-Not every operation benefits from partitioning. Empirical validation on GPT-2 and ViT-B/16 established two hardware-derived thresholds:
-
-- **Minimum elements**: ≥ 10M output elements (below this, dispatch overhead dominates)
-- **Minimum output columns**: N ≥ 32,768 (narrow shapes can't amortize per-unit slice overhead)
-
-Both conditions must be met. In practice, this means only vocabulary-scale projections (GPT-2 N=50,257, LLaMA N=32,000, CLIP N=49,408) are partitioned, while all other operations pass through to single-unit execution with zero overhead.
-
-#### Op-Class Taxonomy
-
-| Class | Examples | Strategy | Speedup |
-|-------|----------|----------|---------|
-| Compute-bound | matmul, attention | 3-unit GPU+MPS+CPU | 1.14-1.91x |
-| MPS-dominant | convolution | MPS/ANE alone (2-5x faster than partitioned) | — |
-| Bandwidth-bound | elementwise, layerNorm | 2-unit GPU+CPU, value is cluster absorption | — |
-| Gather | embedding | 2-unit GPU+CPU, CPU dominates | — |
-
-#### GPT-2 End-to-End Validation
-
-The heterogeneous pipeline was validated on GPT-2 (124M parameters):
-
-| Metric | Result |
-|--------|--------|
-| **Logit projection speedup** | 1.91x (fused GPU+MPS+CPU vs single-unit) |
-| **Regressions** | Zero — compound gate rejects all unprofitable ops |
-| **Ops partitioned (seq=512)** | 1 of 147 (logit projection only) |
-| **Cross-architecture** | ViT-B/16: 0 partitioned at all batch sizes (correct) |
-
-The compound gate is **batch-invariant**: the same ops are selected regardless of batch size (1 through 8). At batch ≥ 16 on 8GB devices, memory pressure causes regressions — the gate should be extended with an upper memory bound for large-batch safety.
-
-## Features
-
-- **StableHLO Conformance** — 191 of 277 conformance tests pass (86 skipped for MPS/Metal limitations)
-- **88% StableHLO Coverage** — 92 of 105 operations implemented
-- **~99% Practical ML Coverage** — All operations needed for production ML workloads
-- **Triple API** — Native Swift API + C API + PJRT plugin for JAX/XLA integration
-- **Configurable Optimization** — O0 to O3 levels with algebraic simplification and operator fusion
-- **Heterogeneous Execution** — GPU+MPS/ANE+CPU auto mode partitions profitable operations across all compute units with a compound profitability gate
-- **Full Training Support** — Forward and backward pass operations
-- **Apple Silicon Optimized** — Leverages MPSGraph, custom Metal kernels, and the Apple Neural Engine
-
-### Supported Workloads
-
-| Workload | Support |
-|----------|---------|
-| CNNs | Full (convolution, pooling, batch norm) |
-| Transformers/MLPs | Full (attention, linear layers, activations) |
-| RNNs | Full (while loops, dynamic operations) |
-| Signal Processing | Full (FFT, IFFT, RFFT, IRFFT) |
-| Quantized Models | Full (quantize/dequantize) |
+Tested against **JAX 0.10.0** and **Flax 0.12.7** with optax 0.2.8.
 
 ## Requirements
 
-- **macOS:** 14.0+ (Sonoma)
-- **Swift:** 6.0+
-- **Xcode:** 15.0+
-- **Hardware:** Apple Silicon (M1/M2/M3/M4)
+- **macOS** 14.0+ (Sonoma); macOS 26+ for the MetalPerformancePrimitives matmul path
+- **Swift** 6.0+, **Xcode** 15.0+
+- **Apple Silicon** (M1/M2/M3/M4/M5)
 
 ## Installation
 
 ### Swift Package Manager
-
-Add MetalHLO to your `Package.swift`:
 
 ```swift
 dependencies: [
@@ -197,16 +34,7 @@ dependencies: [
 ]
 ```
 
-Then add the dependency to your target:
-
-```swift
-.target(
-    name: "YourTarget",
-    dependencies: ["MetalHLO"]
-)
-```
-
-### Building from Source
+### Build from source
 
 ```bash
 git clone https://github.com/pedronahum/MetalHLO.git
@@ -218,1238 +46,270 @@ swift test
 swift build -c release --product PJRTMetalHLO
 ```
 
-## Quick Start
-
-### Swift — Basic Usage
-
-```swift
-import MetalHLO
-
-// Create client
-let client = try Client.create()
-print("Using device: \(client.deviceName)")
-
-// Compile StableHLO MLIR
-let mlir = """
-module @add {
-  func.func @main(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>) -> (tensor<4xf32>) {
-    %0 = stablehlo.add %arg0, %arg1 : tensor<4xf32>
-    return %0 : tensor<4xf32>
-  }
-}
-"""
-let executable = try client.compile(mlir)
-
-// Create input buffers
-let a = client.createBuffer([1.0, 2.0, 3.0, 4.0] as [Float], shape: [4])
-let b = client.createBuffer([10.0, 20.0, 30.0, 40.0] as [Float], shape: [4])
-
-// Execute
-let outputs = try executable.execute([a, b])
-let result = try outputs[0].toFloatArray()
-print("Result: \(result)")  // [11.0, 22.0, 33.0, 44.0]
-```
-
-### Swift — With Optimization Configuration
-
-```swift
-import MetalHLO
-
-let client = try Client.create()
-
-// Configure aggressive optimization (O3)
-let config = CompilationConfig(optimizationLevel: .O3)
-let executable = try client.compile(mlir, config: config)
-
-// Or use presets
-let debugExe = try client.compile(mlir, config: .debug)    // O0, no caching, debug info
-let releaseExe = try client.compile(mlir, config: .release) // O3, caching enabled
-let fastExe = try client.compile(mlir, config: .fast)       // O1, quick compilation
-```
-
-### Swift — Heterogeneous GPU+ANE+CPU Execution
-
-```swift
-import MetalHLO
-
-let client = try Client.create()
-
-// Enable heterogeneous execution across GPU, MPS/ANE, and CPU
-let config = CompilationConfig(
-    optimizationLevel: .O3,
-    devicePolicy: .auto  // Profitability guard decides which ops to partition
-)
-let executable = try client.compile(mlir, config: config)
-
-// Execute — profitable operations are partitioned across GPU + MPS/ANE + CPU
-let outputs = try executable.execute(inputs)
-```
-
-The profitability guard gates partitioning to operations where it provably helps:
-- **Partitioned (3-unit):** Large vocabulary projections (N ≥ 32K, ≥ 10M elements) — e.g., GPT-2 logit projection
-- **Single-unit fallback:** Everything else — the guard ensures zero overhead on unprofitable shapes
-
-### C — Basic Usage
-
-```c
-#include <metalhlo.h>
-#include <stdio.h>
-
-int main() {
-    MHLOClientRef client = NULL;
-    MHLOStatusCode status;
-
-    // Create client
-    status = mhlo_client_create(&client);
-    if (status != MHLO_OK) {
-        fprintf(stderr, "Error: %s\n", mhlo_get_last_error());
-        return 1;
-    }
-
-    // Print device info
-    char* device = mhlo_client_device_name(client);
-    printf("Device: %s\n", device);
-    mhlo_free_string(device);
-
-    // Compile MLIR
-    const char* mlir =
-        "module @add {\n"
-        "  func.func @main(%a: tensor<4xf32>, %b: tensor<4xf32>) -> (tensor<4xf32>) {\n"
-        "    %0 = stablehlo.add %a, %b : tensor<4xf32>\n"
-        "    return %0 : tensor<4xf32>\n"
-        "  }\n"
-        "}\n";
-
-    MHLOExecutableRef exe = NULL;
-    status = mhlo_compile(client, mlir, &exe);
-    if (status != MHLO_OK) {
-        fprintf(stderr, "Compile error: %s\n", mhlo_get_last_error());
-        return 1;
-    }
-
-    // Create input buffers
-    float a_data[] = {1.0f, 2.0f, 3.0f, 4.0f};
-    float b_data[] = {10.0f, 20.0f, 30.0f, 40.0f};
-    int64_t shape[] = {4};
-
-    MHLOBufferRef buf_a = NULL, buf_b = NULL;
-    mhlo_buffer_create(client, a_data, sizeof(a_data), shape, 1, MHLO_F32, &buf_a);
-    mhlo_buffer_create(client, b_data, sizeof(b_data), shape, 1, MHLO_F32, &buf_b);
-
-    // Execute
-    MHLOBufferRef inputs[] = {buf_a, buf_b};
-    MHLOBufferRef outputs[1] = {NULL};
-    int32_t num_outputs = 0;
-
-    status = mhlo_execute(exe, inputs, 2, outputs, &num_outputs);
-    if (status != MHLO_OK) {
-        fprintf(stderr, "Execute error: %s\n", mhlo_get_last_error());
-        return 1;
-    }
-
-    // Read result
-    float result[4];
-    mhlo_buffer_to_host(outputs[0], result, sizeof(result));
-    printf("Result: [%.1f, %.1f, %.1f, %.1f]\n",
-           result[0], result[1], result[2], result[3]);
-
-    // Cleanup
-    mhlo_buffer_destroy(buf_a);
-    mhlo_buffer_destroy(buf_b);
-    mhlo_buffer_destroy(outputs[0]);
-    mhlo_executable_destroy(exe);
-    mhlo_client_destroy(client);
-
-    return 0;
-}
-```
-
-### C — With Optimization Configuration
-
-```c
-#include <metalhlo.h>
-
-// Initialize config with defaults (O2)
-MHLOCompileConfig config;
-mhlo_compile_config_init(&config);
-
-// Use aggressive optimization
-config.optimization_level = MHLO_OPT_O3;
-config.device_policy = MHLO_DEVICE_AUTO;  // Enable GPU+ANE+CPU heterogeneous execution
-config.enable_caching = true;
-config.enable_debug_info = false;
-
-// Compile with configuration
-MHLOExecutableRef exe = NULL;
-mhlo_compile_with_config(client, mlir, &config, &exe);
-
-// Get execution statistics after running
-MHLOExecutionStats stats;
-mhlo_executable_get_stats(exe, &stats);
-printf("Executions: %lld, Avg time: %.3f ms\n",
-       stats.execution_count, stats.average_execution_time_ms);
-```
-
-## Optimization Levels
-
-MetalHLO provides four optimization levels that control the aggressiveness of the compilation pipeline:
-
-| Level | Description | Use Case |
-|-------|-------------|----------|
-| **O0** | No optimization | Debugging, fastest compilation |
-| **O1** | Basic optimization | Quick iteration during development |
-| **O2** | Standard optimization (default) | Production with balanced compile time |
-| **O3** | Aggressive optimization — **experimental, under repair** | Not for use yet (see below) |
-
-> **⚠️ O3 is currently disabled and under active development.** Its pattern-fusion
-> stack (GELU/attention/FFN fusion, cross-layer fusion) has known correctness and
-> stability bugs — a fused-attention kernel that drops the causal mask, a fusedGELU
-> binding crash, and an incomplete cross-layer residual fusion. **Requesting `-O3`
-> transparently falls back to `-O2`** (with a one-time warning) so you always get a
-> correct compile. Setting `METALHLO_ALLOW_O3=1` forces the real O3 for developers
-> working on these fixes — it may crash or miscompile. Use **O2** for production.
-
-### What Each Level Does
-
-**O0 — No Optimization**
-- Direct translation to Metal kernels
-- Fastest compile time
-- Useful for debugging IR issues
-
-**O1 — Basic Optimization**
-- Algebraic simplification (`x + 0 → x`, `x * 1 → x`)
-- Dead code elimination
-- Constant folding
-
-**O2 — Standard Optimization** (Default)
-- All O1 optimizations
-- Shape canonicalization (reshape/transpose/broadcast fusion)
-- Common subexpression elimination
-- Pattern-based fusion (softmax, GELU, layer norm, attention)
-- Producer-consumer fusion
-
-**O3 — Aggressive Optimization**
-- All O2 optimizations
-- Multiple fusion iterations
-- Sibling fusion (multi-output fusion)
-- Horizontal fusion (batching small operations)
-- Cross-layer fusion
-- Layout optimization
-
-## Optimization Pipeline
-
-MetalHLO's optimization pipeline runs in phases, inspired by XLA's approach:
-
-```
-                    ┌─────────────────────────────────────────┐
-                    │           StableHLO MLIR Input          │
-                    └─────────────────┬───────────────────────┘
-                                      │
-                    ┌─────────────────▼───────────────────────┐
-                    │     Phase 1: SIMPLIFICATION             │
-                    │  • Constant folding                     │
-                    │  • Algebraic simplification             │
-                    │  • Dead code elimination                │
-                    │  • Common subexpression elimination     │
-                    └─────────────────┬───────────────────────┘
-                                      │
-                    ┌─────────────────▼───────────────────────┐
-                    │     Phase 2: CANONICALIZATION           │
-                    │  • Reshape canonicalization             │
-                    │  • Transpose canonicalization           │
-                    │  • Broadcast canonicalization           │
-                    └─────────────────┬───────────────────────┘
-                                      │
-                    ┌─────────────────▼───────────────────────┐
-                    │     Phase 3: PATTERN FUSION             │
-                    │  • Softmax detection & fusion           │
-                    │  • GELU/SiLU activation fusion          │
-                    │  • Layer norm / RMS norm fusion         │
-                    │  • Attention pattern fusion             │
-                    │  • Depth attention (Attention Residuals)│
-                    │  • MatMul + Bias + Activation fusion    │
-                    └─────────────────┬───────────────────────┘
-                                      │
-                    ┌─────────────────▼───────────────────────┐
-                    │     Phase 4: GENERIC FUSION             │
-                    │  • Producer-consumer fusion             │
-                    │  • Sibling fusion (multi-output)        │
-                    │  • Horizontal fusion (op batching)      │
-                    └─────────────────┬───────────────────────┘
-                                      │
-                    ┌─────────────────▼───────────────────────┐
-                    │     Phase 5: LAYOUT & SCHEDULING        │
-                    │  • Memory layout optimization           │
-                    │  • Buffer assignment                    │
-                    │  • Kernel scheduling                    │
-                    └─────────────────┬───────────────────────┘
-                                      │
-                    ┌─────────────────▼───────────────────────┐
-                    │         Metal Kernel Generation         │
-                    └─────────────────────────────────────────┘
-```
-
-### Key Optimization Passes
-
-| Pass | Description |
-|------|-------------|
-| **Algebraic Simplifier** | Applies identity rules (`x+0→x`, `x*1→x`), inverse rules (`exp(log(x))→x`), and strength reduction |
-| **Dead Code Elimination** | Removes operations whose results are unused |
-| **CSE** | Common Subexpression Elimination — reuses identical computations |
-| **Reshape Canonicalizer** | Fuses consecutive reshapes, eliminates no-op reshapes |
-| **Transpose Canonicalizer** | Composes consecutive transposes, eliminates identity transposes |
-| **Broadcast Canonicalizer** | Fuses broadcasts, moves broadcasts through elementwise ops |
-| **Pattern Fusion** | Recognizes ML patterns (softmax, GELU, attention, depth attention) and replaces with optimized kernels |
-| **Producer-Consumer Fusion** | Fuses elementwise operations with their consumers to reduce memory traffic |
-| **Sibling Fusion** | Fuses operations that share inputs (multi-output fusion) |
-| **Horizontal Fusion** | Batches multiple small independent operations |
-
-## Supported Operations
-
-### Fully Implemented (98 ops)
-
-| Category | Operations |
-|----------|------------|
-| **Binary Arithmetic** | add, subtract, multiply, divide, maximum, minimum, power, atan2 |
-| **Unary Math** | negate, abs, exp, log, sqrt, rsqrt, sin, cos, tanh, floor, ceil, sign, tan, logistic, is_finite, expm1, log1p, cbrt, round_nearest_afz, round_nearest_even |
-| **Bitwise** | not, and, or, xor, shift_left, shift_right_arithmetic, shift_right_logical, popcnt |
-| **Type Conversion** | convert, bitcast_convert, reduce_precision (IEEE round-to-nearest-even mantissa narrowing) |
-| **Matrix** | dot, dot_general, transpose, reshape, broadcast_in_dim, reverse |
-| **Dynamic Shape** | dynamic_slice, dynamic_update_slice, dynamic_reshape, dynamic_broadcast_in_dim, dynamic_pad, dynamic_iota, dynamic_gather |
-| **Convolution** | convolution |
-| **Reduction** | reduce (sum, max, min, mean), reduce_window, argmax/argmin, cumulative_sum (cumsum/cumprod/cummax/cumlogsumexp) |
-| **Normalization** | batch_norm_inference, batch_norm_training, batch_norm_grad |
-| **FFT** | fft (FFT, IFFT, RFFT, IRFFT) |
-| **Sorting** | sort / argsort / lexsort (stable, any axis), top_k (values + indices), searchsorted |
-| **Special Functions** | erf, lgamma, digamma (chlo composites, legalized to stablehlo) |
-| **Comparison** | compare (EQ, NE, LT, LE, GT, GE), select, clamp |
-| **Indexing** | slice, pad, concatenate, gather, scatter |
-| **RNG** | rng (uniform, normal), rng_bit_generator (threefry2x32 — bit-exact with JAX) |
-| **Constants** | constant, iota |
-| **Control Flow** | while, if (`jax.lax.cond`), case (`jax.lax.switch`), optimization_barrier (`jax.checkpoint` / `jax.remat`) |
-| **Quantization** | uniform_quantize, uniform_dequantize |
-| **Complex Numbers** | complex, real, imag |
-| **Select/Scatter** | select_and_scatter |
-| **Custom Calls** | fused_scaled_dot_product_attention, fused_depth_attention, fused_layer_norm, fused_rms_norm, fused_matmul_bias_activation, fused_softmax, fused_gelu, fused_rope |
-
-### Linear Algebra
-
-| Operation | Backend | Notes |
-|-----------|---------|-------|
-| `triangular_solve` | MPSGraph | Forward/back substitution (`left_side=true`) |
-| `cholesky` | MPSGraph | Cholesky–Banachiewicz recurrence; honors `lower` |
-| `svd` | Accelerate (host) | `@lapack_sgesdd_ffi` → host `sgesdd`; full/thin |
-| `qr` | Accelerate (host) | `@lapack_sgeqrf_ffi` + `@lapack_sorgqr_ffi` → host; reduced/complete |
-| `eigh` | Accelerate (host) | `@lapack_ssyevd_ffi` → host `ssyevd`; honors UPLO |
-| `map` | MPSGraph | Element-wise region inlined over broadcast inputs |
-
-The full dense `jnp.linalg` / `jax.scipy.linalg` surface is reachable end-to-end from JAX. JAX-on-CPU lowers these to LAPACK FFI `custom_call`s; the parser decodes each (uplo/side/trans/diag) and routes it either to a native MPSGraph implementation (`cholesky`, `triangular_solve`) or to the real LAPACK in Apple's Accelerate framework run host-side over the shared unified-memory buffers (`svd`, `qr`, `eigh`) — the same library JAX-CPU itself calls. Verified against JAX CPU by reconstruction (`U·diag(S)·Vᵀ`, `Q·R`, `v·diag(w)·vᵀ`).
-
-### Excluded by Design (14 ops)
-
-Multi-device operations (all_gather, all_reduce, etc.), communication operations (infeed, outfeed, etc.), and tuple operations are excluded per the single-device focus.
-
-## API Reference
-
-### Swift API
-
-#### Client
-
-```swift
-public final class Client: @unchecked Sendable {
-    /// Create a client for the default Metal device
-    static func create() throws -> Client
-
-    /// The underlying Metal device name
-    var deviceName: String { get }
-
-    /// Compile StableHLO MLIR (default O2 optimization)
-    func compile(_ mlir: String) throws -> Executable
-
-    /// Compile with explicit configuration
-    func compile(_ mlir: String, config: CompilationConfig) throws -> Executable
-
-    /// Create buffers from host data
-    func createBuffer(_ data: [Float], shape: [Int]) -> Buffer
-    func createBuffer<T: Numeric>(_ data: [T], shape: [Int], elementType: ElementType) throws -> Buffer
-}
-```
-
-#### CompilationConfig
-
-```swift
-public struct CompilationConfig: Sendable {
-    var optimizationLevel: OptimizationLevel  // .O0, .O1, .O2, .O3
-    var devicePolicy: DevicePolicy            // .gpuOnly, .auto
-    var enableCaching: Bool
-    var generateDebugInfo: Bool
-
-    // Presets
-    static let `default`: CompilationConfig  // O2, GPU only
-    static let debug: CompilationConfig      // O0, no cache, debug info
-    static let release: CompilationConfig    // O3, caching
-    static let fast: CompilationConfig       // O1, caching
-}
-```
-
-#### Executable
-
-```swift
-public final class Executable: @unchecked Sendable {
-    var inputCount: Int { get }
-    var outputCount: Int { get }
-    var inputTypes: [TensorType] { get }
-    var outputTypes: [TensorType] { get }
-
-    func execute(_ inputs: [Buffer]) throws -> [Buffer]
-    func executeWithTiming(_ inputs: [Buffer]) throws -> ([Buffer], ExecutionTiming)
-}
-```
-
-#### Buffer
-
-```swift
-public final class Buffer: @unchecked Sendable {
-    var shape: [Int] { get }
-    var count: Int { get }
-    var elementType: ElementType { get }
-
-    func toFloatArray() throws -> [Float]
-    func toInt32Array() throws -> [Int32]
-    func toData() throws -> Data
-}
-```
-
-### C API
-
-```c
-// Version
-const char* mhlo_version(void);
-
-// Client
-MHLOStatusCode mhlo_client_create(MHLOClientRef* out_client);
-void mhlo_client_destroy(MHLOClientRef client);
-char* mhlo_client_device_name(MHLOClientRef client);
-
-// Compilation
-MHLOStatusCode mhlo_compile(MHLOClientRef client, const char* mlir, MHLOExecutableRef* out);
-MHLOStatusCode mhlo_compile_with_config(MHLOClientRef client, const char* mlir,
-                                         const MHLOCompileConfig* config, MHLOExecutableRef* out);
-void mhlo_compile_config_init(MHLOCompileConfig* config);
-void mhlo_executable_destroy(MHLOExecutableRef exe);
-
-// Execution
-MHLOStatusCode mhlo_execute(MHLOExecutableRef exe, const MHLOBufferRef* inputs, int32_t num_inputs,
-                             MHLOBufferRef* outputs, int32_t* num_outputs);
-MHLOStatusCode mhlo_executable_get_stats(MHLOExecutableRef exe, MHLOExecutionStats* stats);
-void mhlo_executable_reset_stats(MHLOExecutableRef exe);
-
-// Buffers
-MHLOStatusCode mhlo_buffer_create(MHLOClientRef client, const void* data, size_t size,
-                                   const int64_t* shape, int32_t rank, MHLOElementType type,
-                                   MHLOBufferRef* out);
-void mhlo_buffer_destroy(MHLOBufferRef buffer);
-MHLOStatusCode mhlo_buffer_to_host(MHLOBufferRef buffer, void* out, size_t size);
-
-// Utilities
-const char* mhlo_get_last_error(void);
-void mhlo_free_string(const char* str);
-```
-
-## PJRT Plugin (JAX Integration)
-
-MetalHLO implements the [PJRT C API](https://github.com/openxla/xla/tree/main/xla/pjrt/c) (v0.90), the standard device plugin interface for the OpenXLA ecosystem. This enables JAX, TensorFlow, and PyTorch/XLA to execute StableHLO programs on Apple Silicon GPUs via MetalHLO.
-
-### How It Works
-
-The plugin is a dynamic library (`libPJRTMetalHLO.dylib`) that exports a `GetPjrtApi()` symbol returning a fully populated `PJRT_Api` vtable. JAX discovers and loads this plugin automatically via Python's entry-point mechanism.
-
-### Implemented PJRT Functions
-
-| Category | Functions |
-|----------|-----------|
-| **Error** | `Error_Destroy`, `Error_Message`, `Error_GetCode` |
-| **Client** | `Client_Create`, `Client_Destroy`, `Client_PlatformName`, `Client_Devices`, `Client_AddressableDevices`, `Client_Compile`, `Client_BufferFromHostBuffer` |
-| **Executable** | `LoadedExecutable_Execute`, `LoadedExecutable_Destroy`, `LoadedExecutable_GetExecutable`, `Executable_Name`, `Executable_NumOutputs`, `Executable_Serialize`, `Executable_Destroy`, `Executable_Fingerprint`, `Executable_OutputElementTypes`, `Executable_OutputDimensions`, `Executable_OutputMemoryKinds`, `Executable_DeserializeAndLoad` |
-| **Buffer** | `Buffer_ToHostBuffer`, `Buffer_Destroy`, `Buffer_ElementType`, `Buffer_Dimensions`, `Buffer_OnDeviceSizeInBytes`, `Buffer_Device`, `Buffer_Memory`, `Buffer_ReadyEvent`, `Buffer_CopyToDevice` |
-| **Device** | `Device_GetDescription`, `DeviceDescription_Id`, `DeviceDescription_ProcessIndex`, `DeviceDescription_Attributes` |
-| **Memory** | `Device_AddressableMemories`, `Device_DefaultMemory`, `Memory_Id`, `Memory_Kind`, `Memory_Kind_Id` |
-| **Event** | `Event_Await`, `Event_OnReady`, `Event_Destroy`, `Event_IsReady` |
-
-### Building the Plugin
+### JAX backend
 
 ```bash
-# Build the dynamic library
-swift build -c release --product PJRTMetalHLO
-
-# The dylib is at .build/release/libPJRTMetalHLO.dylib
-```
-
-### Using with JAX
-
-Tested with JAX 0.10.0 (compatible back to JAX 0.4.0).
-
-Install the Python package that registers MetalHLO as a JAX backend:
-
-```bash
-# From the repository root
+# Registers MetalHLO as a JAX backend (builds against the PJRT plugin above)
 pip install -e python/
 ```
 
-Then use JAX as usual — MetalHLO will be available as a backend:
-
-```python
-import jax
-import jax.numpy as jnp
-
-# Check available backends
-print(jax.devices())  # Should include MetalHLO device
-
-# Run computations on MetalHLO
-x = jnp.array([1.0, 2.0, 3.0, 4.0])
-y = jnp.array([5.0, 6.0, 7.0, 8.0])
-result = x + y  # Executes on Apple GPU via MetalHLO
-```
-
-You can also set the `METALHLO_PLUGIN_PATH` environment variable to point to the dylib if it's not in the default build locations:
+If the plugin dylib isn't found automatically, point to it explicitly:
 
 ```bash
 export METALHLO_PLUGIN_PATH=/path/to/libPJRTMetalHLO.dylib
 ```
 
-### Plugin Capabilities
+## Quick Start
 
-- **Platform name:** `metalhlo`
-- **Memory model:** Unified memory (CPU/GPU shared, zero-copy transfers)
-- **Compilation:** Uses O2 optimization by default (pattern fusion, CSE, algebraic simplification)
-- **Serialization:** Full executable serialize/deserialize support for caching compiled programs
-- **Buffer management:** Host-to-device and device-to-host transfers with proper event synchronization
-- **Device attributes:** Reports Metal GPU family, recommended max working set size, and unified memory architecture
+### JAX
 
-### Current Limitations
+```python
+import jax
+import jax.numpy as jnp
 
-- Single-device execution only (no multi-GPU or distributed)
-- Static shapes required (no dynamic shape inference at the PJRT level)
-- Token and tuple operations are not supported
-- Some JAX operations may require additional PJRT functions not yet implemented
+print(jax.devices())          # includes the MetalHLO device
+
+x = jnp.array([1.0, 2.0, 3.0, 4.0])
+y = jnp.array([5.0, 6.0, 7.0, 8.0])
+result = x + y                # executes on the Apple GPU via MetalHLO
+```
+
+`jit`, `grad`, `vmap`, `scan`, and full optax training steps all work — see
+[JAX & Flax Compatibility](#jax--flax-compatibility).
+
+### Swift
+
+```swift
+import MetalHLO
+
+let client = try Client.create()
+
+let mlir = """
+module @add {
+  func.func @main(%a: tensor<4xf32>, %b: tensor<4xf32>) -> (tensor<4xf32>) {
+    %0 = stablehlo.add %a, %b : tensor<4xf32>
+    return %0 : tensor<4xf32>
+  }
+}
+"""
+let executable = try client.compile(mlir)                  // O2 by default
+
+let a = client.createBuffer([1, 2, 3, 4] as [Float], shape: [4])
+let b = client.createBuffer([10, 20, 30, 40] as [Float], shape: [4])
+let outputs = try executable.execute([a, b])
+print(try outputs[0].toFloatArray())                       // [11, 22, 33, 44]
+```
+
+Compilation presets: `.debug` (O0), `.fast` (O1), `.default` (O2), `.release` (O3 +
+caching). Pass `devicePolicy: .auto` to enable heterogeneous GPU+ANE+CPU execution. The C
+API mirrors this surface — see [`metalhlo.h`](Sources/CMetalHLO/include/metalhlo.h).
+
+## JAX & Flax Compatibility
+
+MetalHLO is a fully-functional JAX backend. Each row links to the test that exercises it.
+
+### JAX primitives
+
+| Capability | Test |
+|---|---|
+| `jit`, `value_and_grad`, full training step with optax (SGD, Adam) | [flax_metalhlo_training.py](Examples/FlaxExample/flax_metalhlo_training.py) |
+| `vmap`, `vmap` of `grad`, nested `vmap`, non-default `in_axes`/`out_axes` | [flax_metalhlo_vmap.py](Examples/FlaxExample/flax_metalhlo_vmap.py) |
+| `jax.lax.scan`, `flax.linen.scan` forward, `nn.scan` + `grad` (RNN training) | [flax_metalhlo_scan.py](Examples/FlaxExample/flax_metalhlo_scan.py) |
+| `jax.checkpoint` / `jax.remat`, `jax.lax.optimization_barrier` | [OptimizationBarrierTest.swift](Tests/MetalHLOCoreTests/OptimizationBarrierTest.swift) |
+| `jax.lax.top_k`, `jnp.argmax`/`argmin` (in-`jit`), `jnp.cumsum`/`cumprod`/`cummax`/`cumlogsumexp`, `jnp.arctan2`, `jax.lax.reduce_precision`, `jnp.searchsorted`, `jnp.unique(size=K)`, `jnp.sort`/`argsort`/`lexsort` | [Tests/MetalHLOCoreTests](Tests/MetalHLOCoreTests) |
+| `jax.lax.switch` (multi-branch), `jax.lax.cond` | [CaseSwitchTest.swift](Tests/MetalHLOCoreTests/CaseSwitchTest.swift) |
+| `jax.scipy.linalg.cholesky` / `solve_triangular`, `jnp.linalg.svd` / `qr` / `eigh` (routed from JAX's LAPACK FFI to Accelerate), `jax.lax.lgamma` / `digamma` / `erf` | [LapackRoutingTest.swift](Tests/MetalHLOCoreTests/LapackRoutingTest.swift) |
+| `jax.random` — bit-exact threefry2x32 (`bits`/`uniform` match JAX CPU exactly) | [ThreefryRngTest.swift](Tests/MetalHLOCoreTests/ThreefryRngTest.swift) |
+| `jax.debug.print` / `jax.debug.callback` (side-effect-only host callbacks) | [HostCallbackTest.swift](Tests/MetalHLOCoreTests/HostCallbackTest.swift) |
+
+### Dtypes
+
+| Dtype | Forward | Grad | Mixed precision |
+|---|---|---|---|
+| `float32` | ✓ | ✓ | n/a |
+| `float16` | ✓ | ✓ | ✓ (fp32 params + fp16 compute) |
+| `bfloat16` | ✓ | ✓ | ✓ (fp32 params + bf16 compute), Adam step |
+
+### Flax layers (`nn.compact` and `nnx`)
+
+| Layer family | Verified |
+|---|---|
+| Dense, MLP, Sequential, ReLU/Tanh/SiLU/GELU, Softmax, Embed, Classifier | [flax_metalhlo_example.py](Examples/FlaxExample/flax_metalhlo_example.py) |
+| Conv1D/2D, ConvTranspose, depthwise/grouped conv, max/avg pool | [flax_metalhlo_layers.py](Examples/FlaxExample/flax_metalhlo_layers.py) |
+| BatchNorm (train + inference), LayerNorm, RMSNorm, GroupNorm, Dropout | [flax_metalhlo_layers.py](Examples/FlaxExample/flax_metalhlo_layers.py) |
+| MultiHeadDotProductAttention (+ causal masking), Transformer block | [flax_metalhlo_layers.py](Examples/FlaxExample/flax_metalhlo_layers.py) |
+| LSTMCell, GRUCell | [flax_metalhlo_layers.py](Examples/FlaxExample/flax_metalhlo_layers.py) |
+| `flax.nnx`: Linear, Conv, LayerNorm, RMSNorm, Embed, MLP, MHA, Dropout, BatchNorm | [flax_metalhlo_nnx.py](Examples/FlaxExample/flax_metalhlo_nnx.py) |
+| End-to-end: Mini-BERT, Mini-ResNet, Mini-CNN, Autoencoder (multi-step Adam) | [flax_metalhlo_e2e.py](Examples/FlaxExample/flax_metalhlo_e2e.py) |
+| ResNet18 on CIFAR-10 (batch 256, fp32, Adam) — **8.48× over JAX CPU** (M5 Pro) | [Examples/Benchmarks/resnet_cifar10](Examples/Benchmarks/resnet_cifar10) |
+| Karpathy's atomic GPT (1-layer, names dataset) | [Examples/Benchmarks/karpathy_gpt](Examples/Benchmarks/karpathy_gpt) |
+
+## Optimization Levels
+
+| Level | Description | Use Case |
+|-------|-------------|----------|
+| **O0** | No optimization | Debugging, fastest compilation |
+| **O1** | Algebraic simplification, DCE, constant folding | Quick iteration |
+| **O2** (default) | + shape canonicalization, CSE, pattern fusion (softmax/GELU/LayerNorm/attention), producer-consumer fusion | Production |
+| **O3** | + multi-iteration, sibling/horizontal/cross-layer fusion, layout optimization — **experimental** | See note below |
+
+> **⚠️ O3 is experimental and under repair.** Its pattern-fusion stack has known
+> correctness/stability bugs (a fused-attention kernel that drops the causal mask, a
+> fusedGELU binding crash, an incomplete cross-layer residual fusion). Requesting `-O3`
+> transparently falls back to `-O2` with a one-time warning. Set `METALHLO_ALLOW_O3=1`
+> to force the real O3 (may crash or miscompile). **Use O2 for production.**
+
+The pipeline runs in phases — Simplification → Canonicalization → Pattern Fusion →
+Generic Fusion → Layout & Scheduling → Metal kernel generation.
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────────────┐
-│   JAX / XLA               C/C++ Projects           Swift Projects       │
-│        │                       │                         │              │
-│        ▼                       ▼                         ▼              │
-│   ┌──────────────┐    ┌─────────────┐           ┌───────────────────┐  │
-│   │ PJRT Plugin  │    │ C API       │           │ Swift API         │  │
-│   │ GetPjrtApi() │    │ mhlo_*      │           │ MetalHLO.Client   │  │
-│   └──────┬───────┘    └──────┬──────┘           └─────────┬─────────┘  │
-│          │                   │                            │             │
-│          └───────────────────┴────────────────────────────┘             │
-│                                    ▼                                    │
-│               ┌─────────────────────────────────────────┐              │
-│               │  MetalHLOCore                           │              │
-│               │                                         │              │
-│               │  ┌───────────┐   ┌───────────────────┐  │              │
-│               │  │ Parser    │ → │ Optimizer         │  │              │
-│               │  └───────────┘   │ (PassManager)     │  │              │
-│               │                  └─────────┬─────────┘  │              │
-│               │                            │            │              │
-│               │       ┌────────────┴────────────────┐   │              │
-│               │       ▼              ▼              ▼   │              │
-│               │  ┌──────────┐  ┌──────────┐  ┌────────────┐           │
-│               │  │ MPSGraph │  │ Metal    │  │ Heterogen. │           │
-│               │  │ Backend  │  │ Kernel   │  │ GPU+ANE+CPU│           │
-│               │  │ (default)│  │ (O0-O3)  │  │ (auto)     │           │
-│               │  └──────────┘  └──────────┘  └────────────┘           │
-│               └─────────────────────────────────────────┘              │
-│                          │            │            │                    │
-│                          ▼            ▼            ▼                    │
-│               ┌──────────────────────────────────────────┐             │
-│               │  Apple Metal / MPSGraph / ANE / CPU      │             │
-│               └──────────────────────────────────────────┘             │
-└──────────────────────────────────────────────────────────────────────────┘
+  JAX / XLA            C/C++ projects          Swift projects
+      │                      │                       │
+  PJRT plugin            C API                  Swift API
+  GetPjrtApi()           mhlo_*                 MetalHLO.Client
+      └──────────────────────┴───────────────────────┘
+                             ▼
+                  ┌─────────────────────┐
+                  │  MetalHLOCore       │
+                  │  Parser → Optimizer │
+                  │      (PassManager)  │
+                  └──────────┬──────────┘
+            ┌────────────────┼────────────────┐
+            ▼                ▼                 ▼
+       ┌─────────┐     ┌──────────┐    ┌──────────────┐
+       │ MPSGraph│     │  Metal   │    │ Heterogeneous│
+       │(default)│     │ kernels  │    │ GPU+ANE+CPU  │
+       └─────────┘     └──────────┘    └──────────────┘
+            └────────────────┴─────────────────┘
+                             ▼
+                Apple Metal / MPSGraph / ANE / CPU
 ```
 
-## Examples
+**Heterogeneous execution** (`devicePolicy: .auto`) is the one differentiator worth
+calling out: Apple Silicon's unified memory lets the GPU, Neural Engine (via MPS), and CPU
+cores read/write the same buffers with zero transfer cost. A profitability-gated 4-pass
+pipeline partitions only the operations where multi-unit dispatch provably wins — in
+practice, vocabulary-scale projections (≥ 10M output elements, N ≥ 32K). Everything else
+falls through to single-unit execution with zero overhead. Validated on GPT-2 (124M):
+1.91× on the logit projection, zero regressions. See
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md#heterogeneous-execution-gpt-2-validation).
 
-### Two-Layer MLP
+## Supported Operations
 
-```swift
-let mlir = """
-module @mlp {
-  func.func @main(%x: tensor<32x784xf32>, %w1: tensor<784x256xf32>, %b1: tensor<256xf32>,
-                  %w2: tensor<256x10xf32>, %b2: tensor<10xf32>) -> (tensor<32x10xf32>) {
-    // Layer 1: y1 = relu(x @ w1 + b1)
-    %0 = stablehlo.dot %x, %w1 : (tensor<32x784xf32>, tensor<784x256xf32>) -> tensor<32x256xf32>
-    %1 = stablehlo.broadcast_in_dim %b1, dims = [1] : (tensor<256xf32>) -> tensor<32x256xf32>
-    %2 = stablehlo.add %0, %1 : tensor<32x256xf32>
-    %zero1 = stablehlo.constant dense<0.0> : tensor<32x256xf32>
-    %3 = stablehlo.maximum %2, %zero1 : tensor<32x256xf32>
+Broad StableHLO coverage — the operations below span ~99% of what production ML
+workloads need.
 
-    // Layer 2: y2 = x1 @ w2 + b2
-    %4 = stablehlo.dot %3, %w2 : (tensor<32x256xf32>, tensor<256x10xf32>) -> tensor<32x10xf32>
-    %5 = stablehlo.broadcast_in_dim %b2, dims = [1] : (tensor<10xf32>) -> tensor<32x10xf32>
-    %6 = stablehlo.add %4, %5 : tensor<32x10xf32>
-    return %6 : tensor<32x10xf32>
-  }
-}
-"""
+| Category | Operations |
+|----------|------------|
+| **Binary** | add, subtract, multiply, divide, maximum, minimum, power, atan2 |
+| **Unary** | negate, abs, exp, log, sqrt, rsqrt, sin, cos, tan, tanh, floor, ceil, sign, logistic, is_finite, expm1, log1p, cbrt, round_nearest_afz, round_nearest_even |
+| **Bitwise** | not, and, or, xor, shift_left, shift_right_arithmetic, shift_right_logical, popcnt |
+| **Type conversion** | convert, bitcast_convert, reduce_precision |
+| **Matrix** | dot, dot_general, transpose, reshape, broadcast_in_dim, reverse |
+| **Dynamic shape** | dynamic_slice, dynamic_update_slice, dynamic_reshape, dynamic_broadcast_in_dim, dynamic_pad, dynamic_iota, dynamic_gather |
+| **Reduction** | reduce (sum/max/min/mean), reduce_window, argmax/argmin, cumulative (cumsum/cumprod/cummax/cumlogsumexp) |
+| **Normalization** | batch_norm_inference, batch_norm_training, batch_norm_grad |
+| **FFT** | fft (FFT, IFFT, RFFT, IRFFT) |
+| **Sorting** | sort / argsort / lexsort (stable, any axis), top_k, searchsorted |
+| **Special** | erf, lgamma, digamma |
+| **Comparison** | compare (EQ/NE/LT/LE/GT/GE), select, clamp |
+| **Indexing** | slice, pad, concatenate, gather, scatter, select_and_scatter |
+| **Convolution** | convolution |
+| **RNG** | rng (uniform, normal), rng_bit_generator (threefry2x32, bit-exact with JAX) |
+| **Control flow** | while, if (`cond`), case (`switch`), optimization_barrier (`remat`) |
+| **Constants** | constant, iota |
+| **Quantization** | uniform_quantize, uniform_dequantize |
+| **Complex** | complex, real, imag |
+| **Custom calls** | fused attention / depth-attention / layer_norm / rms_norm / matmul-bias-activation / softmax / gelu / rope |
 
-// Compile with O3 for production
-let config = CompilationConfig.release
-let executable = try client.compile(mlir, config: config)
-```
+**Linear algebra.** The dense `jnp.linalg` / `jax.scipy.linalg` surface is reachable
+end-to-end: JAX-CPU lowers to LAPACK FFI `custom_call`s, which the parser decodes and
+routes to native MPSGraph (`cholesky`, `triangular_solve`) or to Apple's Accelerate
+framework run host-side over the shared buffers (`svd`, `qr`, `eigh` — the same LAPACK
+JAX-CPU itself calls). Verified against JAX CPU by reconstruction.
 
-### Transformer Attention (Auto-Fused)
+**Excluded by design.** Multi-device collectives (all_gather, all_reduce), communication
+primitives (infeed, outfeed), and tuple ops — single-device focus.
 
-```swift
-// MetalHLO automatically detects and fuses this attention pattern
-let mlir = """
-module @attention {
-  func.func @main(%q: tensor<1x8x512x64xf32>, %k: tensor<1x8x512x64xf32>,
-                  %v: tensor<1x8x512x64xf32>) -> (tensor<1x8x512x64xf32>) {
-    // Transpose K
-    %kt = stablehlo.transpose %k, dims = [0, 1, 3, 2] : ... -> tensor<1x8x64x512xf32>
+## Performance
 
-    // Q @ K^T
-    %scores = stablehlo.dot_general %q, %kt, ... -> tensor<1x8x512x512xf32>
+Two campaigns, full data in **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)**:
 
-    // Scale by 1/sqrt(d_k)
-    %scale = stablehlo.constant dense<0.125> : tensor<f32>
-    %scaled = stablehlo.multiply %scores, %scale : tensor<1x8x512x512xf32>
+- **Multi-backend (M1)** — across MetalHLO's own backends, Metal kernels beat MPSGraph
+  1.2–3.4× on element-wise ops, batch norm, transpose/reshape, and MLP/FFN inference;
+  MPSGraph stays ahead on large GEMMs, convolutions, layer norm, and training.
+- **vs MLX (M5 Pro)** — at -O3 with `METALHLO_MATMUL_TF32=1`, all 5 model_mlp benchmarks
+  beat MLX (FFN fusion, up to 4.63×), normalization reaches parity, and GEMM 4096² hits
+  0.91× via the MetalPerformancePrimitives matrix coprocessor. Attention fusion fires but
+  MLX's hand-tuned kernel is still ~30% faster; reductions/convolution lack a fused path.
 
-    // Softmax
-    %max = stablehlo.reduce %scaled, max over [3] : tensor<1x8x512x1xf32>
-    %shifted = stablehlo.subtract %scaled, %max : tensor<1x8x512x512xf32>
-    %exp = stablehlo.exponential %shifted : tensor<1x8x512x512xf32>
-    %sum = stablehlo.reduce %exp, add over [3] : tensor<1x8x512x1xf32>
-    %probs = stablehlo.divide %exp, %sum : tensor<1x8x512x512xf32>
+**End-to-end training (nanoGPT, M5 Pro):** 74.4 ms/step vs MLX 59.5 ms (1.25×), loss exact
+against JAX CPU. GPU-busy (~60.8 ms) already ≈ MLX's entire step; the residual is host
+overhead and is bounded by reverse-mode autodiff making forward activations multi-use. Full
+investigation in [docs/BENCHMARKS.md](docs/BENCHMARKS.md#end-to-end-training-gap-nanogpt--investigation-status).
 
-    // Attention @ V
-    %out = stablehlo.dot_general %probs, %v, ... -> tensor<1x8x512x64xf32>
-    return %out : tensor<1x8x512x64xf32>
-  }
-}
-"""
-
-// With O2+, this pattern is detected and fused into a single optimized kernel
-let exe = try client.compile(mlir, config: .release)
-```
-
-## Testing
-
-### Quick Start
-
-Run the core unit tests (fast, ~764 tests):
-
-```bash
-swift test --filter 'MetalHLOCoreTests'
-```
-
-Run the full test suite:
-
-```bash
-swift test
-```
-
-### Recommended: Serial Execution
-
-For the most reliable test runs, use the `--no-parallel` flag. This prevents Metal/MPSGraph resource conflicts that can occur when multiple GPU operations run concurrently:
-
-```bash
-swift test --no-parallel
-```
-
-### Running Specific Tests
-
-```bash
-# By test suite name
-swift test --filter "Binary"
-swift test --filter "Reduction"
-swift test --filter "CAPITests"
-swift test --filter "AlgebraicSimplifier"
-
-# PJRT plugin tests
-swift test --filter 'PJRTPluginTests'
-
-# Conformance tests
-swift test --filter 'OfficialInterpretTests'
-swift test --filter 'Optimization'
-
-# Specific operation tests
-swift test --filter 'testAdd'
-swift test --filter 'scatter'
-```
-
-### Test Organization
-
-| Target | Description | Test Count |
-|--------|-------------|------------|
-| `MetalHLOCoreTests` | Core compiler and optimizer tests | ~764 |
-| `MetalHLOTests` | Integration and conformance tests | ~400+ |
-| `PJRTMetalHLOTests` | PJRT plugin API and execution tests | 10 |
-
-### Test Coverage
-
-| Test Suite | Tests |
-|------------|-------|
-| Lexer & Parser | 25 |
-| Binary Operations | 7 |
-| Unary Operations | 12 |
-| Matrix Operations | 10 |
-| Activation Functions | 35 |
-| CNN Operations | 10 |
-| Control Flow | 8 |
-| Custom Call Handlers | 46 |
-| Optimizer Passes | 50 |
-| C API | 15 |
-| Integration Tests | 30 |
-| PJRT Plugin | 10 |
-| **StableHLO Conformance** | **191** |
-| **Total** | **449** |
+**Tips:** reuse executables (compile once, execute many), batch inputs to amortize launch
+overhead, enable caching, and profile with `executeWithTiming()`.
 
 ## Limitations
 
-### Execution Model
-1. **Static Shapes Only** — Dynamic shapes require shape inference
-2. **Single Device** — No multi-device or distributed execution
-3. **Apple Silicon Only** — Intel Macs with AMD GPUs are not supported
-4. **macOS Only** — iOS/iPadOS support is a future consideration
+**Execution model.** Single-device only (no multi-GPU/distributed); static shapes only
+(no dynamic shape inference); Apple Silicon + macOS only.
 
-### Unsupported Types
-The following types are not supported due to Metal/MPS limitations:
+**Sharding.** `pjit` with a mesh, `shard_map`, and `nn.partitioning` are unsupported.
+Multi-device SPMD modules (`num_partitions`/`num_replicas > 1`) fail loudly at parse time;
+single-device meshes pass through.
 
-| Type | Status | Reason |
-|------|--------|--------|
-| `i2`, `i4`, `ui2`, `ui4` | Not supported | Incompatible overflow semantics when promoted |
-| `complex64`, `complex128` | Partial | Basic operations work; full arithmetic not supported by MPS |
-| `f4E2M1FN`, `f6E2M3FN`, etc. | Not supported | Exotic float types not supported by Metal |
-| 64-bit integer bitwise | Limited | MPS doesn't support 64-bit integer bitwise operations |
-| Distributed/collective ops | Not supported | Single-device focus (all_gather, all_reduce, etc.) |
-| Token operations | Not supported | (after_all, infeed, outfeed) - I/O primitives |
+**Numerics / known gaps.**
+- `jax.random.normal` diverges ~2.4e-7 from JAX — the threefry *bits* are exact, but the
+  downstream `ndtri` inverse-CDF rounds differently in fp32 (not the RNG itself).
+- `jnp.linalg.qr` feeding a downstream op inside the same `jit` falls through to the
+  unsupported MPSGraph path; returning the Q/R factors works. `triangular_solve` with
+  `left_side=false` is not yet implemented.
+- Host callbacks: `jax.debug.print`/`callback` work (side effect dropped, numerics exact);
+  `pure_callback`/`io_callback` are unsupported and fail loudly.
+- Multi-step CNN training may drift up to ~0.1 absolute after step 0 (MPSGraph internal
+  small-op fusion); `nn.custom_vjp` and quantization training are untested.
 
-### Operation-Specific Type Restrictions
+**Unsupported types.** `i2`/`i4`/`ui2`/`ui4` (overflow semantics), exotic floats
+(`f4E2M1FN`, etc.), 64-bit integer bitwise, and full complex arithmetic. For compatibility,
+the runtime promotes unsupported types where it can (`f64`→`f32`, `bf16`→`f32`, small
+floats→`f16`, integers→`f32`). `dot`/`convolution`/`fft` are float-only in MPSGraph.
 
-Some operations only support floating-point types in MPSGraph:
+**Operation-specific.** `gather`/`scatter` support all opt levels and add/max/min/mul
+scatter modes; batching dims are best-tested at leading positions. `reduce_window` and
+`convolution` cover common patterns; unusual dimension permutations may fail. `while` loops
+≤ 1000 iterations are unrolled inline; larger loops fall back to MPSGraph, which can crash
+on complex multi-op loop bodies (`jax.lax.scan` with very large iteration counts) — under
+active investigation.
 
-| Operation | Supported Types | Excluded Types |
-|-----------|-----------------|----------------|
-| `dot`, `dot_general` | `f16`, `f32`, `f64`, `bf16` | All integer types (MPSGraph matmul is float-only) |
-| `convolution` | `f16`, `f32`, `f64`, `bf16` | All integer types (MPSGraph conv is float-only) |
-| `fft` | `f16`, `f32`, `f64`, `bf16` | All integer types (MPSGraph FFT is float-only) |
-| `triangular_solve` | Not implemented | Requires MPSMatrix bridge |
-| `cholesky` | Not implemented | Requires MPSMatrix bridge |
-
-### Operation-Specific Limitations
-
-| Operation | Status | Notes |
-|-----------|--------|-------|
-| `gather` | Improved | Works with all optimization levels (O0-O3); embedding lookup and index_vector_dim handling; batching dims supported when at leading positions |
-| `scatter` | Improved | Supports add/max/min/mul computation modes via MPS; batching dims require leading positions |
-| `convert` | Working | Type conversion between numeric types works with all optimization levels |
-| `slice` | Working | Static slice extraction with starts/limits/strides |
-| `dynamic_slice` | Working | Works when slice_sizes equal input dims (start indices clamped) |
-| `reduce_window` | Partial | Works for common patterns; complex regions limited |
-| `convolution` | Partial | Standard patterns work; complex dimension permutations may fail |
-| `stablehlo.while` | Partial | Small loop counts (≤ 1000 iterations) are unrolled inline; large loops fall back to MPSGraph which may crash on complex loop bodies (see below) |
-
-**Scatter computation modes:**
-```mlir
-// Supported via MPS scatter modes
-scatter %operand, %indices, %updates, computation = add   // Adds update to existing value
-scatter %operand, %indices, %updates, computation = max   // Takes maximum
-scatter %operand, %indices, %updates, computation = min   // Takes minimum
-scatter %operand, %indices, %updates, computation = mul   // Multiplies existing by update
-scatter %operand, %indices, %updates                      // Default: replaces value
-```
-
-**Batching dimension support:**
-Gather and scatter parse batching dimension attributes (`operand_batching_dims`, `start_indices_batching_dims` for gather; `input_batching_dims`, `scatter_indices_batching_dims` for scatter). The implementation includes a transpose-gather/scatter-transpose pattern for arbitrary batch dimension positions. Best tested with batch dimensions at leading positions; complex non-leading configurations may require additional work.
-
-### Known Issues Under Investigation
-
-**Large `stablehlo.while` loops (`jax.lax.scan`):**
-Programs that use `jax.lax.scan` with large iteration counts (e.g., 20,000 time steps in a simulation) compile to `stablehlo.while` loops. MetalHLO handles these in two ways:
-- **Small loops (≤ 1000 iterations)** are unrolled inline into a single flat kernel. This works but produces very large Metal shaders.
-- **Large loops (> 1000 iterations)** fall back to the MPSGraph backend, which has a native while-loop executor. However, the MPSGraph while-loop handler currently crashes on complex loop bodies that include multiple operations (collision, forcing, streaming, boundary conditions).
-
-We are investigating two approaches to resolve this:
-1. **Fix MPSGraph while-loop compilation** for complex multi-operation loop bodies.
-2. **Implement a Metal-native loop executor** that dispatches the loop body kernel repeatedly from the CPU/command buffer level, avoiding the need to unroll into a single shader or rely on MPSGraph's while-loop support.
-
-## StableHLO Conformance
-
-MetalHLO includes a conformance test suite based on the [official StableHLO interpreter tests](https://github.com/openxla/stablehlo/tree/main/stablehlo/tests).
-
-### Conformance Results
-
-| Metric | Count |
-|--------|-------|
-| **Total Tests in Suite** | 277 |
-| **Tests Run** | 191 |
-| **Passed** | 191 |
-| **Failed** | 0 |
-| **Skipped** | 86 (MPS/Metal limitations) |
-
-### Running Conformance Tests
+## Testing
 
 ```bash
-# Run all conformance tests (recommended: use --no-parallel for stability)
+swift test --filter 'MetalHLOCoreTests'   # core compiler/optimizer (~764 tests)
+swift test                                # full suite
+swift test --no-parallel                  # most reliable (avoids GPU resource contention)
+```
+
+| Target | Description | Tests |
+|--------|-------------|-------|
+| `MetalHLOCoreTests` | Core compiler and optimizer | ~764 |
+| `MetalHLOTests` | Integration and conformance | ~400+ |
+| `PJRTMetalHLOTests` | PJRT plugin API and execution | 10 |
+
+**StableHLO conformance:** 191 of 277 official interpreter tests pass, 0 fail, 86 skipped
+for fundamental MPS/Metal limitations (complex types, small/large integers, integer
+matmul/conv/FFT, exotic floats).
+
+```bash
 swift test --filter "Official" --no-parallel
-
-# Run specific operation tests
-swift test --filter "OfficialInterpretTests/testAdd"
-swift test --filter "OfficialInterpretTests/testTranspose"
-```
-
-### Type Promotion
-
-To maximize compatibility, MetalHLO automatically promotes unsupported types to supported ones:
-
-| Source Type | Promoted To | Reason |
-|-------------|-------------|--------|
-| `f64` | `f32` | MPS doesn't support f64 |
-| `bf16` | `f32` | Better precision for comparison |
-| `f8E3M4`, `f8E4M3`, `f8E5M2` | `f16` | Exotic float types |
-| `i8`, `i16`, `i32`, `i64` | `f32` | Integer arithmetic via float |
-| `ui8`, `ui16`, `ui32`, `ui64` | `f32` | Unsigned integers via float |
-
-This allows tests written for other backends to run correctly on Metal.
-
-### Skipped Tests (Fundamental Limitations)
-
-The following test categories are skipped due to fundamental MPS/Metal limitations:
-
-| Category | Reason |
-|----------|--------|
-| Complex types (`complex64`, `complex128`) | MPS doesn't support complex arithmetic |
-| Small integers (`i2`, `i4`, `ui2`, `ui4`) | Incompatible overflow semantics when promoted |
-| Integer matmul (`dot`, `dot_general` with int types) | MPSGraph matmul only supports floating-point |
-| Integer convolution | MPSGraph convolution only supports floating-point |
-| Integer FFT | MPSGraph FFT only supports floating-point |
-| Integer overflow tests | Float arithmetic doesn't wrap on overflow like integers |
-| Integer division tests | Float division doesn't truncate like integer division |
-| Large integer constants | Values like `INT64_MAX` can't be exactly represented in Float32 |
-| Exotic float types (`f4E2M1FN`, etc.) | Not supported by Metal |
-| Unsigned integer bitwise ops | MPS treats all integers as signed |
-| 64-bit integer bitwise ops | MPS doesn't support 64-bit integer bitwise operations |
-
-## Performance Tips
-
-1. **Use O3 for production** — Aggressive fusion significantly reduces memory bandwidth
-2. **Batch your inputs** — Larger batch sizes amortize kernel launch overhead
-3. **Reuse executables** — Compile once, execute many times
-4. **Enable caching** — Repeated compilations of the same MLIR return cached results
-5. **Profile with timing** — Use `executeWithTiming()` to identify bottlenecks
-
-## Benchmarks
-
-MetalHLO includes a comprehensive benchmarking framework with multi-backend comparison across four execution paths.
-
-### Multi-Backend Performance Comparison
-
-All results measured on **Apple M1 (8 GB)**, macOS 15.6, release build, quick mode (3 warmup, 10 measurements).
-Times are mean in milliseconds. **Bold** indicates the fastest backend for each benchmark.
-
-#### Matrix Operations
-
-| Benchmark | Description | MPSGraph | Metal O2 | Metal O3 | GPU+ANE | Best vs MPSGraph |
-|-----------|-------------|----------|----------|----------|---------|-------------------|
-| MAT-DOT-001 | GEMM 128x128 | 0.30 | **0.17** | 0.24 | 0.25 | 1.72x (O2) |
-| MAT-DOT-002 | GEMM 512x512 | 1.03 | **0.77** | 1.71 | 0.85 | 1.34x (O2) |
-| MAT-DOT-003 | GEMM 1024x1024 | **4.17** | 5.10 | 5.32 | 4.53 | MPSGraph best |
-| MAT-DOT-004 | GEMM 2048x2048 | **19.55** | 23.00 | 22.63 | 22.17 | MPSGraph best |
-| MAT-DOT-005 | GEMM 4096x4096 | **122.7** | 226.1 | 227.6 | 234.4 | MPSGraph best |
-| MAT-DOT-006 | Transformer 32x4096x768 | 2.36 | 1.22 | 1.17 | **1.10** | 2.14x (ANE) |
-| MAT-DOT-007 | MLP 128x768x3072 | 3.11 | 1.90 | 2.06 | **1.63** | 1.91x (ANE) |
-| MAT-DOT-008 | Matvec 1x4096x4096 | **3.93** | 10.91 | 11.68 | 10.94 | MPSGraph best |
-| MAT-BATCH-001 | Batched 8x512x512 | 6.10 | 5.41 | **4.69** | 5.58 | 1.30x (O3) |
-| MAT-BATCH-002 | Batched 4x1024x1024 | 4.59 | **2.85** | 3.03 | 2.99 | 1.61x (O2) |
-| MAT-BATCH-003 | Attention heads | 1.61 | 1.12 | **0.67** | 1.28 | 2.42x (O3) |
-| MAT-BATCH-004 | Multi-head attention | 0.81 | 0.38 | 0.38 | **0.36** | 2.29x (ANE) |
-| MAT-TR-001 | Transpose 1024x1024 | 1.45 | 0.84 | **0.50** | 1.27 | 2.87x (O3) |
-| MAT-TR-002 | Transpose 3D 32x128x64 | 0.49 | 0.65 | **0.25** | 0.56 | 1.99x (O3) |
-| MAT-RSH-001 | Reshape flatten 1024x1024 | 1.34 | 0.53 | **0.48** | 0.57 | 2.80x (O3) |
-| MAT-RSH-002 | Reshape batch 32x64x128 | 0.48 | **0.41** | 0.46 | 0.42 | 1.16x (O2) |
-
-**Takeaway:** MPSGraph wins on large GEMMs (≥1024x1024) and matvec where Apple's tuned kernels dominate. Metal O3 wins on batched operations, transpose, and reshape (1.3-2.9x faster). O2 wins on small-to-mid GEMMs. ANE excels on transformer-shaped and MLP matmuls.
-
-#### Element-wise Arithmetic
-
-| Benchmark | Description | MPSGraph | Metal O2 | Metal O3 | GPU+ANE | Best vs MPSGraph |
-|-----------|-------------|----------|----------|----------|---------|-------------------|
-| ARITH-B-001 | Add 1024x1024 | 2.52 | 0.96 | **0.75** | 0.75 | 3.35x (ANE) |
-| ARITH-B-002 | Add 4096x4096 | 12.20 | 10.30 | 16.43 | **8.75** | 1.40x (ANE) |
-| ARITH-B-003 | Add 8192x8192 | **57.7** | 169.1 | 138.5 | 148.1 | MPSGraph best |
-| ARITH-B-004 | Mul 1024x1024 | 2.66 | **0.79** | 0.83 | 0.88 | 3.38x (O2) |
-| ARITH-B-005 | Mul 4096x4096 | 11.91 | **10.12** | 10.43 | 13.97 | 1.18x (O2) |
-| ARITH-B-006 | Div 1024x1024 | 2.16 | 0.97 | **0.80** | 1.15 | 2.69x (O3) |
-| ARITH-B-007 | Pow 1024x1024 | 2.52 | **0.97** | 0.98 | 1.03 | 2.59x (O2) |
-| ARITH-B-008 | Max 4096x4096 | 11.85 | 12.46 | 9.42 | **8.32** | 1.42x (ANE) |
-| ARITH-U-001 | Exp 1024x1024 | 1.23 | 0.61 | **0.57** | 0.85 | 2.14x (O3) |
-| ARITH-U-002 | Log 4096x4096 | 8.07 | 5.01 | **4.90** | 5.08 | 1.65x (O3) |
-| ARITH-U-003 | Tanh 1024x1024 | 1.54 | **0.52** | 0.52 | 0.81 | 2.96x (O3) |
-| ARITH-U-004 | Sqrt 4096x4096 | 8.02 | **4.61** | 4.79 | 5.30 | 1.74x (O2) |
-| ARITH-U-005 | Rsqrt 4096x4096 | 8.71 | 5.65 | 5.74 | **5.57** | 1.56x (ANE) |
-| ARITH-U-006 | Sigmoid 1024x1024 | 1.34 | 0.70 | **0.70** | 0.79 | 1.93x (O3) |
-| ARITH-BC-001 | Add row broadcast | 1.35 | 1.34 | **0.93** | 1.10 | 1.45x (O3) |
-| ARITH-BC-002 | Add scalar broadcast | 1.29 | 1.00 | 0.99 | **0.81** | 1.58x (ANE) |
-| ARITH-BC-003 | Mul last-dim broadcast | 0.48 | **0.39** | 0.44 | 0.54 | 1.23x (O2) |
-
-**Takeaway:** Metal backends are **1.2-3.4x faster** than MPSGraph on element-wise operations. The advantage is largest on 1024x1024 tensors (2.1-3.4x); on 4096x4096 tensors MPSGraph has improved significantly (macOS 15.6), narrowing the gap to 1.2-1.7x. O2, O3, and ANE all trade wins.
-
-#### Reduction Operations
-
-| Benchmark | Description | MPSGraph | Metal O2 | Metal O3 | GPU+ANE | Best vs MPSGraph |
-|-----------|-------------|----------|----------|----------|---------|-------------------|
-| RED-001 | Global sum 1024x1024 | 0.91 | 0.96 | 0.89 | **0.86** | 1.06x (ANE) |
-| RED-002 | Row-wise sum 1024x1024 | 1.03 | **0.87** | 1.09 | 0.95 | 1.18x (O2) |
-| RED-003 | Column-wise sum 1024x1024 | 0.90 | **0.82** | 0.83 | 0.84 | 1.10x (O2) |
-| RED-004 | Row-wise max 4096x4096 | **4.21** | 6.25 | 5.91 | 6.17 | MPSGraph best |
-| RED-005 | LayerNorm reduction 32x128x768 | 2.72 | 1.29 | **0.95** | 1.09 | 2.86x (O3) |
-| RED-006 | Attention reduction 32x12x512x512 | **22.49** | 47.37 | 46.81 | 37.49 | MPSGraph best |
-
-**Takeaway:** Metal backends win on 1024x1024 reductions (1.1-1.2x). O3 excels on LayerNorm reduction (2.9x). On larger reductions (4096x4096 and attention-shaped), MPSGraph wins thanks to macOS 15.6 improvements.
-
-#### Convolution
-
-| Benchmark | Description | MPSGraph | Metal O2 | Metal O3 | GPU+ANE | Best vs MPSGraph |
-|-----------|-------------|----------|----------|----------|---------|-------------------|
-| CONV-001 | ResNet first layer | **1.92** | 1.91 | 2.24 | 2.78 | ~1.00x |
-| CONV-002 | ResNet stage2 3x3 | **1.16** | 3.36 | 3.09 | 1.16 | MPSGraph best |
-| CONV-003 | ResNet stage3 3x3 | **1.06** | 3.64 | 3.15 | 1.36 | MPSGraph best |
-| CONV-004 | ResNet stage4 3x3 | **1.73** | 3.45 | 2.77 | 2.01 | MPSGraph best |
-| CONV-005 | Batched conv | **11.79** | 34.94 | 34.42 | 20.22 | MPSGraph best |
-| CONV-006 | 1x1 pointwise | 0.83 | 0.71 | **0.68** | 1.75 | 1.22x (O3) |
-| CONV-007 | Depthwise-like | 1.61 | 4.88 | 5.24 | **1.54** | 1.05x (ANE) |
-
-**Takeaway:** MPSGraph dominates convolutions thanks to Apple's highly optimized `MPSCNNConvolution` kernels. Metal O3 wins on 1x1 pointwise convolutions. ANE occasionally beats MPSGraph on depthwise patterns.
-
-#### Normalization
-
-| Benchmark | Description | MPSGraph | Metal O2 | Metal O3 | GPU+ANE | Best vs MPSGraph |
-|-----------|-------------|----------|----------|----------|---------|-------------------|
-| NORM-BN-001 | ResNet BN | 0.42 | **0.24** | 0.28 | 0.39 | 1.76x (O2) |
-| NORM-BN-002 | Batched ResNet BN | 8.06 | 3.83 | **2.43** | FAIL | 3.32x (O3) |
-| NORM-BN-003 | Mid-layer BN | 0.35 | **0.18** | 0.21 | 0.19 | 1.90x (O2) |
-| NORM-BN-004 | Late-layer BN | 0.29 | **0.17** | 0.38 | 0.19 | 1.70x (O2) |
-| NORM-LN-001 | BERT-base LayerNorm | 0.57 | **0.52** | 0.56 | 0.59 | 1.09x (O2) |
-| NORM-LN-002 | BERT-base batched LN | **4.42** | 6.17 | 6.87 | 6.46 | MPSGraph best |
-| NORM-LN-003 | BERT-large single LN | **1.36** | 1.77 | 2.17 | 1.63 | MPSGraph best |
-| NORM-LN-004 | Long sequence LN | **15.67** | 20.90 | 21.10 | 23.02 | MPSGraph best |
-
-**Takeaway:** Metal O2 excels at batch normalization (1.7-1.9x faster). O3 wins on large batched BN (3.3x). MPSGraph wins on layer normalization, where its native implementation is well-optimized.
-
-#### Transformer Components
-
-| Benchmark | Description | MPSGraph | Metal O2 | Metal O3 | GPU+ANE | Best vs MPSGraph |
-|-----------|-------------|----------|----------|----------|---------|-------------------|
-| XFMR-INF-001 | Self-attention seq=128 | 2.76 | 2.51 | **2.19** | 2.41 | 1.26x (O3) |
-| XFMR-INF-002 | Self-attention seq=512 | **7.61** | 7.85 | 8.28 | 7.82 | MPSGraph best |
-| XFMR-INF-003 | Self-attention BS=8 seq=128 | **8.80** | 9.45 | 9.43 | 9.22 | MPSGraph best |
-| XFMR-INF-004 | Transformer FFN BS=8 | **11.27** | 18.24 | 16.71 | 16.02 | MPSGraph best |
-| XFMR-INF-005 | Softmax 8x12x128x128 | 2.53 | 2.34 | 2.29 | **2.29** | 1.11x (ANE) |
-| XFMR-INF-006 | Encoder block BS=1 seq=128 | 7.71 | **7.46** | 8.48 | 7.84 | 1.03x (O2) |
-
-**Takeaway:** MPSGraph wins on 3 of 6 transformer workloads (larger sequence lengths, FFN, batched attention). O3 excels on self-attention (1.3x). ANE is competitive on softmax.
-
-#### MLP Inference
-
-| Benchmark | Description | MPSGraph | Metal O2 | Metal O3 | GPU+ANE | Best vs MPSGraph |
-|-----------|-------------|----------|----------|----------|---------|-------------------|
-| MLP-INF-001 | 784->256->10 BS=1 | 0.64 | **0.45** | 0.45 | 0.80 | 1.43x (O2) |
-| MLP-INF-002 | 784->256->10 BS=32 | **0.41** | 0.43 | 0.44 | 0.60 | MPSGraph best |
-| MLP-INF-003 | 784->256->10 BS=128 | 0.60 | 0.72 | 0.47 | **0.45** | 1.35x (ANE) |
-| MLP-INF-004 | Deep MLP 4-layer BS=32 | 1.05 | 0.91 | 0.80 | **0.75** | 1.40x (ANE) |
-| MLP-INF-005 | FFN 768->3072->768 BS=32 | 4.35 | 1.77 | **1.58** | 1.84 | 2.75x (O3) |
-
-**Takeaway:** Metal backends are 1.4-2.8x faster than MPSGraph on MLPs. O3 wins the large FFN (2.8x). ANE excels on deep and batched MLPs. MPSGraph is fastest only on small batch sizes.
-
-#### Training
-
-| Benchmark | Description | MPSGraph | Metal O2 | Metal O3 | GPU+ANE | Best vs MPSGraph |
-|-----------|-------------|----------|----------|----------|---------|-------------------|
-| TRAIN-001 | MLP fwd+bwd BS=32 | **0.69** | 0.91 | 0.90 | 1.00 | ~1.00x |
-| TRAIN-003 | Attention fwd+bwd BS=8 | **7.25** | 10.29 | 10.82 | 11.12 | MPSGraph best |
-
-**Takeaway:** MPSGraph leads on training workloads where its backward-pass graph optimization provides an advantage.
-
-### MLX Comparison (Apple M5 Pro)
-
-This section compares MetalHLO directly against [MLX](https://github.com/ml-explore/mlx) on a different machine — Apple M5 Pro (48 GB), macOS 26.4.1, Xcode 26.4. MLX is the reference for "what an end-to-end-tuned numerical kernel library can achieve on Apple Silicon," so it's the right yardstick for the codegen path.
-
-Measurements use the standalone `mlx-comparison` runner in **quick mode** (3 warmup, 10 measurements), `METALHLO_MATMUL_TF32=1`. **Speedup > 1.0x means MetalHLO is faster than MLX**; speedup < 1.0x means MLX is faster.
-
-#### Per-Category Geomean (60 benchmarks)
-
-The two columns show -O0 (no optimizer passes — kernel-level performance only) and -O3 (full pattern fusion: FFN, attention, LayerNorm fold into single Metal kernels). The opt-level deltas are biggest where the optimizer can collapse multi-op patterns into one fused kernel.
-
-| Category | Benchmarks | -O0 | **-O3** | -O3 wins |
-|---|---|---|---|---|
-| **model_mlp** | 5 | 1.28x | **1.81x** | **5 / 5** |
-| **normalization** | 4 | 0.60x | **1.09x** | 3 / 4 |
-| **matrix** | 16 | 0.76x | 0.72x | 4 / 16 |
-| **model_transformer** | 5 | 0.44x | 0.69x | 1 / 5 |
-| **arithmetic** | 17 | 0.57x | 0.58x | 2 / 17 |
-| **convolution** | 7 | 0.44x | 0.43x | 1 / 7 |
-| **reduction** | 6 | 0.41x | 0.35x | 0 / 6 |
-
-Three categories see large -O3 jumps:
-- **model_mlp** sweeps 5/5 against MLX. The FFN detector recognizes the canonical SiLU (`multiply(x, logistic(x))`) and ReLU (`maximum(x, 0)`) lowerings, so each `matmul → activation → matmul` block fuses into one `fused_ffn` Metal kernel. Greedy non-overlapping pattern selection handles deep MLPs (e.g. MLP-INF-004's 4-layer ReLU stack fuses into 2 fused_ffn ops).
-- **normalization** crosses MLX parity. The LayerNorm detector recognizes the expanded form `add(multiply(multiply(subtract(x, mean), rsqrt(...)), gamma), beta)` and folds it into one `fused_layer_norm`.
-- **model_transformer** improves but doesn't yet beat MLX on attention. The detector recognizes the numerically-stable softmax expansion (`divide(exp(subtract(scaled, max_bc)), sum_bc)`) and fuses Q@K + softmax + @V into one `fused_scaled_dot_product_attention`. MLX's `scaled_dot_product_attention` is still ~30% faster on the 4 / 5 sequences we measured.
-
-#### Headline Numbers
-
-| ID | Description | MetalHLO (ms) | MLX (ms) | Speedup | Notes |
-|---|---|---|---|---|---|
-All times in milliseconds, measured at -O3 with `METALHLO_MATMUL_TF32=1` on M5 Pro.
-
-| ID | Description | MetalHLO | MLX | Speedup | Notes |
-|---|---|---|---|---|---|
-| MAT-DOT-005 | GEMM 4096² | 8.24 | 7.47 | **0.91x** | Matrix coprocessor; gap is ~1ms TF32 input-convert overhead |
-| MAT-DOT-002 | GEMM 512² | 0.53 | 0.54 | **1.02x** | Parity |
-| MLP-INF-001 | MLP 784→256→10 BS=1 (3-layer ReLU) | 0.22 | 0.27 | **1.22x** | FFN fusion + chain ReLU detection |
-| MLP-INF-005 | FFN 768→3072→768 BS=32 (SiLU) | 0.86 | 3.97 | **4.63x** | FFN fusion |
-| ATTN-002 | Self-attention BS=8 H=12 S=128 D=64 | 0.65 | 0.45 | 0.69x | Attention fusion fires; MLX's primitive ~30% faster on this shape |
-| NORM-LN-002 | LayerNorm 32×128×768 (BERT-base batched) | 1.42 | 0.66 | 0.46x | LayerNorm fusion fires; MLX still ahead on this exact shape |
-| RED-006 | Softmax reduction 32×12×512² | 6.03 | 1.65 | 0.27x | No reduction-pattern fusion yet |
-
-**Takeaway.** Three classes of speedup are now active in -O3:
-1. **Kernel-level**: MAT-DOT-005 hits 0.91x of MLX via the MetalPerformancePrimitives matrix coprocessor primitive. The remaining ~1ms is the fp32→fp16 input convert overhead the TF32 transform pays.
-2. **Pattern fusion**: FFN, attention, and LayerNorm patterns expressed as expanded primitive ops (the form most graph-emitters produce) now collapse into single fused Metal kernels. MLP-INF-005 hits 4.63x; all 5 model_mlp benchmarks beat MLX. Attention closes the gap from 0.61x to 0.69x — fusion fires but MLX's kernel is still faster on most shapes.
-3. **Reductions and convolution**: still bounded by per-kernel performance — neither has a fused-pattern path yet, so MLX's hand-tuned kernels remain ahead.
-
-#### Reproducing These Numbers
-
-Requires macOS 26+ and an Apple9-class GPU (M3, M3 Pro/Max/Ultra, M4, M5, M5 Pro/Max/Ultra) for the MPP path; on older OS or GPUs the build still works and the runtime falls back to the simdgroup_matrix kernel automatically.
-
-```bash
-# Build the comparison runner. Must be xcodebuild, not `swift build` —
-# MLX bundles a Metal library that swiftpm doesn't compile.
-xcodebuild build \
-  -scheme mlx-comparison \
-  -configuration Release \
-  -destination 'platform=OS X' \
-  -derivedDataPath .build/xcode
-
-BIN=.build/xcode/Build/Products/Release/mlx-comparison
-RESULTS=results/mlx_comparison_m5pro
-mkdir -p "$RESULTS"
-
-# Run all 7 categories at -O3, save JSON + Markdown per category.
-for cat in matrix arithmetic reduction convolution \
-           normalization model_mlp model_transformer; do
-  METALHLO_MATMUL_TF32=1 "$BIN" --quick -O3 -c "$cat" \
-    -o "$RESULTS/$cat.json"
-done
-
-# Single-benchmark spot check (the headline matmul):
-METALHLO_MATMUL_TF32=1 "$BIN" --quick -O3 -f MAT-DOT-005
-
-# Show which optimizer passes fire on a given benchmark (one line per pass,
-# `[*]` if the pass changed the IR). Use this to diagnose patterns the
-# detector doesn't yet match:
-METALHLO_DEBUG_PASSES=1 METALHLO_MATMUL_TF32=1 "$BIN" --quick -O3 -f MLP-INF-005
-
-# Force the simdgroup_matrix fallback path (verifies the M1/M2 / pre-macOS-26
-# code path produces the same correct results, just slower):
-METALHLO_MATMUL_TF32=1 METALHLO_DISABLE_MPP=1 "$BIN" --quick -O3 -f MAT-DOT-005
-```
-
-Per-category JSON and Markdown reports are written to the directory passed via `-o`. Each `.md` file has the header (chip, OS, build), the summary stats (geomean, win count, mean speedup), and the per-benchmark detail table.
-
-**Environment variables that affect this comparison:**
-
-| Variable | Default | Effect |
-|---|---|---|
-| `METALHLO_MATMUL_TF32` | `0` | When `1`, wraps fp32 dot/dot_general with `convert(fp32→fp16)` ops so the matmul itself runs at fp16. The MPP kernel uses `half × half → float` natively, fusing the output cast in-register. Required to hit MLX-class throughput on large GEMMs. |
-| `METALHLO_DISABLE_MPP` | `0` | When `1`, disables the MetalPerformancePrimitives matmul path even on capable hardware — MetalHLO falls back to its simdgroup_matrix kernel. Use as a kill switch for diagnosing kernel-compile or correctness regressions on a particular machine. |
-| `METALHLO_FORCE_MPSGRAPH` | `0` | When `1`, routes every op through MPSGraph instead of codegen. Bypasses the optimizer; useful as a sanity check, not for production. |
-| `METALHLO_DEBUG_PASSES` | `0` | When `1`, the optimizer prints one line per pass (`[*] pass-name ops: N -> M`, asterisk = changed) to stderr. Use to diagnose why a benchmark looks unchanged at -O3 — empty marker means the pattern detector didn't match the input IR. |
-
-#### Caveats
-
-- **Hardware-specific.** All numbers are M5 Pro / macOS 26.4.1. The MPP path requires Apple9 GPU family and Metal language 4.0; on M1/M2 or pre-macOS-26 the runtime gate (`device.supportsFamily(.apple9)` plus `#available(macOS 26.0, *)`) silently selects the simdgroup_matrix fallback. The simdgroup_matrix path is what users on those machines will hit, with results similar to the M1 multi-backend tables above.
-- **Run-to-run variance.** Quick mode (3 warmup, 10 measurements) keeps total wall time around 30 seconds across all 7 categories but introduces ±10–15% noise on benchmarks under 1ms. The headline numbers (MAT-DOT-005, MLP-INF-005) are stable across repeated runs; small-shape numbers fluctuate.
-- **MLX is the ceiling, not the universal target.** MLX is a hand-tuned numerical library; matching it on every shape isn't the goal. MetalHLO's reason to exist is the optimizer + heterogeneous fusion that MLX doesn't have. The matmul work documented here is specifically about closing the kernel-throughput gap so the optimizer can compose with kernels that aren't slower than the alternatives users would otherwise reach for.
-
-#### End-to-End Training Gap (nanoGPT) — Investigation Status
-
-The microbenchmarks above are forward-only (inference), where pattern fusion is free to fold FFN / attention / LayerNorm into single kernels. The harder, ongoing target is a full **training step** — a 6-layer / 384-dim / 6-head nanoGPT (batch 16, seq 256, ~10.8 M params, char-level tinyshakespeare; `Examples/Benchmarks/nanogpt`) — where the reverse-mode autograd graph changes what fusion can do.
-
-**Where we stand (M5 Pro):** **74.4 ms/step vs MLX 59.5 ms (1.25×)**, down from 82.5 ms. The loss matches JAX CPU exactly at every step throughout.
-
-**Step composition.** GPU-busy is ~60.8 ms; the rest is host overhead (the per-step output handoff copy, command-buffer encode, PJRT / `.item()` sync). The pivotal fact: **GPU-busy alone already ≈ MLX's *entire* 59.5 ms step.** So the tractable headroom was the host overhead, not the GPU-side glue.
-
-**Landed (all loss-neutral):**
-- **Reshape-as-view** — a reshape of a contiguous source (a kernel output or input) aliases that buffer instead of running a copy kernel, with the memory planner keeping the source live across the view's readers. Eliminated ~95 kernels/step.
-- **Parallel output handoff** — the 162-output (~130 MB) copy out of the reused intermediate slab now runs concurrently instead of serially.
-- **Pipelined command buffers** — the ~900-kernel encode is split across command buffers committed incrementally, so the GPU runs chunk *k* while the CPU encodes chunk *k+1*.
-
-**Investigated, found bounded by reverse-mode autodiff** — three glue levers each profiled to a dead end:
-- **Rematerialization** — this MLP is ReLU (no expensive forward intermediate like a GELU `tanh(x³)` worth recomputing), and roughly half the standalone glue is *terminal gradient outputs* (return values, unfusable by anything).
-- **Transpose-into-matmul** — the simple `transA/transB` cases are already absorbed natively by the matmul path; the survivors are 4-D attention head-permutations that would need a strided-operand matmul kernel (unverified hardware surface, ~3 ms ceiling).
-- **Chain / reduce fusion** — the valuable same-shape chain merges are already done by producer-consumer fusion; the remaining chain boundaries are either *multi-use* (a forward value also consumed by the backward pass) or broadcast-shape-changes of a tiny reduced tensor (negligible traffic saved, adds recompute).
-
-The common root is structural: **reverse-mode AD materializes forward activations for the backward pass, making them multi-use** — which both breaks elementwise chains at every branch and makes forward pattern fusion (FFN / attention / LayerNorm) unsafe on the training graph, unlike the inference microbenchmarks above. With GPU-busy already at MLX's step time and matmul (~40 % of GPU) at the TF32 / matrix-coprocessor limit, the residual gap is systemic rather than a single missing optimization. nanoGPT runs at the default optimization level (the gpu-only codegen path), not -O3.
-
-**Reproduce / profile:**
-
-```bash
-# steady-state ms/step + final loss (compare against the JAX CPU baseline)
-python Examples/Benchmarks/nanogpt/main.py --backend metalhlo --steps 30 --skip-inference
-python Examples/Benchmarks/nanogpt/main.py --backend cpu       --steps 30 --skip-inference
-
-METALHLO_PROFILE_GPU=1    ...   # GPU-busy vs wall-clock per step
-METALHLO_PROFILE_PER_OP=1 ...   # per-kernel-type GPU share
-METALHLO_PIPELINE_CHUNK=0 ...   # disable encode pipelining (single command buffer)
-```
-
-### Backend Win Summary
-
-Overall wins across all 67 passing benchmarks:
-
-| Backend | Wins | Best For |
-|---------|------|----------|
-| **MPSGraph** | 20 | Large GEMMs, convolutions, layer norm, large reductions, training |
-| **Metal O2** | 18 | Batch norm, small matmuls, element-wise ops |
-| **Metal O3** | 16 | Transpose, reshape, batched ops, softmax, FFN fusion |
-| **GPU+ANE** | 13 | Element-wise, MLP inference, transformer-shaped matmuls |
-
-### When to Use Each Backend
-
-| Use Case | Recommended Backend | Why |
-|----------|-------------------|-----|
-| Large matrix multiply (≥1024x1024) | MPSGraph (default) | Apple's tuned `MPSMatrixMultiplication` |
-| Convolution-heavy models (CNNs) | MPSGraph (default) | `MPSCNNConvolution` is highly optimized |
-| Training (forward + backward) | MPSGraph (default) | Graph-level backward pass optimization |
-| Element-wise heavy workloads | Metal O2/O3 | 1.2-3.4x faster than MPSGraph |
-| Batch normalization | Metal O2 | 1.7-1.9x faster custom kernels |
-| Transpose / reshape / batched ops | Metal O3 | Pattern fusion + scheduling (2-3x faster) |
-| MLP / FFN inference | Metal O3 or ANE | O3 wins large FFN (2.8x), ANE wins deep MLPs |
-| Debugging/development | MPSGraph (default) | Broadest compatibility, no compilation |
-
-### Benchmark Categories
-
-| Category | Benchmarks | Description |
-|----------|------------|-------------|
-| **Matrix Operations** | MAT-DOT-001 to MAT-DOT-008, MAT-BATCH-001 to MAT-BATCH-004, MAT-TR-*, MAT-RSH-* | GEMM, batched GEMM, transpose, reshape |
-| **Arithmetic** | ARITH-B-001 to ARITH-B-008, ARITH-BC-*, ARITH-U-* | Binary, broadcast, and unary operations |
-| **Reduction** | RED-001 to RED-009 | Sum, max, mean, pooling operations |
-| **Convolution** | CONV-001 to CONV-007 | Standard conv2d patterns (ResNet, VGG) |
-| **Normalization** | NORM-BN-*, NORM-LN-* | Batch norm, layer norm |
-| **Control Flow** | CF-001 to CF-005 | While loops, conditionals |
-| **Indexing** | IDX-001 to IDX-007 | Slice, gather, scatter, pad |
-| **Model Inference** | MLP-INF-*, CNN-INF-*, XFMR-INF-* | MLP, CNN, Transformer components |
-| **Training** | TRAIN-001 to TRAIN-003 | Forward + backward pass benchmarks |
-| **Compiler Analysis** | COMP-001 to COMP-005 | Compilation time for various program sizes |
-| **Fusion Analysis** | FUSION-001 to FUSION-004 | Fused vs naive execution comparison |
-| **Memory** | MEM-001 to MEM-003 | Peak allocation, buffer reuse |
-| **Power Efficiency** | PWR-001 to PWR-003 | Throughput per watt estimates |
-
-### Running Benchmarks
-
-```bash
-# Build in release mode for accurate measurements
-swift build -c release --product benchmark-runner
-
-# Multi-backend comparison (recommended)
-.build/release/benchmark-runner --compare -q -c matrix        # Matrix operations
-.build/release/benchmark-runner --compare -q -c arithmetic    # Element-wise ops
-.build/release/benchmark-runner --compare -q -c model_transformer  # Transformer
-.build/release/benchmark-runner --compare -q                  # All categories
-
-# Single-backend benchmarks
-.build/release/benchmark-runner --category matrix
-.build/release/benchmark-runner --all
-
-# MLX comparison (requires MLX)
-swift build -c release --product mlx-comparison
-.build/release/mlx-comparison --quick
-.build/release/mlx-comparison --category matrix
-
-# Heterogeneous fusion benchmarks (GPU+MPS+CPU partitioning)
-swift build -c release --product HeterogeneousFusionBenchmark
-.build/release/HeterogeneousFusionBenchmark
-
-# GPT-2 end-to-end validation (profitability guard + crossover analysis)
-swift build -c release --product GPT2EndToEnd
-.build/release/GPT2EndToEnd
-
-# Hardware calibration test
-swift build -c release --product CalibrateTest
-.build/release/CalibrateTest
-```
-
-### Benchmark Framework Features
-
-The benchmark framework provides:
-
-- **Timing Statistics**: Mean, std dev, min, max, p95, p99
-- **GPU Synchronization**: Accurate timing with Metal command buffer completion
-- **Warmup Support**: Configurable warmup iterations to avoid cold-start effects
-- **Reproducibility**: Seeded random data generators
-- **Multiple Output Formats**: Console, JSON, CSV
-
-```swift
-// Running benchmarks programmatically
-import MetalHLOBenchmarks
-
-let config = BenchmarkConfig(warmupIterations: 10, measurementIterations: 50)
-let runner = try BenchmarkRunner(config: config)
-
-// Run all matrix benchmarks
-let results = try runner.run(OperationBenchmarks.matrixBenchmarks())
-
-// Access timing statistics
-for result in results {
-    print("\(result.id): \(result.timing.mean * 1000)ms ± \(result.timing.stdDev * 1000)ms")
-}
-```
-
-### GPU Utilization Metrics
-
-The framework includes utilities for measuring GPU efficiency:
-
-```swift
-import MetalHLOBenchmarks
-
-// Detect hardware and calculate utilization
-let calculator = GPUMetricsCalculator()
-
-// After running a 1024x1024 matmul in 2.5ms
-let metrics = calculator.calculateMatMulMetrics(
-    m: 1024, n: 1024, k: 1024,
-    executionTimeSeconds: 0.0025
-)
-
-print(metrics.formatted())
-// Hardware: Apple M1
-// Compute: 0.86 / 2.60 TFLOPS (33.1% utilization)
-// Memory BW: 6.7 / 68.25 GB/s (9.8% utilization)
-```
-
-### Fusion Effectiveness Analysis
-
-Measure the benefit of operation fusion:
-
-```swift
-import MetalHLOBenchmarks
-
-let runner = FusionAnalysisRunner()
-let results = try runner.runAll()
-
-for result in results {
-    print(result.formatted())
-    // FUSION-001: Fused=1.23ms, Naive=3.45ms, Speedup=2.80x (expected: 2-3x)
-}
 ```
 
 ## License
 
-Apache License 2.0 - see [LICENSE](LICENSE) for details.
+Apache License 2.0 — see [LICENSE](LICENSE).
 
 ## References
 
@@ -1459,7 +319,3 @@ Apache License 2.0 - see [LICENSE](LICENSE) for details.
 - [MPSGraph Documentation](https://developer.apple.com/documentation/metalperformanceshadersgraph)
 - [PJRT C API Specification](https://github.com/openxla/xla/tree/main/xla/pjrt/c)
 - [MLIR Language Reference](https://mlir.llvm.org/docs/LangRef/)
-
----
-
-**MetalHLO** — Bringing StableHLO to Apple Silicon
