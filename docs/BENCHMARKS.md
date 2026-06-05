@@ -243,6 +243,7 @@ All times in milliseconds, measured at -O3 with `METALHLO_MATMUL_TF32=1` on M5 P
 | RED-006 | Sum-reduce axis-3 32×12×512² | 1.91 | 1.54 | 0.81x | MLX-mirroring float4 row-reduction kernel (was 0.27x before that kernel) |
 | RED-001 | Global sum 1024² | 0.38 | 0.26 | 0.69x | 2-stage reduction split — was 0.99ms / 0.26x in a single threadgroup |
 | RED-003 | Column sum 1024² | 0.38 | 0.27 | 0.71x | Coalesced 2D-threadgroup column kernel — was 0.58ms / 0.48x (uncoalesced) |
+| CONV-003 | ResNet stage3 3×3 | 0.51 | 0.53 | 1.05x | Auto-routed to MPSCNNConvolution — naive codegen kernel was 2.13ms / 0.22x |
 
 **Takeaway.** Three classes of speedup are active in -O3:
 1. **Kernel-level**: MAT-DOT-005 hits 0.91x of MLX via the MetalPerformancePrimitives
@@ -254,14 +255,13 @@ All times in milliseconds, measured at -O3 with `METALHLO_MATMUL_TF32=1` on M5 P
 3. **Reductions**: the common axis/row reductions (RED-006, softmax-shaped) are competitive
    (0.81x) via the MLX-mirroring float4 kernel; the global reduction (RED-001) was lifted
    0.27x → 0.69x by the 2-stage split, and the column reduction (RED-003) 0.48x → 0.71x by
-   the coalesced kernel. Reductions are now ~0.85x geomean. **Convolution**: the 0.36x here is
-   the **-O3 pure-codegen path**, which uses a naive 1-thread-per-output direct-convolution
-   kernel. That path is NOT what convolution workloads actually use: the PJRT/JAX default
-   policy is `.auto`, which routes convolution to Apple's `MPSCNNConvolution` via the
-   heterogeneous path. Run through MPSGraph (`METALHLO_FORCE_MPSGRAPH=1`), the same conv
-   benchmarks hit **~0.93x geomean vs MLX, winning 4/8** — at parity. This is why ResNet18
-   trains at 8.7x. So convolution is effectively at parity for real workloads; the codegen
-   kernel is the only slow path and is bypassed by default.
+   the coalesced kernel. Reductions are now ~0.85x geomean. **Convolution** is at parity:
+   **0.95x geomean, winning 5/8**. The pure-codegen path lowers conv to a naive
+   1-thread-per-output kernel (~0.36x), so `Client.compile` now auto-routes any
+   convolution-containing graph through the heterogeneous/MPSGraph path
+   (`MPSCNNConvolution`) — on every policy, not just `.auto` — and only the opt-out
+   `METALHLO_CONV_MPSGRAPH=0` reaches the naive kernel. This is the same path that
+   trains ResNet18 at 8.7x.
 
 ### Reproducing These Numbers
 
@@ -309,6 +309,7 @@ METALHLO_MATMUL_TF32=1 METALHLO_DISABLE_MPP=1 "$BIN" --quick -O3 -f MAT-DOT-005
 | `METALHLO_DEBUG_PASSES` | `0` | When `1`, the optimizer prints one line per pass (`[*] pass-name ops: N -> M`, asterisk = changed) to stderr. |
 | `METALHLO_SPLIT_REDUCE` | `1` | On by default. When `0`, disables the 2-stage split of large global (all-axes) reductions — they fall back to the single-threadgroup kernel. |
 | `METALHLO_COALESCED_COLREDUCE` | `1` | On by default. When `0`, disables the coalesced 2D-threadgroup kernel for long-axis column reductions — they fall back to the general (uncoalesced) reduce kernel. |
+| `METALHLO_CONV_MPSGRAPH` | `1` | On by default. When `0`, a convolution-containing graph compiled with `.gpuOnly` uses the naive codegen conv kernel instead of auto-routing to MPSGraph (`MPSCNNConvolution`). |
 
 ### Caveats
 

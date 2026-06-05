@@ -248,9 +248,9 @@ Two campaigns, full data in **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)**:
   0.91× via the MetalPerformancePrimitives matrix coprocessor. Attention fusion fires but
   MLX's hand-tuned kernel is still ~30% faster. Reductions are now ~0.85× geomean — global
   (0.27×→0.69×, 2-stage split) and column (0.48×→0.71×, coalesced kernel) reductions were
-  both fixed. Convolution is at parity (~0.93×, wins 4/8) on the default `.auto` policy that
-  routes it to Apple's `MPSCNNConvolution` — only the pure-codegen path's naive conv kernel
-  is slow, and JAX/CNN workloads don't use it (hence ResNet18 at 8.7×).
+  both fixed. Convolution is at parity (~0.95×, wins 5/8): any conv-containing graph
+  auto-routes to Apple's `MPSCNNConvolution` (the path that trains ResNet18 at 8.7×), so the
+  naive codegen conv kernel is only reached via `METALHLO_CONV_MPSGRAPH=0`.
 
 **End-to-end training vs JAX CPU (M5 Pro):**
 

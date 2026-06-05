@@ -160,6 +160,19 @@ public final class Client: @unchecked Sendable {
             return try compileHeterogeneous(mlir, config: config)
         }
 
+        // The pure-codegen path lowers convolution to a naive 1-thread-per-output
+        // direct-conv kernel (~3-4x slower than Apple's MPSCNNConvolution). When
+        // the graph contains a convolution, upgrade to the heterogeneous path,
+        // which routes conv to MPSGraph (≈MLX parity) while keeping the fast
+        // codegen kernels for everything else. Opt out with
+        // METALHLO_CONV_MPSGRAPH=0 to force the codegen conv kernel.
+        if ProcessInfo.processInfo.environment["METALHLO_CONV_MPSGRAPH"] != "0",
+           mlir.contains("stablehlo.convolution") {
+            var hetConfig = config
+            hetConfig.devicePolicy = .auto
+            return try compileHeterogeneous(mlir, config: hetConfig)
+        }
+
         // ─── O3 is UNDER REPAIR and gated off for users ──────────────────
         // -O3 (aggressivePasses) enables the pattern-fusion stack — but those
         // passes currently hit broken/incomplete code: a cross-layer
