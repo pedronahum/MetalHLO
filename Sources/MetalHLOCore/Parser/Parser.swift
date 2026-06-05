@@ -206,6 +206,16 @@ public final class Parser {
                 if let first = resolvedOperands.first {
                     valueAliases[op.result] = first
                 }
+            } else if op.kind == .allReduce {
+                // Cross-replica all-reduce. On a single device the replica group
+                // has size 1, so the reducer over one value is the identity:
+                // alias the result to the operand (like optimization_barrier).
+                // The multi-device reduction is performed by the distributed
+                // runtime, which intercepts this op before this single-device
+                // alias collapse. (Multi-partition modules are still rejected
+                // up front, so only single-device programs reach here today.)
+                let src = resolveAlias(op.operands.first ?? "", aliases: valueAliases)
+                valueAliases[op.result] = src
             } else if op.kind == .reduce && op.resultCount >= 2
                         && op.attributes.argReduceIndexType != nil {
                 // Multi-input argmax/argmin reduce: a single 2-result op
@@ -1107,7 +1117,8 @@ public final class Parser {
         // These appear after attributes and before the type signature.
         // Also handles reduce_window in generic form, where the reduction op is
         // expressed as an inline region (Flax avg_pool / max_pool emit this).
-        if (kind == .scatter || kind == .selectAndScatter || kind == .reduceWindow)
+        if (kind == .scatter || kind == .selectAndScatter || kind == .reduceWindow
+            || kind == .allReduce)
             && check(.leftParen) {
             // Skip one or more inline regions: ({...}) or ({...}, {...}).
             // select_and_scatter has TWO regions (select predicate + scatter

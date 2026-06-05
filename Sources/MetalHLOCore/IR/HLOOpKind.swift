@@ -182,6 +182,12 @@ public enum HLOOpKind: String, CaseIterable, Sendable {
     /// Reduction operation (sum, max, min, etc.).
     case reduce
 
+    /// Cross-replica all-reduce collective (jax.lax.psum). Carries a reducer
+    /// region + replica_groups/channel_handle. On a single device (replica
+    /// group of size 1) it is the identity; multi-device reduction is handled
+    /// by the distributed runtime.
+    case allReduce = "all_reduce"
+
     /// Reduction over sliding windows (pooling).
     case reduceWindow = "reduce_window"
 
@@ -508,7 +514,7 @@ extension HLOOpKind {
              .iota, .tan, .logistic, .isFinite, .reverse, .fft, .sort,
              .expm1, .log1p, .cbrt, .roundNearestAfz, .roundNearestEven,
              .popcnt, .real, .imag, .cholesky, .svd, .qr, .eigh, .bitcastConvert, .reducePrecision,
-             .topKValues, .topKIndices, .reduceArg:
+             .topKValues, .topKIndices, .reduceArg, .allReduce:
             return .exactly(1)
 
         // Binary

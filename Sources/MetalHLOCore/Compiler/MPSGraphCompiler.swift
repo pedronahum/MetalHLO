@@ -752,6 +752,15 @@ public final class MPSGraphCompiler {
             return try compileTriangularSolve(op)
         case .cholesky:
             return try compileCholesky(op)
+        case .allReduce:
+            // Single-replica all_reduce is the identity and is alias-eliminated
+            // in the parser before any backend sees it; multi-device reduction
+            // is handled by the distributed runtime. Reaching the MPSGraph
+            // compiler means neither happened — fail loudly rather than drop the
+            // collective and compute a wrong (un-reduced) result.
+            throw CompilationError.unsupportedOperation(
+                "all_reduce reached MPSGraph compile — single-replica should be alias-eliminated; "
+                + "multi-device all_reduce is not yet supported on this backend")
         case .svd:
             // SVD runs host-side via the hostSvdShortcut path; the whole function
             // is detected and bypassed before the graph is built, so reaching the
