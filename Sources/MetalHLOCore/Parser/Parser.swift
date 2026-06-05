@@ -1025,6 +1025,21 @@ public final class Parser {
         } else if kind == .customCall {
             // Special handling for custom_call which has @target(operands) format
             (operands, attributes) = try parseCustomCallOperandsAndAttributes()
+        } else if kind == .allReduce {
+            // Pretty form (what JAX/PJRT emits):
+            //   stablehlo.all_reduce %operand, channel_handle = ...,
+            //     replica_groups = dense<...> : tensor<...>, use_global_device_ids
+            //     ({ ^bb0(%a,%b): stablehlo.add ... }) : (T) -> T
+            // The inline attribute list has no braces, and replica_groups carries
+            // its own `:` type — so skip every token up to the reducer region's
+            // '(' (the first paren after the operand). The region-skip block
+            // below then consumes ({reducer}), and the type signature follows.
+            let operand = try parsePercentIdentifier()
+            operands.append(operand)
+            _ = match(.comma)
+            while !check(.leftParen) && !check(.eof) {
+                advance()
+            }
         } else if kind == .reduce {
             // Special handling for reduce: (%input init: %init) applies stablehlo.add across dimensions = [0]
             (operands, attributes) = try parseReduceOperandsAndAttributes()

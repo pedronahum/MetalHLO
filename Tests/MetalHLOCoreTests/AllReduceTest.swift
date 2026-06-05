@@ -61,4 +61,31 @@ struct AllReduceTests {
         let result = try exe.execute([x])[0].toFloatArray()
         #expect(result == xin, "single-replica all_reduce should pass the input through, got \(result)")
     }
+
+    // The pretty assembly form JAX/PJRT actually emits: inline comma-separated
+    // attributes (no `<{...}>`), with replica_groups carrying its own `:` type.
+    @Test("all_reduce pretty form (JAX/PJRT assembly) parses and executes")
+    func allReducePrettyForm() async throws {
+        let mlir = """
+        module @all_reduce_pretty {
+          func.func @main(%arg0: tensor<8xf32>) -> (tensor<f32>) {
+            %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+            %0 = stablehlo.reduce(%arg0 init: %cst) applies stablehlo.add across dimensions = [0] : (tensor<8xf32>, tensor<f32>) -> tensor<f32>
+            %1 = stablehlo.all_reduce %0, channel_handle = #stablehlo.channel_handle<handle = 1, type = 0>, replica_groups = dense<0> : tensor<1x1xi64>, use_global_device_ids ({
+            ^bb0(%a: tensor<f32>, %b: tensor<f32>):
+              %2 = stablehlo.add %a, %b : tensor<f32>
+              stablehlo.return %2 : tensor<f32>
+            }) : (tensor<f32>) -> tensor<f32>
+            return %1 : tensor<f32>
+          }
+        }
+        """
+        let client = try Client.create()
+        let exe = try client.compile(mlir, config: CompilationConfig(optimizationLevel: .O2))
+        let xin: [Float] = [1, 2, 3, 4, 5, 6, 7, 8]
+        let x = try client.createBuffer(xin, shape: [8], elementType: .float32)
+        let result = try exe.execute([x])[0].toFloatArray()
+        // sum(1..8) = 36; single-replica all_reduce(sum) = identity = 36.
+        #expect(result == [36.0], "expected [36.0], got \(result)")
+    }
 }
