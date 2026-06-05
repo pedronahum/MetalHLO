@@ -254,9 +254,14 @@ All times in milliseconds, measured at -O3 with `METALHLO_MATMUL_TF32=1` on M5 P
 3. **Reductions**: the common axis/row reductions (RED-006, softmax-shaped) are competitive
    (0.81x) via the MLX-mirroring float4 kernel; the global reduction (RED-001) was lifted
    0.27x → 0.69x by the 2-stage split, and the column reduction (RED-003) 0.48x → 0.71x by
-   the coalesced kernel. Reductions are now ~0.85x geomean. **Convolution**: still bounded by
-   per-kernel performance with no fused-pattern path, so MLX's hand-tuned kernels remain
-   ahead — the largest single-category gap left.
+   the coalesced kernel. Reductions are now ~0.85x geomean. **Convolution**: the 0.36x here is
+   the **-O3 pure-codegen path**, which uses a naive 1-thread-per-output direct-convolution
+   kernel. That path is NOT what convolution workloads actually use: the PJRT/JAX default
+   policy is `.auto`, which routes convolution to Apple's `MPSCNNConvolution` via the
+   heterogeneous path. Run through MPSGraph (`METALHLO_FORCE_MPSGRAPH=1`), the same conv
+   benchmarks hit **~0.93x geomean vs MLX, winning 4/8** — at parity. This is why ResNet18
+   trains at 8.7x. So convolution is effectively at parity for real workloads; the codegen
+   kernel is the only slow path and is bypassed by default.
 
 ### Reproducing These Numbers
 
