@@ -161,22 +161,22 @@ public final class Client: @unchecked Sendable {
         }
 
         // Convolution and scaled-dot-product attention run far faster on Apple's
-        // MPSGraph kernels than on the codegen path (the codegen conv is a naive
-        // 1-thread-per-output kernel; attention runs as separate matmuls + softmax
-        // rather than MPSGraph's native `scaledDotProductAttention`). When the
-        // graph contains either, upgrade to the heterogeneous path, which routes
-        // those ops to MPSGraph (≈MLX parity, often faster) while keeping the fast
-        // codegen kernels for everything else.
+        // MPSGraph kernels than on the codegen path. Route them to an
+        // MPSGraph-backed compile; everything else uses compileGPUOnlyCodegen.
+        // This routing runs ONLY for a top-level gpuOnly request —
+        // compileHeterogeneous's own fall-backs call compileGPUOnlyCodegen
+        // directly, so a graph whose heterogeneous compile bails out cannot bounce
+        // back here and recurse (the bug that stack-overflowed on 4-D attention).
         let env = ProcessInfo.processInfo.environment
 
         // Attention = a (batched) dot_general feeding a softmax. `exponential`
         // identifies the softmax and distinguishes it from FFN activations
         // (ReLU = maximum, SiLU = logistic), so FFN graphs keep their codegen
-        // fusion instead of being diverted to MPSGraph. The pattern optimizer in
-        // the no-config compile fuses this into MPSGraph's native
-        // `scaledDotProductAttention` (≈MLX parity, often faster). We route to
-        // that pure-MPSGraph path rather than `.auto` because the heterogeneous
-        // partitioner currently faults on some 4-D attention shapes.
+        // fusion. The no-config compile's pattern optimizer fuses this into
+        // MPSGraph's native `scaledDotProductAttention` (≈MLX parity, often
+        // faster). Route to that pure-MPSGraph path rather than `.auto`: attention's
+        // matmuls aren't ANE-recommended, so `.auto` would just fall back to the
+        // slow codegen attention anyway.
         let hasAttention = env["METALHLO_ATTN_MPSGRAPH"] != "0"
             && mlir.contains("stablehlo.dot_general")
             && mlir.contains("stablehlo.exponential")
@@ -194,6 +194,15 @@ public final class Client: @unchecked Sendable {
             return try compileHeterogeneous(mlir, config: hetConfig)
         }
 
+        return try compileGPUOnlyCodegen(mlir, config: config)
+    }
+
+    /// The pure-codegen (Metal kernel) compile path. Separated from
+    /// `compile(_:config:)` so compileHeterogeneous's fall-backs can reach it
+    /// WITHOUT re-running the conv/attention → MPSGraph routing — otherwise a
+    /// graph that routes to heterogeneous and then falls back would re-route and
+    /// recurse until the stack overflows (SIGBUS).
+    private func compileGPUOnlyCodegen(_ mlir: String, config: CompilationConfig) throws -> Executable {
         // ─── O3 is UNDER REPAIR and gated off for users ──────────────────
         // -O3 (aggressivePasses) enables the pattern-fusion stack — but those
         // passes currently hit broken/incomplete code: a cross-layer
@@ -305,19 +314,21 @@ public final class Client: @unchecked Sendable {
         if module.function.operations.contains(where: { $0.kind == .whileOp }) {
             var gpuConfig = config
             gpuConfig.devicePolicy = .gpuOnly
-            return try compile(mlir, config: gpuConfig)
+            return try compileGPUOnlyCodegen(mlir, config: gpuConfig)
         }
 
         // Analyze whether heterogeneous execution is beneficial
         let analyzer = ANEAnalyzer()
         let analysis = analyzer.analyzeFunction(module.function)
 
-        // If no ops benefit from ANE, fall back to GPU-only
+        // If no ops benefit from ANE, fall back to GPU-only codegen. Call
+        // compileGPUOnlyCodegen (not compile) so the conv/attention routing does
+        // not re-fire and bounce back into this method — that recursion is what
+        // stack-overflowed on 4-D attention, whose matmuls aren't ANE-recommended.
         if analysis.aneRecommendedOps.isEmpty && config.devicePolicy != .aneOnly {
-            // Fall through to standard GPU compilation
             var gpuConfig = config
             gpuConfig.devicePolicy = .gpuOnly
-            return try compile(mlir, config: gpuConfig)
+            return try compileGPUOnlyCodegen(mlir, config: gpuConfig)
         }
 
         // Create heterogeneous executor

@@ -229,10 +229,10 @@ Three categories see large -O3 jumps:
   distinguishes it from FFN activations) to MPSGraph's native
   `scaledDotProductAttention` — faster than the codegen separate-matmul path and ahead of
   MLX on all four ATTN benchmarks (1.0–1.76x). It routes to the pure-MPSGraph compile
-  rather than `.auto` because the heterogeneous partitioner currently faults on some 4-D
-  attention shapes. Opt out with `METALHLO_ATTN_MPSGRAPH=0`. The remaining 0.97x (not
-  higher) is the standalone-softmax benchmark XFMR-INF-005, which has no matmul to trigger
-  the route.
+  rather than `.auto` for performance: attention's matmuls aren't ANE-recommended, so
+  `.auto` falls back to the slow codegen attention. Opt out with `METALHLO_ATTN_MPSGRAPH=0`.
+  The remaining 0.97x (not higher) is the standalone-softmax benchmark XFMR-INF-005, which
+  has no matmul to trigger the route.
 
 ### Headline Numbers
 

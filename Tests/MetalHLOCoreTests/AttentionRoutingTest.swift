@@ -73,4 +73,23 @@ struct AttentionRoutingTests {
             }
         }
     }
+
+    // Regression: a `.auto` compile of an attention graph must not recurse. The
+    // heterogeneous compile bails out (attention's matmuls aren't ANE-recommended)
+    // and falls back to the codegen path; a prior version re-ran the
+    // conv/attention → heterogeneous routing on that fall-back and recursed until
+    // the stack overflowed (SIGBUS). This both guards against the recursion and
+    // checks the fallback path is numerically correct.
+    @Test("auto-policy attention compiles without recursing and is correct")
+    func autoAttentionNoRecursion() throws {
+        let result = try runUniformAttention(devicePolicy: .auto)
+        let expectedRow: [Float] = [5.5, 6.5, 7.5]
+        #expect(result.count == 12)
+        for i in 0..<4 {
+            for c in 0..<3 {
+                #expect(abs(result[i * 3 + c] - expectedRow[c]) < 1e-4,
+                        "row \(i) col \(c): expected \(expectedRow[c]), got \(result[i * 3 + c])")
+            }
+        }
+    }
 }
