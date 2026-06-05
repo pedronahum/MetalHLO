@@ -247,8 +247,9 @@ Two campaigns, full data in **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)**:
   beat MLX (FFN fusion, up to 4.63×), normalization reaches parity, and GEMM 4096² hits
   0.91× via the MetalPerformancePrimitives matrix coprocessor. Attention fusion fires but
   MLX's hand-tuned kernel is still ~30% faster. Axis/row reductions are competitive (~0.8×
-  after an MLX-mirroring kernel); the remaining soft spots are global/column reductions and
-  convolution (no fused path).
+  after an MLX-mirroring kernel) and the global reduction was lifted 0.27×→0.69× by a
+  2-stage split; the remaining soft spots are column reductions and convolution (no fused
+  path).
 
 **End-to-end training vs JAX CPU (M5 Pro):**
 

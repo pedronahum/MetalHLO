@@ -222,4 +222,52 @@ struct ReduceTests {
         #expect(result[1] == 26.0, "Expected 26, got \(result[1])")
         #expect(result[5] == 90.0, "Expected 90, got \(result[5])")
     }
+
+    // Global (all-axes) reductions over a large input are rewritten into two
+    // cooperating reduce stages (ReductionSplitTransform) so they fill the GPU
+    // instead of running in a single threadgroup. These guard that the 2-stage
+    // path is numerically correct. 128×128 = 16384 elements with d0=128 trips
+    // the split's size/shape gates; values are chosen to be order-independent.
+    @Test("Global sum of a large 2D tensor (reduction-split path)")
+    func testGlobalSumSplitPath() async throws {
+        let mlir = """
+        module @global_sum {
+          func.func @main(%input: tensor<128x128xf32>) -> (tensor<f32>) {
+            %init = stablehlo.constant dense<0.0> : tensor<f32>
+            %0 = stablehlo.reduce %input, %init applies stablehlo.add across dimensions = [0, 1] : (tensor<128x128xf32>, tensor<f32>) -> tensor<f32>
+            return %0 : tensor<f32>
+          }
+        }
+        """
+        let client = try Client.create()
+        let executable = try client.compile(mlir, config: CompilationConfig(optimizationLevel: .O2))
+        // All-ones → sum is exactly 16384, independent of accumulation order.
+        let input = try client.createBuffer([Float](repeating: 1.0, count: 128 * 128),
+                                             shape: [128, 128], elementType: .float32)
+        let result = try executable.execute([input])[0].toFloatArray()
+        #expect(result.count == 1)
+        #expect(result[0] == 16384.0, "global sum should be 16384, got \(result[0])")
+    }
+
+    @Test("Global max of a large 2D tensor (reduction-split path)")
+    func testGlobalMaxSplitPath() async throws {
+        let mlir = """
+        module @global_max {
+          func.func @main(%input: tensor<128x128xf32>) -> (tensor<f32>) {
+            %init = stablehlo.constant dense<0xFF800000> : tensor<f32>
+            %0 = stablehlo.reduce %input, %init applies stablehlo.maximum across dimensions = [0, 1] : (tensor<128x128xf32>, tensor<f32>) -> tensor<f32>
+            return %0 : tensor<f32>
+          }
+        }
+        """
+        let client = try Client.create()
+        let executable = try client.compile(mlir, config: CompilationConfig(optimizationLevel: .O2))
+        // Mostly 1.0 with a single planted maximum of 42.0 at a non-corner index.
+        var data = [Float](repeating: 1.0, count: 128 * 128)
+        data[5000] = 42.0
+        let input = try client.createBuffer(data, shape: [128, 128], elementType: .float32)
+        let result = try executable.execute([input])[0].toFloatArray()
+        #expect(result.count == 1)
+        #expect(result[0] == 42.0, "global max should be 42, got \(result[0])")
+    }
 }

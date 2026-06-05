@@ -222,7 +222,11 @@ public final class MetalHLOCompiler: @unchecked Sendable {
             return use128 || use64
         }
 
-        let module = applyTF32MatmulTransformIfEnabled(parsed, fuseOutputConvert: mppGate)
+        let tf32Module = applyTF32MatmulTransformIfEnabled(parsed, fuseOutputConvert: mppGate)
+
+        // Split large global reductions into two cooperating reduce stages so
+        // they fill the GPU instead of running in a single threadgroup.
+        let module = applyReductionSplitIfEnabled(tf32Module)
 
         // ═══════════════════════════════════════════════════════════════
         // STAGE 2: ANALYZE
