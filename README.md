@@ -245,8 +245,9 @@ Two campaigns, full data in **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)**:
   MPSGraph stays ahead on large GEMMs, convolutions, layer norm, and training.
 - **vs MLX (M5 Pro)** — at -O3 with `METALHLO_MATMUL_TF32=1`, all 5 model_mlp benchmarks
   beat MLX (FFN fusion, up to 4.63×), normalization reaches parity, and GEMM 4096² hits
-  0.91× via the MetalPerformancePrimitives matrix coprocessor. Attention fusion fires but
-  MLX's hand-tuned kernel is still ~30% faster. Reductions are now ~0.85× geomean — global
+  0.91× via the MetalPerformancePrimitives matrix coprocessor. Attention auto-routes to
+  MPSGraph's native `scaledDotProductAttention` and now **beats MLX on all four ATTN
+  benchmarks** (1.0–1.76×, model_transformer 0.69×→0.97×). Reductions are now ~0.85× geomean — global
   (0.27×→0.69×, 2-stage split) and column (0.48×→0.71×, coalesced kernel) reductions were
   both fixed. Convolution is at parity (~0.95×, wins 5/8): any conv-containing graph
   auto-routes to Apple's `MPSCNNConvolution` (the path that trains ResNet18 at 8.7×), so the

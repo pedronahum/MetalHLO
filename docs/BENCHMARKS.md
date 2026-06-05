@@ -199,7 +199,7 @@ The two columns show -O0 (no optimizer passes — kernel-level performance only)
 | **model_mlp** | 5 | 1.28x | **1.81x** | **5 / 5** |
 | **normalization** | 4 | 0.60x | **1.09x** | 3 / 4 |
 | **matrix** | 16 | 0.76x | 0.72x | 4 / 16 |
-| **model_transformer** | 5 | 0.44x | 0.69x | 1 / 5 |
+| **model_transformer** | 5 | 0.44x | **0.97x** | 4 / 5 |
 | **arithmetic** | 17 | 0.57x | 0.70x | 2 / 17 |
 | **convolution** | 7 | 0.44x | 0.43x | 1 / 7 |
 | **reduction** | 6 | — | ~0.70x | 1 / 6 |
@@ -224,9 +224,15 @@ Three categories see large -O3 jumps:
 - **normalization** crosses MLX parity. The LayerNorm detector recognizes the expanded
   form `add(multiply(multiply(subtract(x, mean), rsqrt(...)), gamma), beta)` and folds it
   into one `fused_layer_norm`.
-- **model_transformer** improves but doesn't yet beat MLX on attention. The detector fuses
-  Q@K + softmax + @V into one `fused_scaled_dot_product_attention`; MLX's
-  `scaled_dot_product_attention` is still ~30% faster on the 4/5 sequences measured.
+- **model_transformer** reaches 0.97x, winning 4/5. `Client.compile` auto-routes any
+  graph with a (batched) `dot_general` + softmax (the `stablehlo.exponential` signal, which
+  distinguishes it from FFN activations) to MPSGraph's native
+  `scaledDotProductAttention` — faster than the codegen separate-matmul path and ahead of
+  MLX on all four ATTN benchmarks (1.0–1.76x). It routes to the pure-MPSGraph compile
+  rather than `.auto` because the heterogeneous partitioner currently faults on some 4-D
+  attention shapes. Opt out with `METALHLO_ATTN_MPSGRAPH=0`. The remaining 0.97x (not
+  higher) is the standalone-softmax benchmark XFMR-INF-005, which has no matmul to trigger
+  the route.
 
 ### Headline Numbers
 
@@ -238,7 +244,7 @@ All times in milliseconds, measured at -O3 with `METALHLO_MATMUL_TF32=1` on M5 P
 | MAT-DOT-002 | GEMM 512² | 0.53 | 0.54 | **1.02x** | Parity |
 | MLP-INF-001 | MLP 784→256→10 BS=1 (3-layer ReLU) | 0.22 | 0.27 | **1.22x** | FFN fusion + chain ReLU detection |
 | MLP-INF-005 | FFN 768→3072→768 BS=32 (SiLU) | 0.86 | 3.97 | **4.63x** | FFN fusion |
-| ATTN-002 | Self-attention BS=8 H=12 S=128 D=64 | 0.65 | 0.45 | 0.69x | Attention fusion fires; MLX's primitive ~30% faster |
+| ATTN-002 | Self-attention BS=8 H=12 S=128 D=64 | 0.53 | 0.93 | **1.76x** | Auto-routed to MPSGraph native scaledDotProductAttention — codegen (separate matmuls) was 0.65x |
 | NORM-LN-002 | LayerNorm 32×128×768 (BERT-base batched) | 1.42 | 0.66 | 0.46x | LayerNorm fusion fires; MLX still ahead on this shape |
 | RED-006 | Sum-reduce axis-3 32×12×512² | 1.91 | 1.54 | 0.81x | MLX-mirroring float4 row-reduction kernel (was 0.27x before that kernel) |
 | RED-001 | Global sum 1024² | 0.38 | 0.26 | 0.69x | 2-stage reduction split — was 0.99ms / 0.26x in a single threadgroup |
@@ -310,6 +316,7 @@ METALHLO_MATMUL_TF32=1 METALHLO_DISABLE_MPP=1 "$BIN" --quick -O3 -f MAT-DOT-005
 | `METALHLO_SPLIT_REDUCE` | `1` | On by default. When `0`, disables the 2-stage split of large global (all-axes) reductions — they fall back to the single-threadgroup kernel. |
 | `METALHLO_COALESCED_COLREDUCE` | `1` | On by default. When `0`, disables the coalesced 2D-threadgroup kernel for long-axis column reductions — they fall back to the general (uncoalesced) reduce kernel. |
 | `METALHLO_CONV_MPSGRAPH` | `1` | On by default. When `0`, a convolution-containing graph compiled with `.gpuOnly` uses the naive codegen conv kernel instead of auto-routing to MPSGraph (`MPSCNNConvolution`). |
+| `METALHLO_ATTN_MPSGRAPH` | `1` | On by default. When `0`, a softmax-attention graph (`dot_general` + `exponential`) compiled with `.gpuOnly` uses the codegen path (separate matmuls + softmax) instead of routing to MPSGraph's native `scaledDotProductAttention`. |
 
 ### Caveats
 

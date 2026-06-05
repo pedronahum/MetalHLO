@@ -160,14 +160,35 @@ public final class Client: @unchecked Sendable {
             return try compileHeterogeneous(mlir, config: config)
         }
 
-        // The pure-codegen path lowers convolution to a naive 1-thread-per-output
-        // direct-conv kernel (~3-4x slower than Apple's MPSCNNConvolution). When
-        // the graph contains a convolution, upgrade to the heterogeneous path,
-        // which routes conv to MPSGraph (≈MLX parity) while keeping the fast
-        // codegen kernels for everything else. Opt out with
-        // METALHLO_CONV_MPSGRAPH=0 to force the codegen conv kernel.
-        if ProcessInfo.processInfo.environment["METALHLO_CONV_MPSGRAPH"] != "0",
-           mlir.contains("stablehlo.convolution") {
+        // Convolution and scaled-dot-product attention run far faster on Apple's
+        // MPSGraph kernels than on the codegen path (the codegen conv is a naive
+        // 1-thread-per-output kernel; attention runs as separate matmuls + softmax
+        // rather than MPSGraph's native `scaledDotProductAttention`). When the
+        // graph contains either, upgrade to the heterogeneous path, which routes
+        // those ops to MPSGraph (≈MLX parity, often faster) while keeping the fast
+        // codegen kernels for everything else.
+        let env = ProcessInfo.processInfo.environment
+
+        // Attention = a (batched) dot_general feeding a softmax. `exponential`
+        // identifies the softmax and distinguishes it from FFN activations
+        // (ReLU = maximum, SiLU = logistic), so FFN graphs keep their codegen
+        // fusion instead of being diverted to MPSGraph. The pattern optimizer in
+        // the no-config compile fuses this into MPSGraph's native
+        // `scaledDotProductAttention` (≈MLX parity, often faster). We route to
+        // that pure-MPSGraph path rather than `.auto` because the heterogeneous
+        // partitioner currently faults on some 4-D attention shapes.
+        let hasAttention = env["METALHLO_ATTN_MPSGRAPH"] != "0"
+            && mlir.contains("stablehlo.dot_general")
+            && mlir.contains("stablehlo.exponential")
+        if hasAttention {
+            return try compile(mlir)
+        }
+
+        // The codegen conv kernel is a naive 1-thread-per-output direct conv
+        // (~3-4x slower than MPSCNNConvolution). Upgrade conv-containing graphs to
+        // the heterogeneous path, which routes conv to MPSGraph while keeping the
+        // fast codegen kernels for everything else.
+        if env["METALHLO_CONV_MPSGRAPH"] != "0", mlir.contains("stablehlo.convolution") {
             var hetConfig = config
             hetConfig.devicePolicy = .auto
             return try compileHeterogeneous(mlir, config: hetConfig)
