@@ -246,7 +246,9 @@ Two campaigns, full data in **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)**:
 - **vs MLX (M5 Pro)** — at -O3 with `METALHLO_MATMUL_TF32=1`, all 5 model_mlp benchmarks
   beat MLX (FFN fusion, up to 4.63×), normalization reaches parity, and GEMM 4096² hits
   0.91× via the MetalPerformancePrimitives matrix coprocessor. Attention fusion fires but
-  MLX's hand-tuned kernel is still ~30% faster; reductions/convolution lack a fused path.
+  MLX's hand-tuned kernel is still ~30% faster. Axis/row reductions are competitive (~0.8×
+  after an MLX-mirroring kernel); the remaining soft spots are global/column reductions and
+  convolution (no fused path).
 
 **End-to-end training vs JAX CPU (M5 Pro):**
 

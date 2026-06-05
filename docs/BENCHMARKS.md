@@ -200,9 +200,16 @@ The two columns show -O0 (no optimizer passes — kernel-level performance only)
 | **normalization** | 4 | 0.60x | **1.09x** | 3 / 4 |
 | **matrix** | 16 | 0.76x | 0.72x | 4 / 16 |
 | **model_transformer** | 5 | 0.44x | 0.69x | 1 / 5 |
-| **arithmetic** | 17 | 0.57x | 0.58x | 2 / 17 |
+| **arithmetic** | 17 | 0.57x | 0.70x | 2 / 17 |
 | **convolution** | 7 | 0.44x | 0.43x | 1 / 7 |
-| **reduction** | 6 | 0.41x | 0.35x | 0 / 6 |
+| **reduction** | 6 | — | ~0.70x | 1 / 6 |
+
+(Reduction was re-measured after the MLX-mirroring float4 row-reduction kernel
+landed: geomean is now ~0.67–0.85x — quick-mode noise is large on sub-ms
+kernels — with one win, RED-004. The remaining gaps are the **global**
+reduction RED-001 (0.27x — runs in a single threadgroup) and the **column**
+reduction RED-003 (0.48x — strided/uncoalesced reads), not the axis/softmax
+reductions, which are now competitive.)
 
 Three categories see large -O3 jumps:
 - **model_mlp** sweeps 5/5 against MLX. The FFN detector recognizes the canonical SiLU
@@ -227,7 +234,8 @@ All times in milliseconds, measured at -O3 with `METALHLO_MATMUL_TF32=1` on M5 P
 | MLP-INF-005 | FFN 768→3072→768 BS=32 (SiLU) | 0.86 | 3.97 | **4.63x** | FFN fusion |
 | ATTN-002 | Self-attention BS=8 H=12 S=128 D=64 | 0.65 | 0.45 | 0.69x | Attention fusion fires; MLX's primitive ~30% faster |
 | NORM-LN-002 | LayerNorm 32×128×768 (BERT-base batched) | 1.42 | 0.66 | 0.46x | LayerNorm fusion fires; MLX still ahead on this shape |
-| RED-006 | Softmax reduction 32×12×512² | 6.03 | 1.65 | 0.27x | No reduction-pattern fusion yet |
+| RED-006 | Sum-reduce axis-3 32×12×512² | 1.91 | 1.54 | 0.81x | MLX-mirroring float4 row-reduction kernel (was 0.27x before that kernel) |
+| RED-001 | Global sum 1024² | 1.00 | 0.27 | 0.27x | Single-threadgroup bottleneck (worst remaining reduction) |
 
 **Takeaway.** Three classes of speedup are active in -O3:
 1. **Kernel-level**: MAT-DOT-005 hits 0.91x of MLX via the MetalPerformancePrimitives
@@ -236,8 +244,11 @@ All times in milliseconds, measured at -O3 with `METALHLO_MATMUL_TF32=1` on M5 P
 2. **Pattern fusion**: FFN, attention, and LayerNorm patterns expressed as expanded
    primitive ops collapse into single fused Metal kernels. MLP-INF-005 hits 4.63x; all 5
    model_mlp benchmarks beat MLX.
-3. **Reductions and convolution**: still bounded by per-kernel performance — neither has a
-   fused-pattern path yet, so MLX's hand-tuned kernels remain ahead.
+3. **Reductions**: the common axis/row reductions (RED-006, softmax-shaped) are now
+   competitive (0.81x) via the MLX-mirroring float4 kernel; the remaining gaps are the
+   global (RED-001, 0.27x — single-threadgroup) and column (RED-003, 0.48x — strided)
+   reductions. **Convolution**: still bounded by per-kernel performance with no fused-pattern
+   path, so MLX's hand-tuned kernels remain ahead.
 
 ### Reproducing These Numbers
 
