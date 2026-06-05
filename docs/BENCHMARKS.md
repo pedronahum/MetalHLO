@@ -205,14 +205,17 @@ The two columns show -O0 (no optimizer passes — kernel-level performance only)
 | **reduction** | 6 | — | ~0.70x | 1 / 6 |
 
 (Reduction was re-measured after the MLX-mirroring float4 row-reduction kernel
-landed: geomean is now ~0.7–0.85x — quick-mode noise is large on sub-ms
-kernels — with one win, RED-004. The **global** reduction RED-001 was then
-improved from 0.27x to **0.69x** by an HLO-level 2-stage split
-(`ReductionSplitTransform`, env opt-out `METALHLO_SPLIT_REDUCE=0`): a reduce-all
-ran in a single threadgroup, so it is rewritten into a parallel chunk-reduce →
-partials, then a cheap final reduce. The remaining gap is the **column**
-reduction RED-003 (0.48x — strided/uncoalesced reads); the axis/softmax
-reductions are competitive.)
+landed: geomean is now ~0.85x — quick-mode noise is large on sub-ms kernels —
+with one win, RED-004. Two further kernel fixes:
+- **Global** reduction RED-001: 0.27x → **0.69x** via an HLO-level 2-stage split
+  (`ReductionSplitTransform`, opt-out `METALHLO_SPLIT_REDUCE=0`). A reduce-all
+  ran in a single threadgroup; it is rewritten into a parallel chunk-reduce →
+  partials, then a cheap final reduce.
+- **Column** reduction RED-003: 0.48x → **~0.71x** via a coalesced 2D-threadgroup
+  kernel (opt-out `METALHLO_COALESCED_COLREDUCE=0`) — MetalHLO 0.58ms → 0.38ms.
+  The general kernel read each column with a per-thread stride (uncoalesced);
+  the new kernel gives adjacent threads adjacent columns.
+The axis/softmax reductions are competitive.)
 
 Three categories see large -O3 jumps:
 - **model_mlp** sweeps 5/5 against MLX. The FFN detector recognizes the canonical SiLU
@@ -239,6 +242,7 @@ All times in milliseconds, measured at -O3 with `METALHLO_MATMUL_TF32=1` on M5 P
 | NORM-LN-002 | LayerNorm 32×128×768 (BERT-base batched) | 1.42 | 0.66 | 0.46x | LayerNorm fusion fires; MLX still ahead on this shape |
 | RED-006 | Sum-reduce axis-3 32×12×512² | 1.91 | 1.54 | 0.81x | MLX-mirroring float4 row-reduction kernel (was 0.27x before that kernel) |
 | RED-001 | Global sum 1024² | 0.38 | 0.26 | 0.69x | 2-stage reduction split — was 0.99ms / 0.26x in a single threadgroup |
+| RED-003 | Column sum 1024² | 0.38 | 0.27 | 0.71x | Coalesced 2D-threadgroup column kernel — was 0.58ms / 0.48x (uncoalesced) |
 
 **Takeaway.** Three classes of speedup are active in -O3:
 1. **Kernel-level**: MAT-DOT-005 hits 0.91x of MLX via the MetalPerformancePrimitives
@@ -248,10 +252,11 @@ All times in milliseconds, measured at -O3 with `METALHLO_MATMUL_TF32=1` on M5 P
    primitive ops collapse into single fused Metal kernels. MLP-INF-005 hits 4.63x; all 5
    model_mlp benchmarks beat MLX.
 3. **Reductions**: the common axis/row reductions (RED-006, softmax-shaped) are competitive
-   (0.81x) via the MLX-mirroring float4 kernel, and the global reduction (RED-001) was lifted
-   0.27x → 0.69x by the 2-stage split. The remaining gap is the column reduction (RED-003,
-   0.48x — strided). **Convolution**: still bounded by per-kernel performance with no
-   fused-pattern path, so MLX's hand-tuned kernels remain ahead.
+   (0.81x) via the MLX-mirroring float4 kernel; the global reduction (RED-001) was lifted
+   0.27x → 0.69x by the 2-stage split, and the column reduction (RED-003) 0.48x → 0.71x by
+   the coalesced kernel. Reductions are now ~0.85x geomean. **Convolution**: still bounded by
+   per-kernel performance with no fused-pattern path, so MLX's hand-tuned kernels remain
+   ahead — the largest single-category gap left.
 
 ### Reproducing These Numbers
 
@@ -298,6 +303,7 @@ METALHLO_MATMUL_TF32=1 METALHLO_DISABLE_MPP=1 "$BIN" --quick -O3 -f MAT-DOT-005
 | `METALHLO_FORCE_MPSGRAPH` | `0` | When `1`, routes every op through MPSGraph instead of codegen. Bypasses the optimizer; useful as a sanity check. |
 | `METALHLO_DEBUG_PASSES` | `0` | When `1`, the optimizer prints one line per pass (`[*] pass-name ops: N -> M`, asterisk = changed) to stderr. |
 | `METALHLO_SPLIT_REDUCE` | `1` | On by default. When `0`, disables the 2-stage split of large global (all-axes) reductions — they fall back to the single-threadgroup kernel. |
+| `METALHLO_COALESCED_COLREDUCE` | `1` | On by default. When `0`, disables the coalesced 2D-threadgroup kernel for long-axis column reductions — they fall back to the general (uncoalesced) reduce kernel. |
 
 ### Caveats
 

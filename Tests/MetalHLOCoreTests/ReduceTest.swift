@@ -270,4 +270,57 @@ struct ReduceTests {
         #expect(result.count == 1)
         #expect(result[0] == 42.0, "global max should be 42, got \(result[0])")
     }
+
+    // Long-axis column reductions (reduce over axis 0, reduceSize ≥ 64) use the
+    // coalesced 2D-threadgroup kernel. 256 rows trips the long-axis path; 70
+    // columns (not a multiple of the 32-wide tile) exercises the boundary guard.
+    @Test("Column sum over a long first axis (coalesced kernel, ragged width)")
+    func testColumnSumCoalescedKernel() async throws {
+        let rows = 256, cols = 70
+        let mlir = """
+        module @col_sum {
+          func.func @main(%input: tensor<256x70xf32>) -> (tensor<70xf32>) {
+            %init = stablehlo.constant dense<0.0> : tensor<f32>
+            %0 = stablehlo.reduce %input, %init applies stablehlo.add across dimensions = [0] : (tensor<256x70xf32>, tensor<f32>) -> tensor<70xf32>
+            return %0 : tensor<70xf32>
+          }
+        }
+        """
+        let client = try Client.create()
+        let executable = try client.compile(mlir, config: CompilationConfig(optimizationLevel: .O2))
+        // Column c holds the value c in every row → column sum is exactly 256*c.
+        var data = [Float](repeating: 0, count: rows * cols)
+        for r in 0..<rows { for c in 0..<cols { data[r * cols + c] = Float(c) } }
+        let input = try client.createBuffer(data, shape: [rows, cols], elementType: .float32)
+        let result = try executable.execute([input])[0].toFloatArray()
+        #expect(result.count == cols)
+        for c in 0..<cols {
+            #expect(result[c] == Float(rows * c), "col \(c) sum should be \(rows * c), got \(result[c])")
+        }
+    }
+
+    @Test("Column max over a long first axis (coalesced kernel)")
+    func testColumnMaxCoalescedKernel() async throws {
+        let rows = 128, cols = 40
+        let mlir = """
+        module @col_max {
+          func.func @main(%input: tensor<128x40xf32>) -> (tensor<40xf32>) {
+            %init = stablehlo.constant dense<0xFF800000> : tensor<f32>
+            %0 = stablehlo.reduce %input, %init applies stablehlo.maximum across dimensions = [0] : (tensor<128x40xf32>, tensor<f32>) -> tensor<40xf32>
+            return %0 : tensor<40xf32>
+          }
+        }
+        """
+        let client = try Client.create()
+        let executable = try client.compile(mlir, config: CompilationConfig(optimizationLevel: .O2))
+        // Column c: all 1.0 except a planted maximum of (c + 100) on one row.
+        var data = [Float](repeating: 1.0, count: rows * cols)
+        for c in 0..<cols { data[(c % rows) * cols + c] = Float(c) + 100 }
+        let input = try client.createBuffer(data, shape: [rows, cols], elementType: .float32)
+        let result = try executable.execute([input])[0].toFloatArray()
+        #expect(result.count == cols)
+        for c in 0..<cols {
+            #expect(result[c] == Float(c) + 100, "col \(c) max should be \(Float(c) + 100), got \(result[c])")
+        }
+    }
 }

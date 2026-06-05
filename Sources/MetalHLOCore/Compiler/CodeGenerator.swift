@@ -5484,7 +5484,18 @@ public final class CodeGenerator: @unchecked Sendable {
                 )
                 return (source, "kernel_reduce", TuningConfig(blockSize: 1024, useColumnReduction: true))
             }
-            // Long-axis column reductions also fall through to the general kernel.
+            // Long-axis column reduction: the general kernel reads the column
+            // with a per-thread stride of `innerSize` (uncoalesced). Use the
+            // coalesced 2D-threadgroup kernel instead. Opt out with
+            // METALHLO_COALESCED_COLREDUCE=0.
+            if ProcessInfo.processInfo.environment["METALHLO_COALESCED_COLREDUCE"] != "0" {
+                let source = ReductionKernelGenerator.generateCoalescedColumnReductionKernel(
+                    op: reductionOp,
+                    entryPoint: "kernel_reduce"
+                )
+                return (source, "kernel_reduce", TuningConfig(useCoalescedColumnReduction: true))
+            }
+            // Otherwise fall through to the general kernel.
 
         case .global, .general:
             break
@@ -7152,6 +7163,16 @@ public final class CodeGenerator: @unchecked Sendable {
                 return DispatchConfig.dispatch1D(elements: totalElements, threadgroupSize: 256)
 
             case .reduce:
+                // Coalesced column reduction: 2D threadgroup of (32 cols × 8
+                // row-groups), one threadgroup per 32-column tile.
+                if let tuning = tuning, tuning.useCoalescedColumnReduction {
+                    let cols = 32, rows = 8
+                    let numTGs = (totalElements + cols - 1) / cols
+                    return DispatchConfig(
+                        gridSize: MTLSize(width: numTGs, height: 1, depth: 1),
+                        threadgroupSize: MTLSize(width: cols, height: rows, depth: 1)
+                    )
+                }
                 // Check for specialized reduction kernels
                 if let tuning = tuning, (tuning.useRowReduction || tuning.useColumnReduction) {
                     // Specialized row/column reduction: one thread per output element

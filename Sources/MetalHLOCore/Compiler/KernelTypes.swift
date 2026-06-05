@@ -176,6 +176,12 @@ public struct TuningConfig: Sendable, Hashable {
     /// Use column reduction kernel (one thread per column, no threadgroup cooperation).
     public var useColumnReduction: Bool
 
+    /// Use the coalesced 2D-threadgroup column reduction kernel: a (32 cols × 8
+    /// row-groups) threadgroup where adjacent threads own adjacent columns
+    /// (coalesced reads) and the row-groups split the reduce axis for occupancy,
+    /// then combine via threadgroup memory. For long-axis column reductions.
+    public var useCoalescedColumnReduction: Bool
+
     /// Use SIMD-per-output reduction kernel: each simdgroup of 32 threads
     /// cooperatively reduces one or more outputs, with 32 simdgroups per
     /// threadgroup. Each TG handles `32 * simdPerOutputNWrites` outputs.
@@ -213,6 +219,7 @@ public struct TuningConfig: Sendable, Hashable {
         elementsPerThread: Int? = nil,
         useRowReduction: Bool = false,
         useColumnReduction: Bool = false,
+        useCoalescedColumnReduction: Bool = false,
         useSIMDPerOutputReduction: Bool = false,
         simdPerOutputNWrites: Int = 1,
         useGEMV: Bool = false,
@@ -229,6 +236,7 @@ public struct TuningConfig: Sendable, Hashable {
         self.elementsPerThread = elementsPerThread
         self.useRowReduction = useRowReduction
         self.useColumnReduction = useColumnReduction
+        self.useCoalescedColumnReduction = useCoalescedColumnReduction
         self.useSIMDPerOutputReduction = useSIMDPerOutputReduction
         self.simdPerOutputNWrites = simdPerOutputNWrites
         self.useGEMV = useGEMV

@@ -215,6 +215,71 @@ public struct ReductionKernelGenerator {
         """
     }
 
+    /// Generates a coalesced column reduction kernel for long reduce axes.
+    ///
+    /// Reduces over the first axis: `[R, N] -> [N]` (or any rank where axis 0 is
+    /// reduced, with `innerSize` = product of the trailing dims). The plain
+    /// column kernel assigns one thread per column (≤ N threads → poor
+    /// occupancy) and the general kernel assigns one threadgroup per column
+    /// (threads stride the column by `innerSize` → uncoalesced). This kernel
+    /// uses a 2D threadgroup of (COLS × ROWS): `tid.x` selects the column so
+    /// adjacent threads read adjacent addresses (coalesced), and `ROWS` thread-
+    /// rows split the reduce axis for occupancy, combining via threadgroup
+    /// memory. Dispatch: `ceil(N / COLS)` threadgroups of (COLS, ROWS).
+    public static func generateCoalescedColumnReductionKernel(
+        op: ReductionOp,
+        entryPoint: String = "kernel_reduce",
+        cols: Int = 32,
+        rows: Int = 8
+    ) -> String {
+        return """
+        #include <metal_stdlib>
+        using namespace metal;
+
+        // Coalesced column reduction: reduce over the first axis.
+        kernel void \(entryPoint)(
+            device const float* input [[buffer(0)]],
+            device const float* initValue [[buffer(1)]],
+            device float* output [[buffer(2)]],
+            constant uint& outputCount [[buffer(3)]],   // N (columns / trailing size)
+            constant uint& reduceSize [[buffer(4)]],    // R (first-axis length)
+            constant uint& innerSize [[buffer(5)]],     // row stride (== outputCount)
+            uint2 tid [[thread_position_in_threadgroup]],
+            uint2 tgid [[threadgroup_position_in_grid]])
+        {
+            constexpr uint COLS = \(cols)u;
+            constexpr uint ROWS = \(rows)u;
+            threadgroup float shared[ROWS * COLS];
+
+            uint col = tgid.x * COLS + tid.x;
+            float accum = \(op.identity);
+            if (col < outputCount) {
+                // Each thread-row reduces a strided slice of the column; reads
+                // across tid.x at a fixed row are contiguous (coalesced).
+                for (uint r = tid.y; r < reduceSize; r += ROWS) {
+                    float val = input[r * innerSize + col];
+                    \(op.accumOp)
+                }
+            }
+            shared[tid.y * COLS + tid.x] = accum;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Thread-row 0 combines the ROWS partials for its column.
+            if (tid.y == 0u && col < outputCount) {
+                float acc = shared[tid.x];
+                for (uint y = 1u; y < ROWS; ++y) {
+                    float a = acc;
+                    float b = shared[y * COLS + tid.x];
+                    acc = \(op.binaryOp);
+                }
+                float a = acc;
+                float b = initValue[0];
+                output[col] = \(op.binaryOp);
+            }
+        }
+        """
+    }
+
     /// Generates an optimized global reduction kernel.
     ///
     /// Global reduction reduces all elements to a single scalar.
