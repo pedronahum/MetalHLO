@@ -2108,9 +2108,13 @@ func pjrt_loaded_executable_execute(
     let numDevices = Int(args.pointee.num_devices)
     let numArgs = Int(args.pointee.num_args)
 
-    // We only support single-device execution
-    guard numDevices <= 1 else {
-        return makeError(PJRT_Error_Code_UNIMPLEMENTED, "Multi-device execution not supported")
+    // Multi-device (sharded shard_map): JAX passes per-device input shards and
+    // expects per-device outputs. The compiled program is the desugared GLOBAL
+    // computation, so gather the shards → global inputs, run once, and scatter
+    // the global outputs back per device.
+    if numDevices > 1 {
+        return executeShardedMultiDevice(args: args, loaded: loaded,
+                                         numDevices: numDevices, numArgs: numArgs)
     }
 
     // Extract input buffers from argument_lists[0]
@@ -2172,6 +2176,80 @@ func pjrt_loaded_executable_execute(
         return nil
     } catch {
         return makeError(PJRT_Error_Code_INTERNAL, "Execution failed: \(error)")
+    }
+}
+
+/// Multi-device execution for a desugared sharded `shard_map`. The program was
+/// lowered (in the parser) to a single GLOBAL computation; here we marshal the
+/// PJRT per-device call convention to/from that global program:
+///   - inputs: an arg whose per-device shard is smaller than the program's global
+///     input is gathered by concatenating the N shards in device order (axis-0
+///     sharding — data parallelism); a replicated arg uses device 0's buffer.
+///   - run the global program once.
+///   - outputs: replicated to every device (the data-parallel case, where
+///     out_specs are replicated after the collective). Sharded outputs (FSDP)
+///     are a later refinement.
+private func executeShardedMultiDevice(
+    args: UnsafeMutablePointer<PJRT_LoadedExecutable_Execute_Args>,
+    loaded: PJRTLoadedExecutableImpl,
+    numDevices: Int,
+    numArgs: Int
+) -> UnsafeMutablePointer<PJRT_Error>? {
+    guard let argLists = args.pointee.argument_lists else {
+        return makeError(PJRT_Error_Code_INVALID_ARGUMENT, "NULL argument_lists")
+    }
+    let inTypes = loaded.executable.inputTypes
+    do {
+        // Gather global inputs from per-device shards.
+        var globalInputs: [Buffer] = []
+        for a in 0..<numArgs {
+            var shards: [Buffer] = []
+            for d in 0..<numDevices {
+                guard let dl = argLists[d], let bp = dl[a] else {
+                    return makeError(PJRT_Error_Code_INVALID_ARGUMENT,
+                                     "NULL buffer at device \(d) arg \(a)")
+                }
+                shards.append(fromOpaque(OpaquePointer(bp), as: PJRTBufferImpl.self).buffer)
+            }
+            let globalShape = a < inTypes.count ? inTypes[a].shape : shards[0].shape
+            if shards[0].shape == globalShape {
+                globalInputs.append(shards[0])   // replicated input
+            } else {
+                // Sharded on axis 0: concatenate shard bytes in device order.
+                var data = Data()
+                for s in shards { data.append(try s.toData()) }
+                globalInputs.append(try loaded.client.client.createBuffer(
+                    bytes: data, shape: globalShape, elementType: shards[0].elementType))
+            }
+        }
+
+        let outputs = try loaded.executable.execute(globalInputs)
+
+        // Scatter: replicate each global output to every device (its own buffer).
+        if let outputLists = args.pointee.output_lists {
+            for d in 0..<numDevices {
+                guard let dl = outputLists[d] else { continue }
+                for (o, out) in outputs.enumerated() {
+                    let copy = try loaded.client.client.createBuffer(
+                        bytes: try out.toData(), shape: out.shape, elementType: out.elementType)
+                    let bufImpl = PJRTBufferImpl(
+                        buffer: copy,
+                        device: loaded.client.devices[d],
+                        memory: loaded.client.memories[d])
+                    dl[o] = UnsafeMutablePointer<PJRT_Buffer>(retainAsOpaque(bufImpl))
+                }
+            }
+        }
+
+        // Per-device completion events (synchronous execution → already done).
+        if let events = args.pointee.device_complete_events {
+            for d in 0..<numDevices {
+                events[d] = UnsafeMutablePointer<PJRT_Event>(retainAsOpaque(PJRTEventImpl()))
+            }
+        }
+        return nil
+    } catch {
+        return makeError(PJRT_Error_Code_INTERNAL, "Multi-device execution failed: \(error)")
     }
 }
 
