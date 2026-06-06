@@ -187,7 +187,30 @@ public final class Parser {
                 skipNewlines()
                 continue
             }
-            let op = try parseOperation()
+            // Parse the `%result =` prefix here so we can peek the op name and
+            // intercept `sdy.manual_computation` (an sdy-dialect region op the
+            // normal op dispatch can't handle) before committing to parsing it.
+            let opResult = try parsePercentIdentifier()
+            var opResultCount = 1
+            if match(.colon) {
+                if case .integer(let count) = currentToken.kind {
+                    opResultCount = Int(count)
+                    advance()
+                }
+            }
+            try expect(.equal)
+
+            if checkIdentifier("sdy.manual_computation") {
+                try desugarManualComputation(
+                    result: opResult,
+                    operations: &operations,
+                    valueAliases: &valueAliases
+                )
+                skipNewlines()
+                continue
+            }
+
+            let op = try parseOperationGivenResult(result: opResult, resultCount: opResultCount)
 
             if op.kind == .tuple {
                 // Record tuple composition — resolve any aliases in operands
@@ -758,6 +781,221 @@ public final class Parser {
         return values
     }
 
+    // MARK: - sdy.manual_computation (shard_map)
+
+    /// Captured shape of an `sdy.manual_computation` (the shard_map wrapper).
+    private struct ManualComputation {
+        let operands: [String]           // outer operand names (global tensors)
+        let operandTypes: [TensorType]   // outer (global) operand types
+        let blockArgs: [HLOArgument]     // per-device body parameters
+        let body: [HLOOperation]         // captured body ops (per-device shapes)
+        let returns: [String]            // sdy.return value names
+        let resultTypes: [TensorType]    // outer (global) result types
+        /// For operand i, the single sharded axis (or nil if replicated),
+        /// derived from global-vs-per-device shape.
+        let shardedAxis: [Int?]
+        /// Number of shards along the manual axis (the mesh axis size).
+        let numShards: Int
+    }
+
+    /// Parses `sdy.manual_computation(...) in_shardings=... out_shardings=...
+    /// manual_axes=... (%blockargs) { body sdy.return } : (ins) -> outs`,
+    /// capturing its structure. The op-name token has NOT been consumed yet.
+    ///
+    /// Sharding is derived from shapes (a body parameter sharded along an axis is
+    /// smaller there than the global operand), so the verbose sdy sharding syntax
+    /// is skipped rather than parsed.
+    private func captureManualComputation(result: String) throws -> ManualComputation {
+        try expectIdentifier("sdy.manual_computation")
+
+        // Outer operands: (%arg0, %arg1, ...)
+        var operands: [String] = []
+        try expect(.leftParen)
+        if !check(.rightParen) {
+            repeat { operands.append(try parsePercentIdentifier()) } while match(.comma)
+        }
+        try expect(.rightParen)
+
+        // Skip in_shardings=... out_shardings=... manual_axes=... up to the body
+        // parameter list's '(' (none of those attributes contain a paren).
+        while !check(.leftParen) && !check(.eof) { advance() }
+
+        // Body parameter list (per-device shapes) + body region.
+        let blockArgs = try parseFunctionArguments()
+        try expect(.leftBrace)
+        skipNewlines()
+
+        var body: [HLOOperation] = []
+        while !checkIdentifier("sdy.return") && !check(.rightBrace) && !check(.eof) {
+            body.append(try parseOperation())
+            skipNewlines()
+        }
+
+        // sdy.return %r0, %r1, ... : t0, t1, ...
+        var returns: [String] = []
+        try expectIdentifier("sdy.return")
+        if check(.percentIdentifier) {
+            repeat { returns.append(try parsePercentIdentifier()) } while match(.comma)
+        }
+        if match(.colon) {
+            _ = try parseTensorType()
+            while match(.comma) { _ = try parseTensorType() }
+        }
+        skipNewlines()
+        try expect(.rightBrace)
+
+        // Outer type signature: (global ins) -> global outs
+        try expect(.colon)
+        var operandTypes: [TensorType] = []
+        try expect(.leftParen)
+        if !check(.rightParen) {
+            operandTypes.append(try parseTensorType())
+            while match(.comma) { operandTypes.append(try parseTensorType()) }
+        }
+        try expect(.rightParen)
+        try expect(.arrow)
+        var resultTypes: [TensorType] = []
+        if match(.leftParen) {
+            if !check(.rightParen) {
+                resultTypes.append(try parseTensorType())
+                while match(.comma) { resultTypes.append(try parseTensorType()) }
+            }
+            try expect(.rightParen)
+        } else {
+            resultTypes.append(try parseTensorType())
+        }
+
+        // Derive the sharded axis per operand (global vs per-device shape) and
+        // the shard count N (consistent across sharded operands).
+        var shardedAxis: [Int?] = []
+        var numShards = 1
+        for (i, gType) in operandTypes.enumerated() {
+            guard i < blockArgs.count else { shardedAxis.append(nil); continue }
+            let g = gType.shape
+            let d = blockArgs[i].type.shape
+            var axis: Int? = nil
+            if g.count == d.count {
+                for ax in 0..<g.count where d[ax] != 0 && g[ax] != d[ax] {
+                    axis = ax
+                    numShards = max(numShards, g[ax] / d[ax])
+                    break
+                }
+            }
+            shardedAxis.append(axis)
+        }
+
+        return ManualComputation(
+            operands: operands, operandTypes: operandTypes, blockArgs: blockArgs,
+            body: body, returns: returns, resultTypes: resultTypes,
+            shardedAxis: shardedAxis, numShards: numShards)
+    }
+
+    /// Desugars a captured `sdy.manual_computation` into flat single-device ops:
+    /// replays the body once per shard over sliced inputs, lowers each `all_reduce`
+    /// to an explicit cross-shard combine, and assembles outputs per the output
+    /// sharding (replicated → shard 0; sharded → concatenate). This is the
+    /// single-process simulation of an N-device shard_map — every shard runs on
+    /// the one GPU. The manual axis must be 1-D (single sharded axis per operand).
+    private func desugarManualComputation(
+        result: String,
+        operations: inout [HLOOperation],
+        valueAliases: inout [String: String]
+    ) throws {
+        let mc = try captureManualComputation(result: result)
+        let N = mc.numShards
+        let loc = currentToken.location
+        guard N >= 1 else {
+            throw ParseError.unsupportedFeature("manual_computation with 0 shards", location: loc)
+        }
+
+        // shardVal[s][bodyValueName] = the desugared global value name for shard s.
+        var shardVal = Array(repeating: [String: String](), count: N)
+
+        // 1. Map each body parameter to its per-shard value: a slice of the
+        //    global operand along the sharded axis, or the whole operand if
+        //    replicated.
+        for (i, blockArg) in mc.blockArgs.enumerated() {
+            guard i < mc.operands.count else { break }
+            let operand = mc.operands[i]
+            if let axis = mc.shardedAxis[i], i < mc.operandTypes.count {
+                let g = mc.operandTypes[i].shape
+                let per = blockArg.type.shape[axis]
+                for s in 0..<N {
+                    let sliceName = "\(result)__in\(i)_s\(s)"
+                    var attrs = HLOAttributes()
+                    attrs.sliceStarts = (0..<g.count).map { $0 == axis ? s * per : 0 }
+                    attrs.sliceLimits = (0..<g.count).map { $0 == axis ? (s + 1) * per : g[$0] }
+                    attrs.sliceStrides = Array(repeating: 1, count: g.count)
+                    operations.append(HLOOperation(
+                        result: sliceName, kind: .slice, operands: [operand],
+                        resultType: blockArg.type, attributes: attrs))
+                    shardVal[s][blockArg.name] = sliceName
+                }
+            } else {
+                for s in 0..<N { shardVal[s][blockArg.name] = operand }
+            }
+        }
+
+        // 2. Replay the body. Regular ops are replicated per shard (SSA-renamed);
+        //    all_reduce combines its operand across shards via its reducer and
+        //    broadcasts the (replicated) result back to every shard.
+        for op in mc.body {
+            if op.kind == .allReduce {
+                let src = op.operands.first ?? ""
+                let perShard = (0..<N).map { shardVal[$0][src] ?? src }
+                let binKind: HLOOpKind
+                switch op.attributes.reductionKind ?? .sum {
+                case .max: binKind = .maximum
+                case .min: binKind = .minimum
+                case .product: binKind = .multiply
+                default: binKind = .add   // sum / mean
+                }
+                var acc = perShard[0]
+                for j in 1..<max(1, perShard.count) {
+                    let name = "\(result)__ar_\(op.result)_\(j)"
+                    operations.append(HLOOperation(
+                        result: name, kind: binKind, operands: [acc, perShard[j]],
+                        resultType: op.resultType, attributes: HLOAttributes()))
+                    acc = name
+                }
+                for s in 0..<N { shardVal[s][op.result] = acc }
+            } else {
+                for s in 0..<N {
+                    let newOperands = op.operands.map { shardVal[s][$0] ?? $0 }
+                    let newResult = "\(op.result)__s\(s)"
+                    operations.append(HLOOperation(
+                        result: newResult, kind: op.kind, operands: newOperands,
+                        resultType: op.resultType, attributes: op.attributes,
+                        resultCount: op.resultCount))
+                    shardVal[s][op.result] = newResult
+                }
+            }
+        }
+
+        // 3. Assemble the (single) output. Replicated output → take shard 0's
+        //    value (equal across shards after the collective); sharded output →
+        //    concatenate the per-shard values along the sharded axis.
+        guard let ret = mc.returns.first else {
+            throw ParseError.unsupportedFeature("manual_computation with no return", location: loc)
+        }
+        let perShardRet = (0..<N).map { shardVal[$0][ret] ?? ret }
+        let perShardRetType = mc.body.last(where: { $0.result == ret })?.resultType
+        let globalOut = mc.resultTypes.first?.shape ?? []
+        if let pType = perShardRetType, pType.shape.count == globalOut.count,
+           pType.shape != globalOut {
+            var axis = 0
+            for a in 0..<globalOut.count where pType.shape[a] != globalOut[a] { axis = a; break }
+            var attrs = HLOAttributes()
+            attrs.axis = axis
+            attrs.dimensions = [axis]
+            operations.append(HLOOperation(
+                result: result, kind: .concatenate, operands: perShardRet,
+                resultType: mc.resultTypes[0], attributes: attrs))
+        } else {
+            valueAliases[result] = perShardRet[0]
+        }
+    }
+
     // MARK: - Operation Parsing
 
     private func parseOperation() throws -> HLOOperation {
@@ -775,7 +1013,14 @@ public final class Parser {
         }
 
         try expect(.equal)
+        return try parseOperationGivenResult(result: result, resultCount: resultCount)
+    }
 
+    /// Parses the operation body after the `%result =` prefix has already been
+    /// consumed. Split out of `parseOperation` so the function-body loop can peek
+    /// the op name (to intercept `sdy.manual_computation`) after parsing the
+    /// result, without backtracking.
+    private func parseOperationGivenResult(result: String, resultCount: Int) throws -> HLOOperation {
         // Parse operation name (e.g., stablehlo.add)
         let opName = try parseOperationName()
         let kind = try parseOpKind(from: opName)
@@ -1147,7 +1392,8 @@ public final class Parser {
                     if check(.rightBrace) { depth -= 1 }
                     // Detect reduction op for reduce_window from body content.
                     // Body uses dotted identifiers like "stablehlo.add" — match by suffix.
-                    if kind == .reduceWindow && attributes.reductionKind == nil
+                    if (kind == .reduceWindow || kind == .allReduce)
+                        && attributes.reductionKind == nil
                         && currentToken.kind == .identifier {
                         let t = currentToken.text
                         if t == "stablehlo.add" || t == "add" {
