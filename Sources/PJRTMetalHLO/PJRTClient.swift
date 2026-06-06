@@ -38,34 +38,49 @@ final class PJRTClientImpl: @unchecked Sendable {
         self.client = client
         self.metalDevice = client.device
 
-        // Create device wrapper
-        let device = PJRTDeviceImpl(device: client.device, id: 0)
-        self.devices = [device]
+        // Number of (virtual) devices to advertise — all backed by the one GPU.
+        // N>1 lets JAX place an N-device mesh (shard_map / data parallelism) on
+        // the backend; it's a single-process simulation where every shard runs
+        // on the same physical device. Configurable via METALHLO_NUM_DEVICES,
+        // default 1 (clamped to >= 1).
+        let numDevices = max(1,
+            Int(ProcessInfo.processInfo.environment["METALHLO_NUM_DEVICES"] ?? "") ?? 1)
 
-        // Create unified memory space (Metal uses shared memory on Apple Silicon)
-        let memory = PJRTMemoryImpl(id: 0, kind: "device", kindId: 0)
-        memory.devices = [device]
-        memory.buildDevicesPtr()
-        device.memories = [memory]
-        self.memories = [memory]
+        // Create one device wrapper + one unified-memory space per virtual device
+        // (Metal uses shared memory on Apple Silicon; each device addresses its own).
+        var devs: [PJRTDeviceImpl] = []
+        var mems: [PJRTMemoryImpl] = []
+        for i in 0..<numDevices {
+            let device = PJRTDeviceImpl(device: client.device, id: Int32(i))
+            let memory = PJRTMemoryImpl(id: Int32(i), kind: "device", kindId: 0)
+            memory.devices = [device]
+            memory.buildDevicesPtr()
+            device.memories = [memory]
+            devs.append(device)
+            mems.append(memory)
+        }
+        self.devices = devs
+        self.memories = mems
 
-        // Build stable C pointer arrays
-        self.devicesPtrBuffer = .allocate(capacity: 1)
-        devicesPtrBuffer[0] = UnsafeMutablePointer<PJRT_Device>(
-            retainAsOpaque(device)
-        )
-
-        self.memoriesPtrBuffer = .allocate(capacity: 1)
-        memoriesPtrBuffer[0] = UnsafeMutablePointer<PJRT_Memory>(
-            retainAsOpaque(memory)
-        )
+        // Build stable C pointer arrays (one extra retain per entry for the
+        // opaque C pointer; released in deinit).
+        self.devicesPtrBuffer = .allocate(capacity: numDevices)
+        for (i, device) in devs.enumerated() {
+            devicesPtrBuffer[i] = UnsafeMutablePointer<PJRT_Device>(retainAsOpaque(device))
+        }
+        self.memoriesPtrBuffer = .allocate(capacity: numDevices)
+        for (i, memory) in mems.enumerated() {
+            memoriesPtrBuffer[i] = UnsafeMutablePointer<PJRT_Memory>(retainAsOpaque(memory))
+        }
 
         // Build topology (owned by client, not separately destroyed)
-        self.topology = PJRTTopologyDescriptionImpl(deviceDescriptions: [device.description])
+        self.topology = PJRTTopologyDescriptionImpl(deviceDescriptions: devs.map { $0.description })
         self.topologyOpaquePtr = retainAsOpaque(self.topology)
 
-        // Set back-reference
-        device.client = self
+        // Set back-references now that all stored properties are initialized.
+        for device in devs {
+            device.client = self
+        }
     }
 
     deinit {

@@ -135,8 +135,25 @@ func pjrt_client_buffer_from_host_buffer(
             retainAsOpaque(doneEvent)
         )
 
-        let device = impl.devices[0]
-        let memory = impl.memories[0]
+        // Place the buffer on the requested device/memory. With N virtual
+        // devices, JAX device_puts each shard to a specific device; honoring it
+        // keeps the buffer's memory-space device matching the sharding's device
+        // (otherwise JAX rejects it). Falls back to device 0.
+        var device = impl.devices[0]
+        var memory = impl.memories[0]
+        if let devPtr = args.pointee.device {
+            let reqDev = fromOpaque(OpaquePointer(devPtr), as: PJRTDeviceImpl.self)
+            if let idx = impl.devices.firstIndex(where: { $0 === reqDev }) {
+                device = impl.devices[idx]
+                memory = impl.memories[idx]
+            }
+        } else if let memPtr = args.pointee.memory {
+            let reqMem = fromOpaque(OpaquePointer(memPtr), as: PJRTMemoryImpl.self)
+            if let idx = impl.memories.firstIndex(where: { $0 === reqMem }) {
+                device = impl.devices[idx]
+                memory = impl.memories[idx]
+            }
+        }
         let bufferImpl = PJRTBufferImpl(buffer: buffer, device: device, memory: memory)
         args.pointee.buffer = UnsafeMutablePointer<PJRT_Buffer>(
             retainAsOpaque(bufferImpl)

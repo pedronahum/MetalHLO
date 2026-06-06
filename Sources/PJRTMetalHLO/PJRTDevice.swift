@@ -234,9 +234,15 @@ func pjrt_device_addressable_memories(
         return makeError(PJRT_Error_Code_INVALID_ARGUMENT, "NULL args")
     }
     let device = fromOpaque(OpaquePointer(devicePtr), as: PJRTDeviceImpl.self)
-    if let client = device.client {
-        args.pointee.memories = UnsafePointer(client.memoriesPtr)
-        args.pointee.num_memories = client.memoriesPtrCount
+    // Each (virtual) device addresses exactly its OWN memory space (memory i ↔
+    // device i). Returning the client's full memory list here made every device
+    // claim every memory, so a device-i buffer would resolve to memory 0 (whose
+    // device is 0) and JAX rejected the device/sharding mismatch.
+    let idx = Int(device.description.id)
+    if let client = device.client, let base = client.memoriesPtr,
+       idx >= 0, idx < client.memoriesPtrCount {
+        args.pointee.memories = UnsafePointer(base + idx)
+        args.pointee.num_memories = 1
     } else {
         args.pointee.num_memories = 0
     }
@@ -250,10 +256,12 @@ func pjrt_device_default_memory(
         return makeError(PJRT_Error_Code_INVALID_ARGUMENT, "NULL args")
     }
     let device = fromOpaque(OpaquePointer(devicePtr), as: PJRTDeviceImpl.self)
-    if let client = device.client, let firstMemory = client.memories.first {
-        args.pointee.memory = UnsafeMutablePointer<PJRT_Memory>(
-            retainAsOpaque(firstMemory)
-        )
+    // The device's default memory is its OWN memory space, not memory 0 — see
+    // pjrt_device_addressable_memories. Use the client's stable opaque pointer
+    // for that memory (borrowed; owned by the client).
+    let idx = Int(device.description.id)
+    if let client = device.client, idx >= 0, idx < client.memoriesPtrCount {
+        args.pointee.memory = client.memoriesPtrBuffer[idx]
     }
     return nil
 }
