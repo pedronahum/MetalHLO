@@ -124,6 +124,7 @@ MetalHLO is a fully-functional JAX backend. Each row links to the test that exer
 | `jax.scipy.linalg.cholesky` / `solve_triangular`, `jnp.linalg.svd` / `qr` / `eigh` (routed from JAX's LAPACK FFI to Accelerate), `jax.lax.lgamma` / `digamma` / `erf` | [LapackRoutingTest.swift](Tests/MetalHLOCoreTests/LapackRoutingTest.swift) |
 | `jax.random` — bit-exact threefry2x32 (`bits`/`uniform` match JAX CPU exactly) | [ThreefryRngTest.swift](Tests/MetalHLOCoreTests/ThreefryRngTest.swift) |
 | `jax.debug.print` / `jax.debug.callback` (side-effect-only host callbacks) | [HostCallbackTest.swift](Tests/MetalHLOCoreTests/HostCallbackTest.swift) |
+| `jax.shard_map` + `jax.lax.psum` / `pmean` (data-parallel, `METALHLO_NUM_DEVICES=N`, single-process sim — experimental) | [ManualComputationTest.swift](Tests/MetalHLOCoreTests/ManualComputationTest.swift), [AllReduceTest.swift](Tests/MetalHLOCoreTests/AllReduceTest.swift) |
 
 ### Dtypes
 
@@ -233,8 +234,11 @@ routes to native MPSGraph (`cholesky`, `triangular_solve`) or to Apple's Acceler
 framework run host-side over the shared buffers (`svd`, `qr`, `eigh` — the same LAPACK
 JAX-CPU itself calls). Verified against JAX CPU by reconstruction.
 
-**Excluded by design.** Multi-device collectives (all_gather, all_reduce), communication
-primitives (infeed, outfeed), and tuple ops — single-device focus.
+**Collectives (experimental).** `stablehlo.all_reduce` is supported, and
+`jax.shard_map` with `jax.lax.psum` / `pmean` runs end-to-end — see **Distributed
+(experimental)** under [Limitations](#limitations).
+
+**Excluded by design.** Communication primitives (infeed, outfeed) and tuple ops.
 
 ## Performance
 
@@ -269,12 +273,21 @@ overhead, enable caching, and profile with `executeWithTiming()`.
 
 ## Limitations
 
-**Execution model.** Single-device only (no multi-GPU/distributed); static shapes only
-(no dynamic shape inference); Apple Silicon + macOS only.
+**Execution model.** One physical Apple GPU; static shapes only (no dynamic shape
+inference); Apple Silicon + macOS only. Data parallelism runs across N *virtual*
+devices on that one GPU (see Distributed below) — not real multi-GPU/multi-host yet.
 
-**Sharding.** `pjit` with a mesh, `shard_map`, and `nn.partitioning` are unsupported.
-Multi-device SPMD modules (`num_partitions`/`num_replicas > 1`) fail loudly at parse time;
-single-device meshes pass through.
+**Distributed (experimental).** `jax.shard_map` with data-parallel collectives
+(`jax.lax.psum` / `pmean`, i.e. `stablehlo.all_reduce`) runs end-to-end through
+JAX → PJRT → MetalHLO. Set `METALHLO_NUM_DEVICES=N` to advertise N devices; JAX
+places an N-device mesh and MetalHLO runs it as a **single-process simulation** —
+the sharded body is desugared into a flat program (slice per shard → replay →
+cross-shard combine → reassemble) and every shard executes on the one GPU. This
+validates the full collective compiler+runtime path; a real multi-Mac transport
+(e.g. RDMA over Thunderbolt) would replace the in-process combine. Not yet:
+automatic `pjit` auto-sharding (needs XLA's SPMD partitioner), sharded outputs
+(FSDP), the other collectives (`all_gather` / `reduce_scatter` / `collective_permute`
+/ `all_to_all`), and non-leading-axis / multi-axis sharding.
 
 **Numerics / known gaps.**
 - `jax.random.normal` diverges ~2.4e-7 from JAX — the threefry *bits* are exact, but the
