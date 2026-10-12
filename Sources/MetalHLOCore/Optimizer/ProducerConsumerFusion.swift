@@ -241,8 +241,11 @@ public final class ProducerConsumerFusion: @unchecked Sendable {
             (op.kind == .transpose || op.kind == .broadcastInDim)
                 && !op.operands.isEmpty && regionResultSet.contains(op.operands[0])
         }
+        // The chain kernel binds every external input, the output and a count
+        // as buffers, and Metal has 31 buffer slots.
+        let fitsBufferSlots = sortedInputs.count <= 28
         let canEmitAsCustomCall = emitCustomCalls && orderedOps.count > 1
-            && allElementwise && !unsafeSelect && !unsafeShapeOp
+            && allElementwise && !unsafeSelect && !unsafeShapeOp && fitsBufferSlots
 
         // Mark this region's ops as assigned so the outer loop doesn't
         // revisit them. There's ONE exception: when the region will emit

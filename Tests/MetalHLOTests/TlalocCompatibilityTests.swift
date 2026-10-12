@@ -528,6 +528,54 @@ struct TlalocNumericsTests {
         expectClose(try out[1].toFloatArray(), [2, 4])
     }
 
+    @Test("chlo.lgamma / chlo.digamma / chlo.polygamma (pretty and generic forms)")
+    func chloSpecialFunctions() throws {
+        let client = try Client.create()
+        let mlir = """
+        module @m {
+          func.func @main(%x: tensor<6xf32>, %n: tensor<6xf32>) -> (tensor<6xf32>, tensor<6xf32>, tensor<6xf32>) {
+            %a = chlo.lgamma %x : tensor<6xf32> -> tensor<6xf32>
+            %b = chlo.digamma %x : tensor<6xf32> -> tensor<6xf32>
+            %c = "chlo.polygamma"(%n, %x) : (tensor<6xf32>, tensor<6xf32>) -> tensor<6xf32>
+            return %a, %b, %c : tensor<6xf32>, tensor<6xf32>, tensor<6xf32>
+          }
+        }
+        """
+        let xs: [Float] = [0.3, 1, 2.5, 7, -0.5, -1.5]
+        let x = try client.createBuffer(xs, shape: [6])
+        let n = try client.createBuffer([0, 1, 2, 3, 1, 0] as [Float], shape: [6])
+        // log Γ(x); ψ(x); ψ⁽ⁿ⁾(x) for n = 0, 1, 2, 3, 1, 0 (scipy.special values).
+        let lgamma: [Float] = [1.0957980, 0, 0.2846829, 6.5792512, 1.2655121, 0.8600470]
+        let digamma: [Float] = [-3.5025242, -0.5772157, 0.7031566, 1.8727843, 0.0364899, 0.7031566]
+        let polygamma: [Float] = [-3.5025242, 1.6449341, -0.2362041, 0.0071982, 8.9348022, 0.7031566]
+        for exe in try compileBoth(client, mlir) {
+            let out = try exe.execute([x, n])
+            expectClose(try out[0].toFloatArray(), lgamma, tol: 1e-5, "lgamma")
+            expectClose(try out[1].toFloatArray(), digamma, tol: 1e-5, "digamma")
+            expectClose(try out[2].toFloatArray(), polygamma, tol: 1e-4, "polygamma")
+        }
+    }
+
+    @Test("is_finite on the Metal-kernel path")
+    func isFinite() throws {
+        let client = try Client.create()
+        let mlir = """
+        module @m {
+          func.func @main(%x: tensor<4xf32>) -> tensor<4xf32> {
+            %p = stablehlo.is_finite %x : (tensor<4xf32>) -> tensor<4xi1>
+            %one = stablehlo.constant dense<1.0> : tensor<4xf32>
+            %zero = stablehlo.constant dense<0.0> : tensor<4xf32>
+            %r = stablehlo.select %p, %one, %zero : tensor<4xi1>, tensor<4xf32>
+            return %r : tensor<4xf32>
+          }
+        }
+        """
+        let x = try client.createBuffer([1, .infinity, .nan, -3] as [Float], shape: [4])
+        for exe in try compileBoth(client, mlir) {
+            expectClose(try exe.execute([x])[0].toFloatArray(), [1, 0, 0, 1])
+        }
+    }
+
     @Test("concurrent executions of one executable keep their own results")
     func concurrentExecute() throws {
         let client = try Client.create()

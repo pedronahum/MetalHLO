@@ -211,6 +211,12 @@ public final class Parser {
             }
 
             let op = try parseOperationGivenResult(result: opResult, resultCount: opResultCount)
+            for expanded in takePendingExpansion() {
+                operations.append(HLOOperation(
+                    result: expanded.result, kind: expanded.kind,
+                    operands: expanded.operands.map { resolveAlias($0, aliases: valueAliases) },
+                    resultType: expanded.resultType, attributes: expanded.attributes))
+            }
 
             if op.kind == .tuple {
                 // Record tuple composition — resolve any aliases in operands
@@ -1040,9 +1046,34 @@ public final class Parser {
     /// consumed. Split out of `parseOperation` so the function-body loop can peek
     /// the op name (to intercept `sdy.manual_computation`) after parsing the
     /// result, without backtracking.
+    /// Ops a CHLO expansion emitted ahead of the op it returns; whoever
+    /// appends that op appends these first (see `ChloExpander`).
+    private var pendingExpansion: [HLOOperation] = []
+
+    private func takePendingExpansion() -> [HLOOperation] {
+        defer { pendingExpansion = [] }
+        return pendingExpansion
+    }
+
     private func parseOperationGivenResult(result: String, resultCount: Int) throws -> HLOOperation {
         // Parse operation name (e.g., stablehlo.add)
         let opName = try parseOperationName()
+
+        // CHLO special functions: expanded into elementwise StableHLO ops.
+        if opName == "chlo.lgamma" || opName == "chlo.digamma" || opName == "chlo.polygamma" {
+            let (operands, _, resultType) = try parseOperationBody(
+                kind: opName == "chlo.polygamma" ? .atan2 : .exponential)
+            var expander = ChloExpander(type: resultType, prefix: result)
+            switch opName {
+            case "chlo.lgamma": _ = expander.lgamma(operands[0])
+            case "chlo.digamma": _ = expander.digamma(operands[0])
+            default: _ = expander.polygamma(operands[0], operands[1])
+            }
+            expander.finish(as: result)
+            pendingExpansion.append(contentsOf: expander.ops.dropLast())
+            return expander.ops.last!
+        }
+
         let kind = try parseOpKind(from: opName)
 
         // Parse operands and attributes based on operation
@@ -3354,6 +3385,7 @@ public final class Parser {
                 break
             }
             let op = try parseOperation()
+            operations.append(contentsOf: takePendingExpansion())
             operations.append(op)
             skipNewlines()
         }
@@ -3616,7 +3648,12 @@ public final class Parser {
             return try parseTensorType()
         }
 
-        return try parseTensorType()
+        let type = try parseTensorType()
+        // `: T -> R` (an unparenthesized single operand type): R is the result.
+        if match(.arrow) {
+            return try parseTensorType()
+        }
+        return type
     }
 
     /// Parses the type signature of a multi-input (argmax/argmin) reduce and

@@ -586,6 +586,20 @@ public final class CodeGenerator: @unchecked Sendable {
             } else {
                 source += generateUnaryKernel(entryPoint: entryPoint, operation: "\(metalType)(log(1.0f + float(x)))", metalType: metalType)
             }
+        case .isFinite:
+            // Float input, i1 (bool) output.
+            let inputMetal = metalTypeName(for: attributes.inputElementTypes?.first ?? .float32)
+            source += """
+            kernel void \(entryPoint)(
+                device const \(inputMetal)* input [[buffer(0)]],
+                device bool* output [[buffer(1)]],
+                constant uint& count [[buffer(2)]],
+                uint tid [[thread_position_in_grid]])
+            {
+                if (tid >= count) return;
+                output[tid] = isfinite(float(input[tid]));
+            }
+            """
         case .tan:
             if isFloat {
                 source += generateUnaryKernel(entryPoint: entryPoint, operation: "tan(x)", metalType: metalType)
@@ -1116,26 +1130,9 @@ public final class CodeGenerator: @unchecked Sendable {
     private func generateUnaryKernel(entryPoint: String, operation: String, metalType: String = "float") -> String {
         // Use vectorized kernel for float types
         if metalType == "float" {
-            // Convert operation to work with float4
-            // Replace 'x' with 'x4' for the vectorized version
-            let vec4Operation = operation
-                .replacingOccurrences(of: "exp(x)", with: "exp(x4)")
-                .replacingOccurrences(of: "log(x)", with: "log(x4)")
-                .replacingOccurrences(of: "sqrt(x)", with: "sqrt(x4)")
-                .replacingOccurrences(of: "rsqrt(x)", with: "rsqrt(x4)")
-                .replacingOccurrences(of: "sin(x)", with: "sin(x4)")
-                .replacingOccurrences(of: "cos(x)", with: "cos(x4)")
-                .replacingOccurrences(of: "tanh(x)", with: "tanh(x4)")
-                .replacingOccurrences(of: "abs(x)", with: "abs(x4)")
-                .replacingOccurrences(of: "floor(x)", with: "floor(x4)")
-                .replacingOccurrences(of: "ceil(x)", with: "ceil(x4)")
-                .replacingOccurrences(of: "sign(x)", with: "sign(x4)")
-                .replacingOccurrences(of: "-x", with: "-x4")
-                .replacingOccurrences(of: "(x)", with: "(x4)")
-                .replacingOccurrences(of: " x ", with: " x4 ")
-                .replacingOccurrences(of: " x)", with: " x4)")
-                .replacingOccurrences(of: "(x ", with: "(x4 ")
-
+            // The vector path names its float4 operand `x` too, so the scalar
+            // expression applies as-is (Metal's math functions have float4
+            // overloads).
             return """
             kernel void \(entryPoint)(
                 device const float* input [[buffer(0)]],
@@ -1150,10 +1147,10 @@ public final class CodeGenerator: @unchecked Sendable {
                 if (tid < count8) {
                     // Vectorized path: process 8 elements (two float4)
                     uint base = tid * 2;
-                    float4 x4 = reinterpret_cast<device const float4*>(input)[base];
-                    reinterpret_cast<device float4*>(output)[base] = \(vec4Operation);
-                    x4 = reinterpret_cast<device const float4*>(input)[base + 1];
-                    reinterpret_cast<device float4*>(output)[base + 1] = \(vec4Operation);
+                    float4 x = reinterpret_cast<device const float4*>(input)[base];
+                    reinterpret_cast<device float4*>(output)[base] = \(operation);
+                    x = reinterpret_cast<device const float4*>(input)[base + 1];
+                    reinterpret_cast<device float4*>(output)[base + 1] = \(operation);
                 }
                 else if (tid == count8) {
                     // Handle remainder (up to 7 elements)
@@ -7705,7 +7702,7 @@ public final class CodeGenerator: @unchecked Sendable {
             case .add, .subtract, .multiply, .divide, .remainder, .maximum, .minimum, .power, .atan2,
                  .negate, .abs, .exponential, .log, .sqrt, .rsqrt, .ceil, .floor, .roundNearestEven,
                  .sine, .cosine, .tanh, .sign, .logistic, .expm1, .log1p, .cbrt,
-                 .tan, .roundNearestAfz,
+                 .tan, .roundNearestAfz, .isFinite,
                  .and, .or, .xor, .not,
                  .shiftLeft, .shiftRightArithmetic, .shiftRightLogical,
                  .clamp, .select,
