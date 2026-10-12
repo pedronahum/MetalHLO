@@ -418,10 +418,18 @@ public final class IntegratedExecutor: @unchecked Sendable {
         // top-level runloop turn — which never comes when JAX is calling us in
         // a tight Python loop. Measured at full nanoGPT scale: ~2.64 GB leak
         // per step until OOM at ~step 14 in a 51 GB machine.
+        // One call at a time per executor: every call zeroes and fills the same
+        // unifiedBuffer slab, so concurrent calls on one executable would
+        // overwrite each other's intermediates. Different executables (each
+        // with its own executor and slab) still run concurrently.
+        executeLock.lock()
+        defer { executeLock.unlock() }
         return try autoreleasepool {
             try executeImpl(inputs: inputs)
         }
     }
+
+    private let executeLock = NSLock()
 
     private func executeImpl(inputs: [String: MTLBuffer]) throws -> ExecutionResult {
         let startTime = DispatchTime.now()

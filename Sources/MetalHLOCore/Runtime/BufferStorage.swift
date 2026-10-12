@@ -424,6 +424,36 @@ public final class BufferStorage: @unchecked Sendable {
         }
     }
 
+    // MARK: - Float64 at the executor boundary
+
+    /// Metal has no double: every executor computes f64 as f32 and reads an f64
+    /// tensor's elements as 4-byte floats. This is the storage an executor is
+    /// fed for a caller's f64 buffer (8-byte doubles): still typed f64, holding
+    /// f32 values in the first `4 * count` bytes, zero-padded to the f64 byte
+    /// size that executors' input checks expect. Storage of any other type is
+    /// returned unchanged.
+    public func float64ForExecutor() throws -> BufferStorage {
+        guard elementType == .float64 else { return self }
+        var floats = try toArray(as: Double.self).map { Float($0) }
+        floats.append(contentsOf: repeatElement(0, count: floats.count))
+        return try BufferStorage(
+            bytes: floats.withUnsafeBufferPointer { Data(buffer: $0) },
+            shape: shape, elementType: .float64, device: device)
+    }
+
+    /// The inverse of `float64ForExecutor()` for an executor output declared
+    /// f64: its first `count` 4-byte floats (or, for an input handed straight
+    /// back, an f32-typed storage) widened to 8-byte doubles.
+    public func float64FromExecutor() throws -> BufferStorage {
+        guard elementType == .float64 || elementType == .float32 else { return self }
+        let n = count
+        let floats: [Float] = try toData().withUnsafeBytes { Array($0.bindMemory(to: Float.self).prefix(n)) }
+        let doubles = floats.map { Double($0) }
+        return try BufferStorage(
+            bytes: doubles.withUnsafeBufferPointer { Data(buffer: $0) },
+            shape: shape, elementType: .float64, device: device)
+    }
+
     /// Converts buffer contents to a Bool array.
     public func toBoolArray() throws -> [Bool] {
         let bytes: [UInt8] = try toArray(as: UInt8.self)

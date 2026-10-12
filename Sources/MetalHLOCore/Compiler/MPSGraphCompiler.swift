@@ -693,7 +693,7 @@ public final class MPSGraphCompiler {
 
         // Shift operations
         case .shiftLeft:
-            return try compileBinaryOp(op) { graph.bitwiseLeftShift($0, $1, name: op.result) }
+            return try compileShiftLeft(op)
         case .shiftRightArithmetic:
             return try compileBinaryOp(op) { graph.bitwiseRightShift($0, $1, name: op.result) }
         case .shiftRightLogical:
@@ -800,10 +800,7 @@ public final class MPSGraphCompiler {
             return try compileSort(op)
 
         case .sortResult:
-            // Multi-operand sort is split into per-result rank-scatter kernels on
-            // the fast CodeGenerator path; it does not run on the MPSGraph path.
-            throw CompilationError.unsupportedOperation(
-                "sort_result is a fast-path-only op and should not reach MPSGraph")
+            return try compileSortResult(op)
 
         // Top-k over the last axis (jax.lax.top_k), split into a values op and
         // an indices op by the parser.
@@ -1058,9 +1055,11 @@ public final class MPSGraphCompiler {
 
         // Map function return values to call results
         var results: [MPSGraphTensor] = []
+        var resultTypes: [TensorType?] = []
         for returnVal in function.returnValues {
             if let tensor = valueMap[prefix + returnVal] {
                 results.append(tensor)
+                resultTypes.append(typeMap[prefix + returnVal])
             }
         }
 
@@ -1069,6 +1068,7 @@ public final class MPSGraphCompiler {
             for (index, tensor) in results.enumerated() {
                 let indexedName = "\(op.result).\(index)"
                 valueMap[indexedName] = tensor
+                if let type = resultTypes[index] { typeMap[indexedName] = type }
             }
             tupleOutputCounts[op.result] = results.count
         }
@@ -2045,6 +2045,111 @@ public final class MPSGraphCompiler {
     }
 
     /// Compile gather with no batching dimensions.
+    /// True when StableHLO gather semantics coincide with MPS gatherND: the
+    /// indexed dims are the leading operand dims in order, each collapsed with
+    /// slice size 1, every other dim is taken whole, and the offset dims trail
+    /// the batch dims in the result.
+    private func gatherIsPlainGatherND(
+        _ dimNumbers: GatherDimensionNumbers,
+        operandShape: [Int],
+        numBatchDims: Int
+    ) -> Bool {
+        let k = dimNumbers.startIndexMap.count
+        let rank = operandShape.count
+        guard k <= rank, dimNumbers.sliceSizes.count == rank,
+              dimNumbers.startIndexMap == Array(0..<k),
+              dimNumbers.collapsedSliceDims == Array(0..<k) else { return false }
+        for d in 0..<rank where dimNumbers.sliceSizes[d] != (d < k ? 1 : operandShape[d]) {
+            return false
+        }
+        return dimNumbers.offsetDims == Array(numBatchDims..<(numBatchDims + rank - k))
+    }
+
+    /// StableHLO gather by its definition: every result element reads
+    /// operand[clamp(start(batch)) + window offset]. Builds that full coordinate
+    /// for each element (clamped start broadcast against a constant grid of
+    /// window offsets), gathers it with one gatherND over all operand dims,
+    /// drops the collapsed dims and moves the offset dims to `offset_dims`.
+    private func compileGatherBySlices(
+        _ op: HLOOperation,
+        operand: MPSGraphTensor,
+        operandShape: [Int],
+        startIndices: MPSGraphTensor,
+        indicesShape: [Int],
+        dimNumbers: GatherDimensionNumbers
+    ) throws -> MPSGraphTensor {
+        let rank = operandShape.count
+        let sizes = dimNumbers.sliceSizes
+        let indexVectorDim = dimNumbers.indexVectorDim
+        let nsShape: ([Int]) -> [NSNumber] = { $0.map { NSNumber(value: $0) } }
+
+        // Start indices as [batch..., K].
+        var batchShape = indicesShape
+        let idx: MPSGraphTensor
+        if indexVectorDim >= indicesShape.count {
+            idx = graph.reshape(startIndices, shape: nsShape(indicesShape + [1]), name: "\(op.result)_idx")
+        } else {
+            batchShape.remove(at: indexVectorDim)
+            var perm = Array(0..<indicesShape.count)
+            perm.remove(at: indexVectorDim)
+            perm.append(indexVectorDim)
+            idx = perm == Array(0..<indicesShape.count) ? startIndices
+                : graph.transpose(startIndices, permutation: nsShape(perm), name: "\(op.result)_idx")
+        }
+        let nB = batchShape.count
+
+        // One clamped start column per operand dim: [batch..., 1] each, then [batch..., R].
+        let zero = graph.constant(0, dataType: .int32)
+        var columns: [MPSGraphTensor] = []
+        for d in 0..<rank {
+            if let k = dimNumbers.startIndexMap.firstIndex(of: d) {
+                let column = graph.sliceTensor(idx, dimension: nB, start: k, length: 1, name: "\(op.result)_start\(d)")
+                let high = graph.constant(Double(max(operandShape[d] - sizes[d], 0)), dataType: .int32)
+                columns.append(graph.clamp(column, min: zero, max: high, name: "\(op.result)_clamp\(d)"))
+            } else {
+                columns.append(graph.constant(0, shape: nsShape(batchShape + [1]), dataType: .int32))
+            }
+        }
+        var start = columns.count == 1 ? columns[0]
+            : graph.concatTensors(columns, dimension: nB, name: "\(op.result)_starts")
+        start = graph.reshape(start, shape: nsShape(batchShape + Array(repeating: 1, count: rank) + [rank]),
+                              name: "\(op.result)_starts_b")
+
+        // Window offsets: [sizes..., R], entry [w..., d] = w_d.
+        let windowCount = sizes.reduce(1, *)
+        var offsets = [Int32](repeating: 0, count: windowCount * rank)
+        for linear in 0..<windowCount {
+            var rest = linear
+            for d in stride(from: rank - 1, through: 0, by: -1) {
+                offsets[linear * rank + d] = Int32(rest % sizes[d])
+                rest /= sizes[d]
+            }
+        }
+        let window = graph.constant(
+            offsets.withUnsafeBufferPointer { Data(buffer: $0) },
+            shape: nsShape(sizes + [rank]), dataType: .int32)
+
+        let coordinates = graph.addition(start, window, name: "\(op.result)_coords")  // [batch..., sizes..., R]
+        let gathered = graph.gatherND(withUpdatesTensor: operand, indicesTensor: coordinates,
+                                      batchDimensions: 0, name: "\(op.result)_gathered")  // [batch..., sizes...]
+
+        let kept = (0..<rank).filter { !dimNumbers.collapsedSliceDims.contains($0) }.map { sizes[$0] }
+        var result = graph.reshape(gathered, shape: nsShape(batchShape + kept), name: "\(op.result)_kept")
+
+        let outRank = nB + kept.count
+        var perm: [Int] = []
+        var nextBatch = 0
+        var nextOffset = nB
+        for p in 0..<outRank {
+            if dimNumbers.offsetDims.contains(p) { perm.append(nextOffset); nextOffset += 1 }
+            else { perm.append(nextBatch); nextBatch += 1 }
+        }
+        if perm != Array(0..<outRank) {
+            result = graph.transpose(result, permutation: nsShape(perm), name: op.result)
+        }
+        return result
+    }
+
     private func compileGatherNoBatching(
         _ op: HLOOperation,
         operand: MPSGraphTensor,
@@ -2060,6 +2165,18 @@ public final class MPSGraphCompiler {
         let indicesRank = indicesShape.count
         let indexVectorDim = dimNumbers.indexVectorDim
         let indexVectorSize = dimNumbers.startIndexMap.count
+
+        // gatherND alone takes whole trailing slices at leading-dim indices; any
+        // other gather (windowed slices, unordered or uncollapsed indexed dims,
+        // offset dims not trailing) goes through the general lowering.
+        if let operandShape = operand.shape?.map({ $0.intValue }),
+           !gatherIsPlainGatherND(
+               dimNumbers, operandShape: operandShape,
+               numBatchDims: indexVectorDim < indicesRank ? indicesRank - 1 : indicesRank) {
+            return try compileGatherBySlices(
+                op, operand: operand, operandShape: operandShape,
+                startIndices: startIndices, indicesShape: indicesShape, dimNumbers: dimNumbers)
+        }
 
         // Build indices tensor for gatherND
         var reshapedIndices: MPSGraphTensor
@@ -2161,7 +2278,17 @@ public final class MPSGraphCompiler {
         let inputBatchDims = dimNumbers.inputBatchingDims
         let indicesBatchDims = dimNumbers.scatterIndicesBatchingDims
 
-        // FAST PATH: No batching dimensions
+        // No batching dimensions: StableHLO scatter by its definition.
+        if inputBatchDims.isEmpty {
+            return try compileScatterByCoordinates(
+                op,
+                operand: operand,
+                scatterIndices: scatterIndices,
+                updates: updates,
+                dimNumbers: dimNumbers,
+                scatterMode: scatterMode
+            )
+        }
         if inputBatchDims.isEmpty {
             return try compileScatterNoBatching(
                 op,
@@ -2507,6 +2634,110 @@ public final class MPSGraphCompiler {
     }
 
     /// Compile scatter with no batching dimensions.
+    /// StableHLO scatter (no batching dims) by its definition: every update
+    /// element lands at operand[start(scatter index) + window offset], combined
+    /// by `scatterMode`. Builds that full coordinate for each update element
+    /// (start columns broadcast against a constant grid of window offsets),
+    /// sends out-of-bounds elements — which StableHLO skips — to a padding row
+    /// appended to dim 0, applies one scatterND over all operand dims and
+    /// slices the padding off.
+    private func compileScatterByCoordinates(
+        _ op: HLOOperation,
+        operand: MPSGraphTensor,
+        scatterIndices: MPSGraphTensor,
+        updates: MPSGraphTensor,
+        dimNumbers: ScatterDimensionNumbers,
+        scatterMode: MPSGraphScatterMode
+    ) throws -> MPSGraphTensor {
+        guard let operandShape = operand.shape?.map({ $0.intValue }),
+              let indicesShape = scatterIndices.shape?.map({ $0.intValue }),
+              let updatesShape = updates.shape?.map({ $0.intValue }),
+              !operandShape.isEmpty else {
+            throw CompilationError.undefinedValue("\(op.result)_shape")
+        }
+        let ns: ([Int]) -> [NSNumber] = { $0.map { NSNumber(value: $0) } }
+        let rank = operandShape.count
+        let windowDims = dimNumbers.updateWindowDims
+        let scatterDims = (0..<updatesShape.count).filter { !windowDims.contains($0) }
+        let scatterShape = scatterDims.map { updatesShape[$0] }
+        let windowShape = windowDims.map { updatesShape[$0] }
+        let windowOperandDims = (0..<rank).filter { !dimNumbers.insertedWindowDims.contains($0) }
+        guard windowOperandDims.count == windowDims.count else {
+            throw CompilationError.unsupportedOperation(
+                "scatter: \(windowDims.count) update window dims for \(windowOperandDims.count) operand window dims")
+        }
+
+        // Updates as [scatter..., window...].
+        var updatesPerm = scatterDims + windowDims
+        let orderedUpdates = updatesPerm == Array(0..<updatesShape.count) ? updates
+            : graph.transpose(updates, permutation: ns(updatesPerm), name: "\(op.result)_upd")
+        updatesPerm.removeAll()
+
+        // Indices as [scatter..., K].
+        var idx = graph.cast(scatterIndices, to: .int32, name: "\(op.result)_idx_i32")
+        let ivd = dimNumbers.indexVectorDim
+        if ivd >= indicesShape.count {
+            idx = graph.reshape(idx, shape: ns(indicesShape + [1]), name: "\(op.result)_idx")
+        } else if ivd != indicesShape.count - 1 {
+            var perm = Array(0..<indicesShape.count)
+            perm.remove(at: ivd)
+            perm.append(ivd)
+            idx = graph.transpose(idx, permutation: ns(perm), name: "\(op.result)_idx")
+        }
+        let nS = scatterShape.count
+
+        // Start coordinate per operand dim: [scatter..., R], then [scatter..., 1 x window, R].
+        var columns: [MPSGraphTensor] = []
+        for d in 0..<rank {
+            if let k = dimNumbers.scatterDimsToOperandDims.firstIndex(of: d) {
+                columns.append(graph.sliceTensor(idx, dimension: nS, start: k, length: 1, name: nil))
+            } else {
+                columns.append(graph.constant(0, shape: ns(scatterShape + [1]), dataType: .int32))
+            }
+        }
+        var start = columns.count == 1 ? columns[0] : graph.concatTensors(columns, dimension: nS, name: nil)
+        start = graph.reshape(start, shape: ns(scatterShape + Array(repeating: 1, count: windowShape.count) + [rank]),
+                              name: "\(op.result)_start")
+
+        // Window offsets [window..., R]: window dim i moves operand dim windowOperandDims[i].
+        let windowCount = windowShape.reduce(1, *)
+        var offsets = [Int32](repeating: 0, count: windowCount * rank)
+        for linear in 0..<windowCount {
+            var rest = linear
+            for i in stride(from: windowShape.count - 1, through: 0, by: -1) {
+                offsets[linear * rank + windowOperandDims[i]] = Int32(rest % windowShape[i])
+                rest /= windowShape[i]
+            }
+        }
+        let window = graph.constant(offsets.withUnsafeBufferPointer { Data(buffer: $0) },
+                                    shape: ns(windowShape + [rank]), dataType: .int32)
+        var coords = graph.addition(start, window, name: "\(op.result)_coords")  // [scatter..., window..., R]
+
+        // Out-of-bounds elements go to the padding row operand[dim0 = size0, 0, ...].
+        let bounds = graph.constant(operandShape.map { Int32($0) }.withUnsafeBufferPointer { Data(buffer: $0) },
+                                    shape: [NSNumber(value: rank)], dataType: .int32)
+        let zero = graph.constant(0, dataType: .int32)
+        let outside = graph.logicalOR(graph.lessThan(coords, zero, name: nil),
+                                      graph.greaterThanOrEqualTo(coords, bounds, name: nil), name: nil)
+        let anyOutside = graph.greaterThan(
+            graph.reductionMaximum(with: graph.cast(outside, to: .int32, name: nil), axis: -1, name: nil),
+            zero, name: nil)  // [..., 1]
+        var paddingRow = [Int32](repeating: 0, count: rank)
+        paddingRow[0] = Int32(operandShape[0])
+        let paddingCoord = graph.constant(paddingRow.withUnsafeBufferPointer { Data(buffer: $0) },
+                                          shape: [NSNumber(value: rank)], dataType: .int32)
+        coords = graph.select(predicate: anyOutside, trueTensor: paddingCoord, falseTensor: coords, name: nil)
+
+        var rightPadding = [Int](repeating: 0, count: rank)
+        rightPadding[0] = 1
+        let padded = graph.padTensor(operand, with: .constant,
+                                     leftPadding: ns(Array(repeating: 0, count: rank)),
+                                     rightPadding: ns(rightPadding), constantValue: 0, name: nil)
+        let scattered = graph.scatterNDWithData(padded, updates: orderedUpdates, indices: coords,
+                                        batchDimensions: 0, mode: scatterMode, name: nil)
+        return graph.sliceTensor(scattered, dimension: 0, start: 0, length: operandShape[0], name: op.result)
+    }
+
     private func compileScatterNoBatching(
         _ op: HLOOperation,
         operand: MPSGraphTensor,
@@ -2864,8 +3095,10 @@ public final class MPSGraphCompiler {
                 var floats = values.map { Float16($0) }
                 data = Data(bytes: &floats, count: floats.count * MemoryLayout<Float16>.stride)
             case .float64:
-                var doubles = values
-                data = Data(bytes: &doubles, count: doubles.count * MemoryLayout<Double>.stride)
+                // f64 runs as f32 on Metal (mpsDataType maps it to .float32), so
+                // the constant's bytes must be f32 too.
+                var floats = values.map { Float($0) }
+                data = Data(bytes: &floats, count: floats.count * MemoryLayout<Float>.stride)
             case .bfloat16:
                 // bf16 = upper 16 bits of fp32 (round-to-nearest-even).
                 var bf16Bytes = [UInt16]()
@@ -4264,15 +4497,59 @@ public final class MPSGraphCompiler {
         return graph.cast(result, to: op.resultType.elementType.mpsDataType, name: op.result)
     }
 
-    private func compileShiftRightLogical(_ op: HLOOperation) throws -> MPSGraphTensor {
-        // Logical right shift (zero-filling)
-        // MPSGraph's bitwiseRightShift is arithmetic, so we need to handle unsigned
-        let input = try getOperand(op.operands[0])
-        let shiftAmount = try getOperand(op.operands[1])
+    /// The unsigned type of the same width, for shifting signed bits logically.
+    private func unsignedCounterpart(_ type: MPSDataType) -> MPSDataType {
+        switch type {
+        case .int8: return .uInt8
+        case .int16: return .uInt16
+        case .int32: return .uInt32
+        case .int64: return .uInt64
+        default: return type
+        }
+    }
 
-        // For unsigned types, arithmetic and logical shifts are the same
-        // For signed types, we'd need to mask, but MPSGraph handles this
-        return graph.bitwiseRightShift(input, shiftAmount, name: op.result)
+    private func bitWidth(_ type: MPSDataType) -> Int {
+        switch type {
+        case .int8, .uInt8: return 8
+        case .int16, .uInt16: return 16
+        case .int64, .uInt64: return 64
+        default: return 32
+        }
+    }
+
+    /// StableHLO shift counts are unsigned: a count >= the bit width (or a
+    /// negative one, read as unsigned) shifts every bit out. Selects `zero`
+    /// for those lanes.
+    private func zeroingOversizedShifts(
+        _ shifted: MPSGraphTensor, count: MPSGraphTensor, type: MPSDataType, name: String
+    ) -> MPSGraphTensor {
+        let unsignedCount = graph.reinterpretCast(count, to: unsignedCounterpart(type), name: nil)
+        let width = graph.constant(Double(bitWidth(type)), dataType: unsignedCounterpart(type))
+        let oversized = graph.greaterThanOrEqualTo(unsignedCount, width, name: nil)
+        return graph.select(predicate: oversized, trueTensor: graph.constant(0, dataType: type),
+                            falseTensor: shifted, name: name)
+    }
+
+    private func compileShiftLeft(_ op: HLOOperation) throws -> MPSGraphTensor {
+        let input = try getOperand(op.operands[0])
+        let count = try getOperand(op.operands[1])
+        let shifted = graph.bitwiseLeftShift(input, count, name: nil)
+        return zeroingOversizedShifts(shifted, count: count, type: input.dataType, name: op.result)
+    }
+
+    private func compileShiftRightLogical(_ op: HLOOperation) throws -> MPSGraphTensor {
+        // Logical right shift (zero-filling). MPSGraph's bitwiseRightShift is
+        // arithmetic on signed types, so shift the bits as the unsigned type of
+        // the same width.
+        let input = try getOperand(op.operands[0])
+        let count = try getOperand(op.operands[1])
+        let type = input.dataType
+        let unsigned = unsignedCounterpart(type)
+        var shifted = graph.bitwiseRightShift(
+            graph.reinterpretCast(input, to: unsigned, name: nil),
+            graph.reinterpretCast(count, to: unsigned, name: nil), name: nil)
+        if unsigned != type { shifted = graph.reinterpretCast(shifted, to: type, name: nil) }
+        return zeroingOversizedShifts(shifted, count: count, type: type, name: op.result)
     }
 
     // MARK: - Complex Number Operations
@@ -4662,8 +4939,8 @@ public final class MPSGraphCompiler {
     // MARK: - Linear Algebra Operations
 
     private func compileTriangularSolve(_ op: HLOOperation) throws -> MPSGraphTensor {
-        var a = try getOperand(op.operands[0])  // triangular matrix [N, N]
-        let b = try getOperand(op.operands[1])  // right-hand side [N, M]
+        var a = try getOperand(op.operands[0])  // triangular matrix [..., N, N]
+        let b = try getOperand(op.operands[1])  // right-hand side [..., N, M]
 
         let leftSide = op.attributes.leftSide ?? true
         var lower = op.attributes.lower ?? true
@@ -4675,6 +4952,14 @@ public final class MPSGraphCompiler {
                 "triangular_solve with left_side=false not yet implemented"
             )
         }
+        guard let aShape = a.shape, aShape.count >= 2 else {
+            throw CompilationError.unsupportedOperation("triangular_solve requires a matrix A of rank >= 2")
+        }
+        // Leading dims are batch dims; the matrix is the last two axes. Every
+        // slice, concat and matmul below works over those two axes and
+        // broadcasts across the batch.
+        let rowAxis = aShape.count - 2
+        let colAxis = aShape.count - 1
 
         // Solve op(A)·X = B. For trans = T (or C; real inputs make adjoint == T),
         // op(A) = Aᵀ. Since the transpose of a lower-triangular matrix is upper
@@ -4682,72 +4967,108 @@ public final class MPSGraphCompiler {
         // same forward/backward substitution. The unit-diagonal property is
         // preserved by the transpose.
         if transpose != .noTranspose {
-            a = graph.transposeTensor(a, dimension: 0, withDimension: 1, name: nil)
+            a = graph.transposeTensor(a, dimension: rowAxis, withDimension: colAxis, name: nil)
             lower.toggle()
         }
-
-        guard let aShape = a.shape, aShape.count == 2 else {
-            throw CompilationError.unsupportedOperation("triangular_solve requires 2D matrix A")
-        }
-        let n = aShape[0].intValue
+        let n = aShape[rowAxis].intValue
 
         // Build X row-by-row via forward (lower) or backward (upper) substitution.
         // For lower triangular: X[i,:] = (B[i,:] - A[i,0:i] @ X[0:i,:]) / A[i,i]
         // For upper triangular: X[i,:] = (B[i,:] - A[i,i+1:N] @ X[i+1:N,:]) / A[i,i]
-        var xRows: [MPSGraphTensor] = Array(repeating: graph.constant(0.0, shape: [1, 1], dataType: .float32), count: n)
+        var xRows: [MPSGraphTensor?] = Array(repeating: nil, count: n)
         let indices = lower ? Array(0..<n) : Array((0..<n).reversed())
 
         for i in indices {
-            // B[i, :] — shape [1, M]
-            let bi = graph.sliceTensor(b, dimension: 0, start: i, length: 1, name: nil)
+            // B[..., i, :] — shape [..., 1, M]
+            let bi = graph.sliceTensor(b, dimension: rowAxis, start: i, length: 1, name: nil)
+            let aRowI = graph.sliceTensor(a, dimension: rowAxis, start: i, length: 1, name: nil)  // [..., 1, N]
 
             // Compute correction = A[i, prev_range] @ X[prev_range, :]
             var corrected = bi
             let prevIndices = lower ? Array(0..<i) : Array((i+1)..<n)
 
             if !prevIndices.isEmpty {
-                // Stack previously solved rows into a submatrix
-                var prevRows: [MPSGraphTensor] = []
-                for j in prevIndices {
-                    prevRows.append(xRows[j])
-                }
-                let xPrev = graph.concatTensors(prevRows, dimension: 0, name: nil)  // [K, M]
+                // Stack previously solved rows into a submatrix [..., K, M]
+                let xPrev = graph.concatTensors(prevIndices.map { xRows[$0]! }, dimension: rowAxis, name: nil)
 
-                // A[i, prev_range] — shape [1, K]
-                let aRow: MPSGraphTensor
-                if lower {
-                    aRow = graph.sliceTensor(
-                        graph.sliceTensor(a, dimension: 0, start: i, length: 1, name: nil),
-                        dimension: 1, start: 0, length: i, name: nil
-                    )
-                } else {
-                    aRow = graph.sliceTensor(
-                        graph.sliceTensor(a, dimension: 0, start: i, length: 1, name: nil),
-                        dimension: 1, start: i + 1, length: n - i - 1, name: nil
-                    )
-                }
+                // A[..., i, prev_range] — shape [..., 1, K]
+                let aRow = lower
+                    ? graph.sliceTensor(aRowI, dimension: colAxis, start: 0, length: i, name: nil)
+                    : graph.sliceTensor(aRowI, dimension: colAxis, start: i + 1, length: n - i - 1, name: nil)
 
-                // correction = A[i, prev_range] @ X[prev_range, :] — [1, M]
-                let correction = graph.matrixMultiplication(
-                    primary: aRow, secondary: xPrev, name: nil
-                )
+                // correction = A[i, prev_range] @ X[prev_range, :] — [..., 1, M]
+                let correction = graph.matrixMultiplication(primary: aRow, secondary: xPrev, name: nil)
                 corrected = graph.subtraction(bi, correction, name: nil)
             }
 
             if !unitDiag {
-                // Divide by diagonal element A[i, i]
-                let aii = graph.sliceTensor(
-                    graph.sliceTensor(a, dimension: 0, start: i, length: 1, name: nil),
-                    dimension: 1, start: i, length: 1, name: nil
-                )
+                // Divide by diagonal element A[..., i, i]
+                let aii = graph.sliceTensor(aRowI, dimension: colAxis, start: i, length: 1, name: nil)
                 corrected = graph.division(corrected, aii, name: nil)
             }
 
-            xRows[i] = corrected  // [1, M]
+            xRows[i] = corrected  // [..., 1, M]
         }
 
-        // Concatenate all rows → [N, M]
-        return graph.concatTensors(xRows, dimension: 0, name: op.result)
+        // Concatenate all rows → [..., N, M]
+        return graph.concatTensors(xRows.map { $0! }, dimension: rowAxis, name: op.result)
+    }
+
+    /// One result of a multi-operand sort (the parser splits `%r:N = sort(...)`
+    /// into N of these): operands are the K keys followed by this result's
+    /// payload. Same semantics as the fast path's kernel_sort_result — a stable
+    /// lexicographic order over the keys, NaN largest, ties kept in input
+    /// order — computed as each element's rank (how many elements sort before
+    /// it) and a scatter of the payload to that rank. The rank compares every
+    /// pair along the axis, so axes longer than `pairwiseRankLimit` fall back
+    /// to argSort on the first key.
+    private func compileSortResult(_ op: HLOOperation) throws -> MPSGraphTensor {
+        let operands = try op.operands.map { try getOperand($0) }
+        guard operands.count >= 2, let payloadShape = operands.last?.shape?.map({ $0.intValue }) else {
+            throw CompilationError.wrongOperandCount(expected: 2, got: operands.count)
+        }
+        let keys = Array(operands.dropLast())
+        let payload = operands.last!
+        let rank = payloadShape.count
+        let axis = { let a = op.attributes.axis ?? (rank - 1); return a < 0 ? a + rank : a }()
+        let descending = op.attributes.sortDescending ?? false
+        let length = payloadShape[axis]
+        let pairwiseRankLimit = 4096
+
+        if length > pairwiseRankLimit {
+            let order = graph.argSort(keys[0], axis: axis, descending: descending, name: nil)
+            return graph.gatherAlongAxis(axis, updates: payload, indices: order, name: op.result)
+        }
+
+        // Pairwise grid [..., L (i, at axis), L (j, at axis + 1), ...].
+        var gridShape = payloadShape
+        gridShape.insert(length, at: axis + 1)
+        let gridNS = gridShape.map { NSNumber(value: $0) }
+        let i = graph.coordinate(alongAxis: axis, withShape: gridNS, name: nil)
+        let j = graph.coordinate(alongAxis: axis + 1, withShape: gridNS, name: nil)
+
+        // before(j, i): j sorts ahead of i. Built from the last key outward:
+        // before = before_k0 || (equal_k0 && (before_k1 || (equal_k1 && ... (j < i))))
+        var before = graph.lessThan(j, i, name: nil)
+        for key in keys.reversed() {
+            let ki = graph.expandDims(key, axis: axis + 1, name: nil)  // element i
+            let kj = graph.expandDims(key, axis: axis, name: nil)      // element j
+            let iNaN = graph.notEqual(ki, ki, name: nil)
+            let jNaN = graph.notEqual(kj, kj, name: nil)
+            // Total order with NaN largest.
+            let jLess = graph.logicalOR(graph.logicalAND(graph.not(with: jNaN, name: nil), iNaN, name: nil),
+                                        graph.lessThan(kj, ki, name: nil), name: nil)
+            let jGreater = graph.logicalOR(graph.logicalAND(jNaN, graph.not(with: iNaN, name: nil), name: nil),
+                                           graph.greaterThan(kj, ki, name: nil), name: nil)
+            let equal = graph.not(with: graph.logicalOR(jLess, jGreater, name: nil), name: nil)
+            before = graph.logicalOR(descending ? jGreater : jLess,
+                                     graph.logicalAND(equal, before, name: nil), name: nil)
+        }
+        let position = graph.squeeze(
+            graph.reductionSum(with: graph.cast(before, to: .int32, name: nil), axis: axis + 1, name: nil),
+            axis: axis + 1, name: nil)
+        let zeros = graph.constant(0, shape: payloadShape.map { NSNumber(value: $0) }, dataType: payload.dataType)
+        return graph.scatterAlongAxis(axis, data: zeros, updates: payload, indices: position, mode: .set, name: op.result)
     }
 
     private func compileCholesky(_ op: HLOOperation) throws -> MPSGraphTensor {
@@ -4761,68 +5082,58 @@ public final class MPSGraphCompiler {
         //   L[j,j] = sqrt(A[j,j] - Σ_{k<j} L[j,k]²)
         //   L[i,j] = (A[i,j] - Σ_{k<j} L[i,k]·L[j,k]) / L[j,j]   (i > j)
         // The upper factor is just Lᵀ, so we compute L and transpose when needed.
-        let a = try getOperand(op.operands[0])  // SPD matrix [N, N]
+        // Leading dims are batch dims; the matrix is the last two axes.
+        let a = try getOperand(op.operands[0])  // SPD matrix [..., N, N]
         let lower = op.attributes.lower ?? true
 
-        guard let aShape = a.shape, aShape.count == 2 else {
-            throw CompilationError.unsupportedOperation("cholesky requires a 2D matrix")
+        guard let aShape = a.shape, aShape.count >= 2 else {
+            throw CompilationError.unsupportedOperation("cholesky requires a matrix of rank >= 2")
         }
-        let n = aShape[0].intValue
-        guard aShape[1].intValue == n else {
+        let rowAxis = aShape.count - 2
+        let colAxis = aShape.count - 1
+        let n = aShape[rowAxis].intValue
+        guard aShape[colAxis].intValue == n else {
             throw CompilationError.unsupportedOperation("cholesky requires a square matrix")
         }
+        let dataType = a.dataType
+        var columnShape = aShape
+        columnShape[colAxis] = 1  // [..., N, 1]
 
-        // Columns of L are accumulated as [N, 1] tensors. cols[j] holds column j;
-        // entries above the diagonal (row < j) are zero.
-        var cols: [MPSGraphTensor] = Array(
-            repeating: graph.constant(0.0, shape: [NSNumber(value: n), 1], dataType: a.dataType ?? .float32),
-            count: n
-        )
+        // Columns of L are accumulated as [..., N, 1] tensors. cols[j] holds
+        // column j; entries above the diagonal (row < j) are zero.
+        var cols: [MPSGraphTensor] = []
+        let rowIdx = graph.cast(
+            graph.coordinate(alongAxis: rowAxis, withShape: columnShape, name: nil), to: dataType, name: nil)
+        let zero = graph.constant(0.0, dataType: dataType)
 
         for j in 0..<n {
-            // A[:, j] — full column of the input, shape [N, 1].
-            let aColJ = graph.sliceTensor(a, dimension: 1, start: j, length: 1, name: nil)
-
+            // A[..., :, j] — full column of the input, shape [..., N, 1].
             // running = A[:, j] - Σ_{k<j} L[:, k] * L[j, k]
             // (L[j,k] is the j-th row entry of already-computed column k.)
-            var running = aColJ
+            var running = graph.sliceTensor(a, dimension: colAxis, start: j, length: 1, name: nil)
             for k in 0..<j {
-                let colK = cols[k]                               // [N, 1]
-                let ljk = graph.sliceTensor(colK, dimension: 0, start: j, length: 1, name: nil)  // [1,1] = L[j,k]
-                let term = graph.multiplication(colK, ljk, name: nil)  // broadcast [N,1]
-                running = graph.subtraction(running, term, name: nil)
+                let colK = cols[k]                                                                  // [..., N, 1]
+                let ljk = graph.sliceTensor(colK, dimension: rowAxis, start: j, length: 1, name: nil)  // [..., 1, 1]
+                running = graph.subtraction(running, graph.multiplication(colK, ljk, name: nil), name: nil)
             }
 
-            // Diagonal pivot L[j,j] = sqrt(running[j]).
-            let pivotRaw = graph.sliceTensor(running, dimension: 0, start: j, length: 1, name: nil)  // [1,1]
-            let pivot = graph.squareRoot(with: pivotRaw, name: nil)                                  // [1,1]
-
-            // Below-diagonal entries L[i,j] = running[i] / pivot for i > j; the
-            // diagonal becomes pivot; rows above j stay zero.
-            // Build a per-row mask: 1 where row > j (scale by 1/pivot), and inject
-            // the diagonal separately.
-            let divided = graph.division(running, pivot, name: nil)  // [N,1], correct for i>j and i==j
-
-            // Zero out rows i < j (strict upper part of this column).
-            // rowIdx[i] = i ; keep where rowIdx >= j.
-            let rowIdx = graph.coordinate(alongAxis: 0, withShape: [NSNumber(value: n), 1], name: nil)
-            let rowIdxF = graph.cast(rowIdx, to: a.dataType ?? .float32, name: nil)
-            let jConst = graph.constant(Double(j), shape: [1, 1], dataType: a.dataType ?? .float32)
-            let keepMask = graph.greaterThanOrEqualTo(rowIdxF, jConst, name: nil)  // bool [N,1]
-            let zero = graph.constant(0.0, shape: [NSNumber(value: n), 1], dataType: a.dataType ?? .float32)
-            let colJ = graph.select(predicate: keepMask, trueTensor: divided, falseTensor: zero, name: nil)
-
-            cols[j] = colJ
+            // Diagonal pivot L[j,j] = sqrt(running[j]); entries i >= j are
+            // running[i] / pivot (the diagonal itself is pivot); rows i < j are 0.
+            let pivotRaw = graph.sliceTensor(running, dimension: rowAxis, start: j, length: 1, name: nil)
+            let pivot = graph.squareRoot(with: pivotRaw, name: nil)
+            let divided = graph.division(running, pivot, name: nil)
+            let keepMask = graph.greaterThanOrEqualTo(
+                rowIdx, graph.constant(Double(j), dataType: dataType), name: nil)
+            cols.append(graph.select(predicate: keepMask, trueTensor: divided, falseTensor: zero, name: nil))
         }
 
-        // Assemble L = [col0 | col1 | ... ] → [N, N].
-        let lower_L = graph.concatTensors(cols, dimension: 1, name: lower ? op.result : nil)
-
+        // Assemble L = [col0 | col1 | ... ] → [..., N, N].
+        let lowerL = graph.concatTensors(cols, dimension: colAxis, name: lower ? op.result : nil)
         if lower {
-            return lower_L
+            return lowerL
         }
         // Upper factor requested: return Lᵀ.
-        return graph.transposeTensor(lower_L, dimension: 0, withDimension: 1, name: op.result)
+        return graph.transposeTensor(lowerL, dimension: rowAxis, withDimension: colAxis, name: op.result)
     }
 
     private func compileSelectAndScatter(_ op: HLOOperation) throws -> MPSGraphTensor {
@@ -5074,6 +5385,12 @@ public final class MPSGraphCompiler {
         for (index, tensor) in results.enumerated() {
             let indexedName = "\(op.result).\(index)"
             valueMap[indexedName] = tensor
+            // Shape-dependent consumers (broadcast_in_dim, dot, ...) read typeMap.
+            if index < bodyRegion.arguments.count {
+                typeMap[indexedName] = bodyRegion.arguments[index].type
+            } else if index < op.operands.count, let operandType = typeMap[op.operands[index]] {
+                typeMap[indexedName] = operandType
+            }
         }
 
         // Also store the count of outputs for tuple handling

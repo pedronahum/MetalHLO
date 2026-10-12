@@ -284,7 +284,7 @@ public final class StaticMemoryPlanner: @unchecked Sendable {
             let isConstant = op.kind == .constant
 
             lifetimes[op.result] = ScheduledTensorLifetime(
-                createdAt: index,
+                createdAt: Self.needsZeroedSlot(op) ? -1 : index,
                 lastUsedAt: isOutput ? function.operations.count : lastUse,
                 byteSize: byteSize,
                 isOutput: isOutput,
@@ -293,6 +293,16 @@ public final class StaticMemoryPlanner: @unchecked Sendable {
         }
 
         return lifetimes
+    }
+
+    /// Whether `op`'s kernel accumulates into its output with atomics and so
+    /// needs the slot zeroed when it starts (the f32 add-scatter of
+    /// `CodeGenerator.generateScatterKernel`). Such a result is treated as live
+    /// from before the first op, so no earlier tensor shares its slot and the
+    /// executor's per-call slab memset leaves it at zero.
+    static func needsZeroedSlot(_ op: HLOOperation) -> Bool {
+        op.kind == .scatter && op.attributes.scatterComputationKind == .add
+            && op.resultType.elementType == .float32
     }
 
     /// Extends the lifetime of any tensor feeding a `reshape` to cover the
@@ -371,7 +381,7 @@ public final class StaticMemoryPlanner: @unchecked Sendable {
             let isConstant = op.kind == .constant
 
             lifetimes[op.result] = ScheduledTensorLifetime(
-                createdAt: scheduledIndex,
+                createdAt: Self.needsZeroedSlot(op) ? -1 : scheduledIndex,
                 lastUsedAt: isOutput ? order.count : lastUse,
                 byteSize: op.resultType.byteCount,
                 isOutput: isOutput,

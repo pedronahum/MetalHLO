@@ -78,7 +78,8 @@ public final class Executable: @unchecked Sendable {
                 )
             }
         case .integrated(let executable, _):
-            return executable.inputSpecs.values.map { spec in
+            // In signature order: inputSpecs is keyed by name.
+            return executable.inputOrder.compactMap { executable.inputSpecs[$0] }.map { spec in
                 TensorType(
                     shape: spec.shape,
                     elementType: ElementType.fromCoreType(spec.elementType)
@@ -105,7 +106,8 @@ public final class Executable: @unchecked Sendable {
                 )
             }
         case .integrated(let executable, _):
-            return executable.outputSpecs.values.map { spec in
+            // In signature order: outputSpecs is keyed by name.
+            return executable.outputOrder.compactMap { executable.outputSpecs[$0] }.map { spec in
                 TensorType(
                     shape: spec.shape,
                     elementType: ElementType.fromCoreType(spec.elementType)
@@ -146,13 +148,35 @@ public final class Executable: @unchecked Sendable {
     /// - Throws: `MetalHLOError.executionFailed` or `MetalHLOError.inputMismatch`.
     /// - Returns: Output buffers.
     public func execute(_ inputs: [Buffer]) throws -> [Buffer] {
+        let inputs = try float64ForExecutor(inputs)
+        let outputs: [Buffer]
         switch backend {
         case .mpsGraph(let compiled, let executor):
-            return try executeMPSGraph(inputs, compiled: compiled, executor: executor)
+            outputs = try executeMPSGraph(inputs, compiled: compiled, executor: executor)
         case .integrated(_, let executor):
-            return try executeIntegrated(inputs, executor: executor)
+            outputs = try executeIntegrated(inputs, executor: executor)
         case .heterogeneous(let function, let executor):
-            return try executeHeterogeneous(inputs, function: function, executor: executor)
+            outputs = try executeHeterogeneous(inputs, function: function, executor: executor)
+        }
+        return try float64FromExecutor(outputs)
+    }
+
+    // MARK: - Float64 boundary
+
+    /// Executors compute f64 as f32 (Metal has no double); callers' f64 buffers
+    /// hold 8-byte doubles. Narrow f64 inputs on the way in...
+    private func float64ForExecutor(_ inputs: [Buffer]) throws -> [Buffer] {
+        guard inputs.contains(where: { $0.elementType == .float64 }) else { return inputs }
+        return try inputs.map { $0.elementType == .float64 ? Buffer(storage: try $0.storage.float64ForExecutor()) : $0 }
+    }
+
+    /// ...and widen every output the program declares f64 on the way out.
+    private func float64FromExecutor(_ outputs: [Buffer]) throws -> [Buffer] {
+        let declared = outputTypes
+        guard declared.contains(where: { $0.elementType == .float64 }) else { return outputs }
+        return try outputs.enumerated().map { i, out in
+            i < declared.count && declared[i].elementType == .float64
+                ? Buffer(storage: try out.storage.float64FromExecutor()) : out
         }
     }
 
@@ -162,6 +186,11 @@ public final class Executable: @unchecked Sendable {
     /// - Throws: `MetalHLOError.executionFailed` or `MetalHLOError.inputMismatch`.
     /// - Returns: A tuple of (outputs, timing).
     public func executeWithTiming(_ inputs: [Buffer]) throws -> ([Buffer], ExecutionTiming) {
+        let (outputs, timing) = try executeWithTimingUnconverted(try float64ForExecutor(inputs))
+        return (try float64FromExecutor(outputs), timing)
+    }
+
+    private func executeWithTimingUnconverted(_ inputs: [Buffer]) throws -> ([Buffer], ExecutionTiming) {
         switch backend {
         case .mpsGraph(let compiled, let executor):
             return try executeWithTimingMPSGraph(inputs, compiled: compiled, executor: executor)
@@ -238,7 +267,7 @@ public final class Executable: @unchecked Sendable {
             throw Self.convertIntegratedError(error)
         }
         let t2 = prof ? DispatchTime.now().uptimeNanoseconds : 0
-        let out = buildOutputBuffers(from: result, executor: executor)
+        let out = try buildOutputBuffers(from: result, executor: executor, inputs: inputs)
         if prof {
             let t3 = DispatchTime.now().uptimeNanoseconds
             let ms = { (a: UInt64, b: UInt64) in Double(b - a) / 1_000_000 }
@@ -258,7 +287,7 @@ public final class Executable: @unchecked Sendable {
         } catch let error as IntegratedExecutorError {
             throw Self.convertIntegratedError(error)
         }
-        let buffers = buildOutputBuffers(from: result, executor: executor)
+        let buffers = try buildOutputBuffers(from: result, executor: executor, inputs: inputs)
         let timing = ExecutionTiming(
             encodeTime: 0,  // Not separately tracked in integrated executor
             gpuTime: result.gpuTimeMs / 1000.0,  // GPU-only time (excludes output extraction)
@@ -294,7 +323,9 @@ public final class Executable: @unchecked Sendable {
         return metalInputs
     }
 
-    private func buildOutputBuffers(from result: ExecutionResult, executor: IntegratedExecutor) -> [Buffer] {
+    private func buildOutputBuffers(
+        from result: ExecutionResult, executor: IntegratedExecutor, inputs: [Buffer]
+    ) throws -> [Buffer] {
         let device = executor.device
         // Use outputOrder to preserve function signature order (not alphabetical)
         let outputNames = executor.executable.outputOrder
@@ -305,10 +336,15 @@ public final class Executable: @unchecked Sendable {
         // training, outputs are the updated params + optimizer state (~130 MB),
         // so the double-copy was ~17 ms/step — the dominant host overhead.
         let zeroCopy = ProcessInfo.processInfo.environment["METALHLO_ZEROCOPY_OUTPUTS"] != "0"
-        return outputNames.compactMap { name -> Buffer? in
-            guard let metalBuffer = result.outputs[name],
+        return try outputNames.map { name -> Buffer in
+            guard let metalBuffer = result.outputs[name] ?? executor.executable.constantBuffers[name],
                   let spec = executor.executable.outputSpecs[name] else {
-                return nil
+                // No kernel writes an output the function returns straight
+                // from its arguments: hand that argument back.
+                if let i = executor.executable.inputOrder.firstIndex(of: name), i < inputs.count {
+                    return inputs[i]
+                }
+                throw MetalHLOError.executionFailed("output \(name) was not produced")
             }
             if zeroCopy {
                 let large = LargeTensorStorage(
@@ -317,13 +353,13 @@ public final class Executable: @unchecked Sendable {
             }
             let byteCount = metalBuffer.length
             let data = Data(bytes: metalBuffer.contents(), count: byteCount)
-            let storage = try? BufferStorage(
+            let storage = try BufferStorage(
                 bytes: data,
                 shape: spec.shape,
                 elementType: spec.elementType,
                 device: device
             )
-            return storage.map { Buffer(storage: $0) }
+            return Buffer(storage: storage)
         }
     }
 

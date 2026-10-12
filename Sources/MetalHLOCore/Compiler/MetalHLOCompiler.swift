@@ -629,8 +629,10 @@ public final class MetalHLOCompiler: @unchecked Sendable {
             return withUnsafeBytes(of: &floatValue) { Array($0) }
 
         case .float64:
-            var doubleValue = value
-            return withUnsafeBytes(of: &doubleValue) { Array($0) }
+            // Kernels compute f64 as `float` (Metal has no double), so f64
+            // constants are stored as f32.
+            var floatValue = Float(value)
+            return withUnsafeBytes(of: &floatValue) { Array($0) }
 
         case .float16:
             // Convert to float16 (IEEE 754 half precision)

@@ -314,7 +314,7 @@ public final class Parser {
                     // rank is lexicographic over keys[0..K-1] = operands[0..N-2]
                     // (argsort: K=1; lexsort: K=N-1). Each sortResult carries all
                     // K keys plus its own payload operand.
-                    let k = max(1, n - 1)
+                    let k = min(n, max(1, op.attributes.sortNumKeys ?? (n - 1)))
                     let keys = Array(resolvedOperands.prefix(k))
                     for i in 0..<n {
                         let payload = resolvedOperands[i]
@@ -1362,6 +1362,11 @@ public final class Parser {
             let (whileOperands, whileAttrs, whileType) = try parseWhileBindingsAndRegions()
             return (whileOperands, whileAttrs, whileType)
         } else {
+            // Pretty-printed convolution wraps its operands: stablehlo.convolution(%lhs, %rhs) dim_numbers = ...
+            if kind == .convolution && match(.leftParen) {
+                repeat { operands.append(try parsePercentIdentifier()) } while match(.comma)
+                try expect(.rightParen)
+            }
             // Parse operands (% identifiers before attributes/type)
             while check(.percentIdentifier) {
                 let operand = try parsePercentIdentifier()
@@ -1614,6 +1619,28 @@ public final class Parser {
     /// top-level `,` or `}`), consuming any nested `<...>`, `[...]`, `(...)`,
     /// `{...}` groups as balanced units so embedded commas/colons don't terminate
     /// the skip early. Stops with the cursor on the delimiting `,`/`}`.
+    /// Consumes one balanced `[...]`, `<...>`, `(...)` or `{...}` group starting
+    /// at the current token, and nothing after it.
+    private func skipBalancedGroup() throws {
+        let open = currentToken.kind
+        let close: TokenKind
+        switch open {
+        case .leftBracket: close = .rightBracket
+        case .leftAngle: close = .rightAngle
+        case .leftParen: close = .rightParen
+        case .leftBrace: close = .rightBrace
+        default:
+            throw ParseError.unexpectedToken(expected: "'[', '<', '(' or '{'", got: currentToken)
+        }
+        advance()
+        var depth = 1
+        while depth > 0 && !check(.eof) {
+            if check(open) { depth += 1 }
+            if check(close) { depth -= 1 }
+            advance()
+        }
+    }
+
     private func skipBalancedAttributeValue() {
         var depth = 0
         while !check(.eof) {
@@ -1744,6 +1771,13 @@ public final class Parser {
                         }
                         _ = match(.comma)
                     }
+                } else if kind == .gather {
+                    // "stablehlo.gather"(%x, %i) <{dimension_numbers = #stablehlo.gather<...>, slice_sizes = ...}>
+                    attributes.gatherDimensionNumbers = try parseGatherDimensionNumbers()
+                } else if kind == .scatter {
+                    let (dimNumbers, kindFromAttrs) = try parseScatterAttributes(stopAtOuterBrace: true)
+                    attributes.scatterDimensionNumbers = dimNumbers
+                    if kindFromAttrs != nil { attributes.scatterComputationKind = kindFromAttrs }
                 }
                 // Skip any remaining/unknown attributes up to the closing brace.
                 while !check(.rightBrace) && !check(.eof) {
@@ -1774,6 +1808,19 @@ public final class Parser {
             try expect(.rightParen)
             attributes.caseRegions = branches
             skipNewlines()
+        } else if kind == .whileOp && check(.leftParen) {
+            // Generic while: "stablehlo.while"(%a, %b) ({ ^bb0(...): cond }, { ^bb0(...): body })
+            try expect(.leftParen)
+            skipNewlines()
+            let condRegion = try parseRegion()
+            skipNewlines()
+            try expect(.comma)
+            skipNewlines()
+            let bodyRegion = try parseRegion()
+            skipNewlines()
+            try expect(.rightParen)
+            attributes.whileRegions = WhileRegions(condition: condRegion, body: bodyRegion)
+            skipNewlines()
         } else if kind == .map && check(.leftParen) {
             // stablehlo.map carries a full per-element computation region, not a
             // single reduction kind. Capture the whole region so codegen can
@@ -1801,6 +1848,13 @@ public final class Parser {
                 }
             }
             attributes.sortDescending = descending
+            // Block args come in (lhs, rhs) pairs per operand; the keys are the
+            // operands whose args the comparator's compares read.
+            let argIndex = Dictionary(comparator.arguments.enumerated().map { ($1.name, $0) },
+                                      uniquingKeysWith: { first, _ in first })
+            let compared = comparator.operations.filter { $0.kind == .compare }
+                .flatMap { $0.operands }.compactMap { argIndex[$0].map { $0 / 2 } }
+            if let lastKey = compared.max() { attributes.sortNumKeys = lastKey + 1 }
             try expect(.rightParen)
             skipNewlines()
         } else if check(.leftParen) {
@@ -1875,6 +1929,12 @@ public final class Parser {
                                 advance()
                             }
                         }
+                    } else if kind == .sort && checkIdentifier("dimension") {
+                        // Older generic form: ({comparator}) {dimension = N : i64, is_stable = b}
+                        try expectIdentifier("dimension")
+                        try expect(.equal)
+                        attributes.axis = try parseInteger()
+                        if match(.colon) { advance() }  // `: i64`
                     } else if checkIdentifier("rng_distribution") {
                         try expectIdentifier("rng_distribution")
                         try expect(.equal)
@@ -2327,6 +2387,57 @@ public final class Parser {
                 attributes.batchGroupCount = try parseInteger()
             } else if checkIdentifier("dimension_numbers") || check(.hashIdentifier) {
                 attributes.convolutionDimensionNumbers = try parseConvolutionDimensionNumbers()
+            } else if checkIdentifier("dim_numbers") {
+                // Pretty form: dim_numbers = [b, f, 0, 1]x[o, i, 0, 1]->[b, f, 0, 1]
+                advance()
+                try expect(.equal)
+                attributes.convolutionDimensionNumbers = try parseConvolutionDimensionNumbers()
+            } else if checkIdentifier("window") {
+                // Pretty form: window = {stride = [..], pad = [[lo, hi], ..], lhs_dilate = [..], rhs_dilate = [..]}
+                advance()
+                try expect(.equal)
+                try expect(.leftBrace)
+                while !check(.rightBrace) && !check(.eof) {
+                    let name = currentToken.text
+                    advance()
+                    try expect(.equal)
+                    switch name {
+                    case "stride": attributes.windowStrides = try parseSignedIntegerList()
+                    case "lhs_dilate": attributes.lhsDilation = try parseSignedIntegerList()
+                    case "rhs_dilate": attributes.rhsDilation = try parseSignedIntegerList()
+                    case "pad":
+                        try expect(.leftBracket)
+                        var pairs: [[Int]] = []
+                        if !check(.rightBracket) {
+                            repeat { pairs.append(try parseSignedIntegerList()) } while match(.comma)
+                        }
+                        try expect(.rightBracket)
+                        attributes.convPadding = pairs
+                    default: try skipBalancedGroup()  // reverse = [..]
+                    }
+                    _ = match(.comma)
+                }
+                try expect(.rightBrace)
+            } else if check(.leftBrace) {
+                // Pretty form's trailing dict: {batch_group_count = 1 : i64, feature_group_count = 1 : i64, precision_config = [...]}
+                advance()
+                while !check(.rightBrace) && !check(.eof) {
+                    let name = currentToken.text
+                    advance()
+                    try expect(.equal)
+                    if name == "feature_group_count" || name == "batch_group_count" {
+                        let value = try parseInteger()
+                        if match(.colon) { advance() }  // `: i64`
+                        if name == "feature_group_count" { attributes.featureGroupCount = value }
+                        else { attributes.batchGroupCount = value }
+                    } else if check(.leftBracket) || check(.leftAngle) || check(.leftBrace) {
+                        try skipBalancedGroup()
+                    } else {
+                        while !check(.comma) && !check(.rightBrace) && !check(.eof) { advance() }
+                    }
+                    _ = match(.comma)
+                }
+                try expect(.rightBrace)
             } else {
                 break
             }
@@ -2334,6 +2445,21 @@ public final class Parser {
         }
 
         return attributes
+    }
+
+    /// `[a, -b, c]` — a bracketed list of possibly negative integers.
+    private func parseSignedIntegerList() throws -> [Int] {
+        try expect(.leftBracket)
+        var values: [Int] = []
+        if !check(.rightBracket) {
+            repeat {
+                let negative = match(.minus)
+                let value = try parseInteger()
+                values.append(negative ? -value : value)
+            } while match(.comma)
+        }
+        try expect(.rightBracket)
+        return values
     }
 
     private func parseConvolutionDimensionNumbers() throws -> ConvolutionDimensionNumbers? {
@@ -2595,7 +2721,8 @@ public final class Parser {
                         if angleDepth == 0 { break }
                         angleDepth -= 1
                         advance()
-                    } else if angleDepth == 0 && check(.comma) {
+                    } else if angleDepth == 0 && (check(.comma) || check(.rightBrace)) {
+                        // `,` ends this attribute; `}` ends the `<{...}>` dict it sits in.
                         break
                     } else {
                         advance()
@@ -2807,6 +2934,13 @@ public final class Parser {
                 }
             }
             attributes.sortDescending = descending
+            // Block args come in (lhs, rhs) pairs per operand; the keys are the
+            // operands whose args the comparator's compares read.
+            let argIndex = Dictionary(comparator.arguments.enumerated().map { ($1.name, $0) },
+                                      uniquingKeysWith: { first, _ in first })
+            let compared = comparator.operations.filter { $0.kind == .compare }
+                .flatMap { $0.operands }.compactMap { argIndex[$0].map { $0 / 2 } }
+            if let lastKey = compared.max() { attributes.sortNumKeys = lastKey + 1 }
             try expect(.rightParen)
         }
 
@@ -2819,8 +2953,10 @@ public final class Parser {
         var attributes = HLOAttributes()
 
         while !check(.colon) && !check(.eof) {
-            if checkIdentifier("slice_sizes") {
-                try expectIdentifier("slice_sizes")
+            if checkIdentifier("slice_sizes") || checkIdentifier("sizes") {
+                // `slice_sizes = array<i64: ...>` (JAX) or the pretty
+                // printer's `sizes = [...]`.
+                advance()
                 try expect(.equal)
                 attributes.dynamicSliceSizes = try parseArrayAttribute()
             } else {
@@ -3182,6 +3318,10 @@ public final class Parser {
                 returnValues = try parseStablehloReturn()
                 break
             }
+            if case .string(let name) = currentToken.kind, name == "stablehlo.return" {
+                returnValues = try parseGenericStablehloReturn()
+                break
+            }
             let op = try parseOperation()
             operations.append(op)
             skipNewlines()
@@ -3292,6 +3432,22 @@ public final class Parser {
 
     /// Parses stablehlo.return statement.
     /// Format: stablehlo.return %val1, %val2, ... : types
+    /// Generic-form region terminator: `"stablehlo.return"(%a, %b) : (T0, T1) -> ()`.
+    private func parseGenericStablehloReturn() throws -> [String] {
+        advance() // "stablehlo.return"
+        var values: [String] = []
+        try expect(.leftParen)
+        if !check(.rightParen) {
+            repeat { values.append(try parsePercentIdentifier()) } while match(.comma)
+        }
+        try expect(.rightParen)
+        if match(.colon) {
+            try skipBalancedParens()
+            if match(.arrow) { try skipBalancedParens() }
+        }
+        return values
+    }
+
     private func parseStablehloReturn() throws -> [String] {
         try expectIdentifier("stablehlo.return")
 
@@ -3702,6 +3858,16 @@ public final class Parser {
                 lhsContracting = try parseDimensionList()
                 try expectIdentifier("x")
                 rhsContracting = try parseDimensionList()
+            }
+
+            // Optional trailing `, precision = [HIGHEST, HIGHEST]` and
+            // `, algorithm = <lhs_precision_type = f32, ...>`. Dots run at the
+            // operands' own precision here, so both are accepted and ignored.
+            while check(.comma) && (peekNext().text == "precision" || peekNext().text == "algorithm") {
+                advance()
+                advance()
+                try expect(.equal)
+                try skipBalancedGroup()
             }
         } else {
             // No dimension numbers provided

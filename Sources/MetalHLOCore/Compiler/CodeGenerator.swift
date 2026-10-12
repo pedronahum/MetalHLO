@@ -586,6 +586,20 @@ public final class CodeGenerator: @unchecked Sendable {
             } else {
                 source += generateUnaryKernel(entryPoint: entryPoint, operation: "\(metalType)(log(1.0f + float(x)))", metalType: metalType)
             }
+        case .tan:
+            if isFloat {
+                source += generateUnaryKernel(entryPoint: entryPoint, operation: "tan(x)", metalType: metalType)
+            } else {
+                source += generateUnaryKernel(entryPoint: entryPoint, operation: "\(metalType)(tan(float(x)))", metalType: metalType)
+            }
+        case .roundNearestEven:
+            // rint rounds half to even.
+            source += generateUnaryKernel(entryPoint: entryPoint, operation: isFloat ? "rint(x)" : "x", metalType: metalType)
+        case .roundNearestAfz:
+            // Metal's round() rounds half away from zero.
+            source += generateUnaryKernel(entryPoint: entryPoint, operation: isFloat ? "round(x)" : "x", metalType: metalType)
+        case .popcnt:
+            source += generateUnaryKernel(entryPoint: entryPoint, operation: "\(metalType)(popcount(x))", metalType: metalType)
         case .cbrt:
             // Cube root: sign(x) * pow(abs(x), 1/3)
             if isFloat {
@@ -656,15 +670,20 @@ public final class CodeGenerator: @unchecked Sendable {
             // StableHLO: shift_left(a, b) returns 0 if b >= bit_width.
             // Metal/C: shifting by >= bit_width is undefined behavior.
             let bitWidthL = elementByteSize(for: elementType) * 8
-            source += generateBinaryKernel(entryPoint: entryPoint, operation: "(b >= \(bitWidthL)) ? (\(metalType))(0) : (a << b)", metalType: metalType)
+            // Shift counts are unsigned in StableHLO: a negative count is >= bit_width.
+            let uL = Self.unsignedMetalType(metalType)
+            source += generateBinaryKernel(entryPoint: entryPoint, operation: "(\(uL)(b) >= \(bitWidthL)) ? (\(metalType))(0) : as_type<\(metalType)>(\(uL)(a) << \(uL)(b))", metalType: metalType)
         case .shiftRightLogical:
             // StableHLO: shift_right_logical(a, b) returns 0 if b >= bit_width.
             let bitWidthRL = elementByteSize(for: elementType) * 8
-            source += generateBinaryKernel(entryPoint: entryPoint, operation: "(b >= \(bitWidthRL)) ? (\(metalType))(0) : (a >> b)", metalType: metalType)
+            // Logical: shift the bits as unsigned (`>>` on a signed type is arithmetic).
+            let uRL = Self.unsignedMetalType(metalType)
+            source += generateBinaryKernel(entryPoint: entryPoint, operation: "(\(uRL)(b) >= \(bitWidthRL)) ? (\(metalType))(0) : as_type<\(metalType)>(\(uRL)(a) >> \(uRL)(b))", metalType: metalType)
         case .shiftRightArithmetic:
             // StableHLO: shift_right_arithmetic(a, b) returns sign-fill if b >= bit_width.
             let bitWidthRA = elementByteSize(for: elementType) * 8
-            source += generateBinaryKernel(entryPoint: entryPoint, operation: "(b >= \(bitWidthRA)) ? (a >> \(bitWidthRA - 1)) : (a >> b)", metalType: metalType)
+            let uRA = Self.unsignedMetalType(metalType)
+            source += generateBinaryKernel(entryPoint: entryPoint, operation: "(\(uRA)(b) >= \(bitWidthRA)) ? (a >> \(bitWidthRA - 1)) : (a >> b)", metalType: metalType)
 
         // Comparison operations (output is bool/i1)
         case .compare:
@@ -1167,15 +1186,9 @@ public final class CodeGenerator: @unchecked Sendable {
     private func generateBinaryKernel(entryPoint: String, operation: String, metalType: String = "float") -> String {
         // Use vectorized kernel for float types
         if metalType == "float" {
-            // Convert operation to work with float4
-            let vec4Operation = operation
-                .replacingOccurrences(of: "max(a, b)", with: "max(a4, b4)")
-                .replacingOccurrences(of: "min(a, b)", with: "min(a4, b4)")
-                .replacingOccurrences(of: "pow(a, b)", with: "pow(a4, b4)")
-                .replacingOccurrences(of: "a + b", with: "a4 + b4")
-                .replacingOccurrences(of: "a - b", with: "a4 - b4")
-                .replacingOccurrences(of: "a * b", with: "a4 * b4")
-                .replacingOccurrences(of: "a / b", with: "a4 / b4")
+            // The vector path names its float4 operands `a` and `b` too, so the
+            // scalar expression applies as-is: every float operation passed
+            // here (+ - * /, fmod, max, min, pow, atan2) has a float4 overload.
 
             return """
             kernel void \(entryPoint)(
@@ -1192,12 +1205,12 @@ public final class CodeGenerator: @unchecked Sendable {
                 if (tid < count8) {
                     // Vectorized path: process 8 elements (two float4)
                     uint base = tid * 2;
-                    float4 a4 = reinterpret_cast<device const float4*>(inputA)[base];
-                    float4 b4 = reinterpret_cast<device const float4*>(inputB)[base];
-                    reinterpret_cast<device float4*>(output)[base] = \(vec4Operation);
-                    a4 = reinterpret_cast<device const float4*>(inputA)[base + 1];
-                    b4 = reinterpret_cast<device const float4*>(inputB)[base + 1];
-                    reinterpret_cast<device float4*>(output)[base + 1] = \(vec4Operation);
+                    float4 a = reinterpret_cast<device const float4*>(inputA)[base];
+                    float4 b = reinterpret_cast<device const float4*>(inputB)[base];
+                    reinterpret_cast<device float4*>(output)[base] = \(operation);
+                    a = reinterpret_cast<device const float4*>(inputA)[base + 1];
+                    b = reinterpret_cast<device const float4*>(inputB)[base + 1];
+                    reinterpret_cast<device float4*>(output)[base + 1] = \(operation);
                 }
                 else if (tid == count8) {
                     // Handle remainder (up to 7 elements)
@@ -1855,14 +1868,23 @@ public final class CodeGenerator: @unchecked Sendable {
         // the embedding-backward path (and the nanoGPT loss gate) exactly stable;
         // the reuse-stale-byte hazard is fixed in the non-atomic output-centric
         // path below, which is the one jnp.unique's i32 add-scatter takes.
+        // The planner gives this result a slot no earlier op touched
+        // (StaticMemoryPlanner.needsZeroedSlot), so it starts at zero; the first
+        // `operand` threads add the operand in and the rest add the updates, so
+        // the result is operand + Σ updates in any order, for any operand.
         if useAtomicAdd {
             return """
             \(kernelHeader)
             {
-                if (tid >= \(totalUpdateElements)) return;
-            \(dstPosBody("tid"))
+                if (tid < \(totalOperandElements)) {
+                    atomic_fetch_add_explicit((device atomic_float*)(output + tid), operand[tid], memory_order_relaxed);
+                    return;
+                }
+                uint u = tid - \(totalOperandElements);
+                if (u >= \(totalUpdateElements)) return;
+            \(dstPosBody("u"))
                 if (oob) return;
-                atomic_fetch_add_explicit((device atomic_float*)(output + dstPos), updates[tid], memory_order_relaxed);
+                atomic_fetch_add_explicit((device atomic_float*)(output + dstPos), updates[u], memory_order_relaxed);
             }
             """
         }
@@ -6470,7 +6492,9 @@ public final class CodeGenerator: @unchecked Sendable {
             }
             let operands = op.operands.map(operandExpr)
             let expr = elementwiseChainExpr(kind: op.kind, operands: operands, metalType: computeType, comparison: op.comparison)
-            body += "    \(computeType) v\(i) = \(expr);\n"
+            // Explicit conversion: Metal math on bfloat/half returns float, and
+            // bfloat has no implicit conversion from float.
+            body += "    \(computeType) v\(i) = \(computeType)(\(expr));\n"
         }
         let resultExpr: String = chain.ops.isEmpty ? externalRef(0) : "v\(chain.ops.count - 1)"
 
@@ -6651,11 +6675,30 @@ public final class CodeGenerator: @unchecked Sendable {
         case .cosine:    return "cos(\(lhs))"
         case .floor:     return "floor(\(lhs))"
         case .ceil:      return "ceil(\(lhs))"
+        case .tan:       return "tan(\(lhs))"
+        case .expm1:     return "(exp(\(lhs)) - 1.0f)"
+        case .log1p:     return "log(1.0f + \(lhs))"
+        case .cbrt:      return "(sign(\(lhs)) * pow(abs(\(lhs)), 0.333333333333f))"
+        case .sign:      return "sign(\(lhs))"
+        case .roundNearestEven: return "rint(\(lhs))"
+        case .roundNearestAfz:  return "round(\(lhs))"
         // Reshape and scalar broadcast: pass the operand through unchanged.
         // Reshape is a no-op in linear-index space; scalar broadcast was
         // already lowered to `input[0]` by externalRef.
         case .reshape, .broadcastInDim: return lhs
         default:         return lhs
+        }
+    }
+
+    /// The unsigned Metal integer type of the same width (unsigned types map to
+    /// themselves). Logical shifts and shift-count checks go through it.
+    static func unsignedMetalType(_ metalType: String) -> String {
+        switch metalType {
+        case "int": return "uint"
+        case "long": return "ulong"
+        case "short": return "ushort"
+        case "char": return "uchar"
+        default: return metalType
         }
     }
 
@@ -6700,13 +6743,16 @@ public final class CodeGenerator: @unchecked Sendable {
             return "\(prefix)\(left) ^ \(right);\n"
         case .shiftLeft:
             let bwL = metalType == "ulong" || metalType == "long" ? 64 : (metalType == "ushort" || metalType == "short" ? 16 : (metalType == "uchar" || metalType == "char" ? 8 : 32))
-            return "\(prefix)((\(right)) >= \(bwL)) ? (\(metalType))(0) : ((\(left)) << (\(right)));\n"
+            let uL = Self.unsignedMetalType(metalType)
+            return "\(prefix)(\(uL)(\(right)) >= \(bwL)) ? (\(metalType))(0) : as_type<\(metalType)>(\(uL)(\(left)) << \(uL)(\(right)));\n"
         case .shiftRightLogical:
             let bwRL = metalType == "ulong" || metalType == "long" ? 64 : (metalType == "ushort" || metalType == "short" ? 16 : (metalType == "uchar" || metalType == "char" ? 8 : 32))
-            return "\(prefix)((\(right)) >= \(bwRL)) ? (\(metalType))(0) : ((\(left)) >> (\(right)));\n"
+            let uRL = Self.unsignedMetalType(metalType)
+            return "\(prefix)(\(uRL)(\(right)) >= \(bwRL)) ? (\(metalType))(0) : as_type<\(metalType)>(\(uRL)(\(left)) >> \(uRL)(\(right)));\n"
         case .shiftRightArithmetic:
             let bwRA = metalType == "ulong" || metalType == "long" ? 64 : (metalType == "ushort" || metalType == "short" ? 16 : (metalType == "uchar" || metalType == "char" ? 8 : 32))
-            return "\(prefix)((\(right)) >= \(bwRA)) ? ((\(left)) >> \(bwRA - 1)) : ((\(left)) >> (\(right)));\n"
+            let uRA = Self.unsignedMetalType(metalType)
+            return "\(prefix)(\(uRA)(\(right)) >= \(bwRA)) ? ((\(left)) >> \(bwRA - 1)) : ((\(left)) >> (\(right)));\n"
         default:
             return "\(prefix)\(left);\n"  // Fallback
         }
@@ -7268,13 +7314,16 @@ public final class CodeGenerator: @unchecked Sendable {
                 return DispatchConfig.dispatch1D(elements: totalElements, threadgroupSize: 256)
             case .scatter:
                 // Scatter kernel: copy operand to output then write updates at indexed positions.
-                // Needs max(operandElements, updateElements) threads.
+                // Needs max(operandElements, updateElements) threads; the f32
+                // atomic add-scatter adds the operand and the updates in one
+                // pass, so it needs one thread for each of both.
                 let operandElements = inputShapes.first.map { $0.reduce(1, *) } ?? totalElements
                 let updatesElements = inputShapes.count > 2
                     ? inputShapes[2].reduce(1, *)
                     : totalElements
+                let atomicAdd = elementType == .float32 && attributes.scatterComputationKind == .add
                 return DispatchConfig.dispatch1D(
-                    elements: max(operandElements, updatesElements),
+                    elements: atomicAdd ? operandElements + updatesElements : max(operandElements, updatesElements),
                     threadgroupSize: 256
                 )
             case .convert, .bitcastConvert:
@@ -7654,6 +7703,7 @@ public final class CodeGenerator: @unchecked Sendable {
             case .add, .subtract, .multiply, .divide, .remainder, .maximum, .minimum, .power, .atan2,
                  .negate, .abs, .exponential, .log, .sqrt, .rsqrt, .ceil, .floor, .roundNearestEven,
                  .sine, .cosine, .tanh, .sign, .logistic, .expm1, .log1p, .cbrt,
+                 .tan, .roundNearestAfz,
                  .and, .or, .xor, .not,
                  .shiftLeft, .shiftRightArithmetic, .shiftRightLogical,
                  .clamp, .select,

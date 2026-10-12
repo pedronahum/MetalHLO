@@ -171,6 +171,10 @@ public struct HLOAttributes: Sendable {
     /// Sort descending instead of ascending.
     public var sortDescending: Bool?
 
+    /// Number of leading sort operands the comparator compares (the keys);
+    /// the rest are payload carried along, ties kept in input order.
+    public var sortNumKeys: Int?
+
     // MARK: - Triangular Solve Attributes
 
     /// Whether A is on the left side (Ax = b) or right (xA = b).
