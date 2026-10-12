@@ -105,6 +105,38 @@ struct TlalocParserTests {
         expectClose(try out[0].toFloatArray(), [11, 19, 27, 35])
     }
 
+    @Test("while bodies use the function-body lowerings (broadcast_in_dim dims)")
+    func whileBodyBroadcastDims() throws {
+        let client = try Client.create()
+        // One iteration: m = broadcast_in_dim(x, dims = [0]) puts x[i] across
+        // row i. Region ops once had their own lowering that ignored `dims`
+        // and broadcast x across rows instead.
+        let mlir = """
+        module @m {
+          func.func @main(%x: tensor<3xf32>) -> tensor<3x3xf32> {
+            %z = stablehlo.constant dense<0> : tensor<i32>
+            %m0 = stablehlo.constant dense<0.0> : tensor<3x3xf32>
+            %w:3 = "stablehlo.while"(%z, %x, %m0) ({
+              ^bb0(%i: tensor<i32>, %v: tensor<3xf32>, %m: tensor<3x3xf32>):
+                %n = stablehlo.constant dense<1> : tensor<i32>
+                %p = stablehlo.compare LT, %i, %n, SIGNED : (tensor<i32>, tensor<i32>) -> tensor<i1>
+                "stablehlo.return"(%p) : (tensor<i1>) -> ()
+            }, {
+              ^bb0(%i: tensor<i32>, %v: tensor<3xf32>, %m: tensor<3x3xf32>):
+                %one = stablehlo.constant dense<1> : tensor<i32>
+                %i2 = stablehlo.add %i, %one : tensor<i32>
+                %b = stablehlo.broadcast_in_dim %v, dims = [0] : (tensor<3xf32>) -> tensor<3x3xf32>
+                "stablehlo.return"(%i2, %v, %b) : (tensor<i32>, tensor<3xf32>, tensor<3x3xf32>) -> ()
+            }) : (tensor<i32>, tensor<3xf32>, tensor<3x3xf32>) -> (tensor<i32>, tensor<3xf32>, tensor<3x3xf32>)
+            return %w#2 : tensor<3x3xf32>
+          }
+        }
+        """
+        let x = try client.createBuffer([1, 2, 3] as [Float], shape: [3])
+        let out = try client.compile(mlir).execute([x])
+        expectClose(try out[0].toFloatArray(), [1, 1, 1, 2, 2, 2, 3, 3, 3])
+    }
+
     @Test("pretty-printed convolution")
     func prettyConvolution() throws {
         let client = try Client.create()

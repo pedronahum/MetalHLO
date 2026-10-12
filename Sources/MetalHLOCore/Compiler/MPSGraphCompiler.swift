@@ -5483,7 +5483,73 @@ public final class MPSGraphCompiler {
     }
 
     /// Compiles an operation within a control flow region using a local value map.
+    /// Compiles one op of a region body (while/if/...) with the same lowerings
+    /// as a function body: the region's values — block arguments and earlier
+    /// region results — are overlaid on `valueMap`/`typeMap` for the call and
+    /// restored afterwards. An op the full lowering rejects falls back to the
+    /// region-only subset in `compileRegionOperationSubset`.
     private func compileRegionOperation(
+        _ op: HLOOperation,
+        localValueMap: inout [String: MPSGraphTensor]
+    ) throws -> MPSGraphTensor {
+        var shadowedValues: [String: MPSGraphTensor?] = [:]
+        var shadowedTypes: [String: TensorType?] = [:]
+        for (name, tensor) in localValueMap {
+            shadowedValues[name] = valueMap[name]
+            valueMap[name] = tensor
+            if let type = regionValueTypes[name] ?? Self.tensorType(of: tensor) {
+                shadowedTypes[name] = typeMap[name]
+                typeMap[name] = type
+            }
+        }
+        defer {
+            for (name, old) in shadowedValues {
+                if let old { valueMap[name] = old } else { valueMap.removeValue(forKey: name) }
+            }
+            for (name, old) in shadowedTypes {
+                if let old { typeMap[name] = old } else { typeMap.removeValue(forKey: name) }
+            }
+        }
+        let result: MPSGraphTensor
+        do {
+            result = try compileOperation(op)
+        } catch {
+            result = try compileRegionOperationSubset(op, localValueMap: &localValueMap)
+        }
+        regionValueTypes[op.result] = op.resultType
+        return result
+    }
+
+    /// Result types of ops compiled inside regions, for later ops in the same
+    /// region (their tensors are not in `typeMap` outside the overlay).
+    private var regionValueTypes: [String: TensorType] = [:]
+
+    /// The TensorType of a graph tensor with a static shape and a dtype this
+    /// compiler emits.
+    private static func tensorType(of tensor: MPSGraphTensor) -> TensorType? {
+        guard let shape = tensor.shape?.map({ $0.intValue }), !shape.contains(where: { $0 < 0 }) else { return nil }
+        let elementType: ElementType
+        switch tensor.dataType {
+        case .float32: elementType = .float32
+        case .float16: elementType = .float16
+        case .bFloat16: elementType = .bfloat16
+        case .int8: elementType = .int8
+        case .int16: elementType = .int16
+        case .int32: elementType = .int32
+        case .int64: elementType = .int64
+        case .uInt8: elementType = .uint8
+        case .uInt16: elementType = .uint16
+        case .uInt32: elementType = .uint32
+        case .uInt64: elementType = .uint64
+        case .bool: elementType = .int1
+        default: return nil
+        }
+        return TensorType(shape: shape, elementType: elementType)
+    }
+
+    /// The region-only op subset used before regions shared the function-body
+    /// lowerings; kept as the fallback for ops the full path rejects there.
+    private func compileRegionOperationSubset(
         _ op: HLOOperation,
         localValueMap: inout [String: MPSGraphTensor]
     ) throws -> MPSGraphTensor {
