@@ -226,6 +226,26 @@ struct TlalocNumericsTests {
         expectClose(try out[0].toFloatArray(), [1, 2, 10, 11])
     }
 
+    @Test("gather clamps negative and too-large start indices into range")
+    func gatherClampsStarts() throws {
+        let client = try Client.create()
+        // Rows of a 4x2 table at start indices -3, 1, 9: clamped to 0, 1, 3.
+        let mlir = """
+        module @m {
+          func.func @main(%t: tensor<4x2xf32>, %i: tensor<3xi32>) -> tensor<3x2xf32> {
+            %0 = "stablehlo.gather"(%t, %i) <{dimension_numbers = #stablehlo.gather<offset_dims = [1], collapsed_slice_dims = [0], start_index_map = [0], index_vector_dim = 1>, slice_sizes = array<i64: 1, 2>}> : (tensor<4x2xf32>, tensor<3xi32>) -> tensor<3x2xf32>
+            return %0 : tensor<3x2xf32>
+          }
+        }
+        """
+        let t = try client.createBuffer((0..<8).map { Float($0) }, shape: [4, 2])
+        let i = try client.createBuffer([-3, 1, 9] as [Int32], shape: [3])
+        for exe in try compileBoth(client, mlir) {
+            let out = try exe.execute([t, i])
+            expectClose(try out[0].toFloatArray(), [0, 1, 2, 3, 6, 7])
+        }
+    }
+
     @Test("scatter-add: repeated indices, a non-zero operand, and a reused output slot")
     func scatterAdd() throws {
         let client = try Client.create()
@@ -361,6 +381,39 @@ struct TlalocNumericsTests {
         expectClose(try out[0].toFloatArray(), [11, 22, 33])
         expectClose(try out[1].toFloatArray(), [10, 20, 30])
         expectClose(try out[2].toFloatArray(), [1, 2, 3])
+    }
+
+    @Test("programs differing only in a constant inside a loop do not share a compiled graph")
+    func compileCacheSeesRegionConstants() throws {
+        let client = try Client.create()
+        func program(_ step: String) -> String {
+            """
+            module @same_name {
+              func.func @main(%x: tensor<2xf32>) -> tensor<2xf32> {
+                %z = stablehlo.constant dense<0> : tensor<i32>
+                %w:2 = "stablehlo.while"(%z, %x) ({
+                  ^bb0(%i: tensor<i32>, %v: tensor<2xf32>):
+                    %n = stablehlo.constant dense<2> : tensor<i32>
+                    %p = stablehlo.compare LT, %i, %n, SIGNED : (tensor<i32>, tensor<i32>) -> tensor<i1>
+                    "stablehlo.return"(%p) : (tensor<i1>) -> ()
+                }, {
+                  ^bb0(%i: tensor<i32>, %v: tensor<2xf32>):
+                    %one = stablehlo.constant dense<1> : tensor<i32>
+                    %i2 = stablehlo.add %i, %one : tensor<i32>
+                    %s = stablehlo.constant dense<\(step)> : tensor<2xf32>
+                    %v2 = stablehlo.add %v, %s : tensor<2xf32>
+                    "stablehlo.return"(%i2, %v2) : (tensor<i32>, tensor<2xf32>) -> ()
+                }) : (tensor<i32>, tensor<2xf32>) -> (tensor<i32>, tensor<2xf32>)
+                return %w#1 : tensor<2xf32>
+              }
+            }
+            """
+        }
+        let x = try client.createBuffer([1, 2] as [Float], shape: [2])
+        let small = try client.compile(program("1.0")).execute([x])
+        let large = try client.compile(program("10.0")).execute([x])
+        expectClose(try small[0].toFloatArray(), [3, 4])
+        expectClose(try large[0].toFloatArray(), [21, 22])
     }
 
     @Test("concurrent executions of one executable keep their own results")

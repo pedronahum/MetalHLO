@@ -123,7 +123,7 @@ public final class Client: @unchecked Sendable {
         }
 
         // Compile HLOModule to MPSGraph executable
-        let compiled = try executor.compile(module: optimizedModule)
+        let compiled = try executor.compile(module: optimizedModule, source: mlir)
 
         return Executable(compiled: compiled, executor: executor)
     }

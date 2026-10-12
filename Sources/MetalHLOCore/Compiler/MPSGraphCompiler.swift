@@ -2204,6 +2204,15 @@ public final class MPSGraphCompiler {
             )
         }
 
+        // StableHLO clamps start indices into range; gatherND does not.
+        if let operandShape = operand.shape?.map({ $0.intValue }), indexVectorSize > 0 {
+            let upper = (0..<indexVectorSize).map { Int32(max(operandShape[$0] - 1, 0)) }
+            let upperTensor = graph.constant(upper.withUnsafeBufferPointer { Data(buffer: $0) },
+                                             shape: [NSNumber(value: indexVectorSize)], dataType: .int32)
+            reshapedIndices = graph.clamp(graph.cast(reshapedIndices, to: .int32, name: nil),
+                                          min: graph.constant(0, dataType: .int32), max: upperTensor, name: nil)
+        }
+
         return graph.gatherND(
             withUpdatesTensor: operand,
             indicesTensor: reshapedIndices,

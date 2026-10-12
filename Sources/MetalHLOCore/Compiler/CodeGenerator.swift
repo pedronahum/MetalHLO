@@ -1506,9 +1506,11 @@ public final class CodeGenerator: @unchecked Sendable {
                 }
             }
             let idxExpr = idxTerms.joined(separator: " + ")
-            body += "            uint startIdx\(comp) = uint(indices[\(idxExpr)]);\n"
-            // Clamp
-            body += "            if (startIdx\(comp) >= \(operandShape[mappedDim])) startIdx\(comp) = \(operandShape[mappedDim] - 1);\n"
+            // StableHLO clamps each start index to [0, dim - slice_size], so a
+            // negative or too-large start still reads a whole in-bounds slice.
+            let sliceSize = mappedDim < dimNumbers.sliceSizes.count ? dimNumbers.sliceSizes[mappedDim] : 1
+            let maxStart = max(operandShape[mappedDim] - sliceSize, 0)
+            body += "            uint startIdx\(comp) = uint(clamp(long(indices[\(idxExpr)]), 0L, \(maxStart)L));\n"
         }
 
         // Helper: indices dim → grid coord index (skips index_vector_dim).

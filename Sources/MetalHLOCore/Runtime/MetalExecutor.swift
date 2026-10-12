@@ -4,6 +4,7 @@
 // Manages Metal device and execution.
 
 import Foundation
+import CryptoKit
 import Metal
 @preconcurrency import MetalPerformanceShadersGraph
 import Accelerate
@@ -72,13 +73,22 @@ public final class MetalExecutor: @unchecked Sendable {
 
     /// Compiles an HLO module to a CompiledGraph.
     ///
-    /// - Parameter module: The HLO module to compile.
+    /// - Parameters:
+    ///   - module: The HLO module to compile.
+    ///   - source: The program text the module was parsed from, when there is
+    ///     one. Compiled graphs are cached by its SHA-256: the module's
+    ///     `description` leaves out constant values and region bodies, so two
+    ///     programs differing only there (one constant inside a loop) would
+    ///     share a cache entry and run each other's graph.
     /// - Throws: `CompilationError` if compilation fails.
     /// - Returns: A compiled graph.
-    public func compile(module: HLOModule) throws -> CompiledGraph {
-        // Check cache first - use content hash to avoid returning wrong cached results
-        // for different modules with the same name
-        let cacheKey = "\(module.name)_\(module.description.hashValue)"
+    public func compile(module: HLOModule, source: String? = nil) throws -> CompiledGraph {
+        let cacheKey: String
+        if let source {
+            cacheKey = "src_" + SHA256.hash(data: Data(source.utf8)).map { String(format: "%02x", $0) }.joined()
+        } else {
+            cacheKey = "\(module.name)_\(module.description.hashValue)"
+        }
         if let cached = compilationCache.get(key: cacheKey) {
             return cached
         }
