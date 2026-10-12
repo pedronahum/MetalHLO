@@ -367,6 +367,12 @@ public final class BufferStorage: @unchecked Sendable {
             var ints = values.map { UInt8(clamping: intValue($0)) }
             return Data(bytes: &ints, count: ints.count)
 
+        case .float8E4M3FN:
+            return Data(values.map { NarrowFloat.encodeF8E4M3FN(floatValue($0)) })
+
+        case .float4E2M1FN:
+            return Data(values.map { NarrowFloat.encodeF4E2M1FN(floatValue($0)) })
+
         case .uint16:
             var ints = values.map { UInt16(clamping: intValue($0)) }
             return Data(bytes: &ints, count: ints.count * MemoryLayout<UInt16>.stride)
@@ -452,6 +458,21 @@ public final class BufferStorage: @unchecked Sendable {
         return try BufferStorage(
             bytes: doubles.withUnsafeBufferPointer { Data(buffer: $0) },
             shape: shape, elementType: .float64, device: device)
+    }
+
+    /// f8E4M3FN bytes decoded to the f32 storage a legalized program takes.
+    public func float8E4M3FNForExecutor() throws -> BufferStorage {
+        guard elementType == .float8E4M3FN else { return self }
+        let values = try toData().prefix(count).map { NarrowFloat.decodeF8E4M3FN($0) }
+        return BufferStorage(floatData: values, shape: shape, device: device)
+    }
+
+    /// An f32 result the program declares f8E4M3FN, encoded one byte per element.
+    public func float8E4M3FNFromExecutor() throws -> BufferStorage {
+        let n = count
+        let floats: [Float] = try toData().withUnsafeBytes { Array($0.bindMemory(to: Float.self).prefix(n)) }
+        return try BufferStorage(bytes: Data(floats.map { NarrowFloat.encodeF8E4M3FN($0) }),
+                                 shape: shape, elementType: .float8E4M3FN, device: device)
     }
 
     /// Converts buffer contents to a Bool array.

@@ -3161,6 +3161,10 @@ public final class MPSGraphCompiler {
             case .uint8:
                 var ints = values.map { UInt8($0) }
                 data = Data(bytes: &ints, count: ints.count * MemoryLayout<UInt8>.stride)
+            case .float8E4M3FN:
+                data = Data(values.map { NarrowFloat.encodeF8E4M3FN(Float($0)) })
+            case .float4E2M1FN:
+                data = Data(values.map { NarrowFloat.encodeF4E2M1FN(Float($0)) })
             case .uint16:
                 var ints = values.map { UInt16($0) }
                 data = Data(bytes: &ints, count: ints.count * MemoryLayout<UInt16>.stride)
@@ -4616,10 +4620,14 @@ public final class MPSGraphCompiler {
 
     private func compileBitcastConvert(_ op: HLOOperation) throws -> MPSGraphTensor {
         // Bitcast - reinterpret bits as different type
+        // Reinterpret the bits (graph.cast would convert the values). Between
+        // types of different widths StableHLO moves the size difference into
+        // the last dimension; reshape to the declared result shape.
         let input = try getOperand(op.operands[0])
-        // MPSGraph doesn't have native bitcast, use reshape + cast approach
-        // This preserves the bit pattern by going through the same memory
-        return graph.cast(input, to: op.resultType.elementType.mpsDataType, name: op.result)
+        let target = op.resultType.elementType.mpsDataType
+        if input.dataType == target { return graph.identity(with: input, name: op.result) }
+        let reinterpreted = graph.reinterpretCast(input, to: target, name: nil)
+        return graph.reshape(reinterpreted, shape: op.resultType.mpsShape, name: op.result)
     }
 
     private func compileReducePrecision(_ op: HLOOperation) throws -> MPSGraphTensor {

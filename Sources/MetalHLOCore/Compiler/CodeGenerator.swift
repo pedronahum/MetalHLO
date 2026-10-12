@@ -306,7 +306,7 @@ public final class CodeGenerator: @unchecked Sendable {
         case .int16: return "short"
         case .int32: return "int"
         case .int64: return "long"
-        case .uint8: return "uchar"
+        case .uint8, .float8E4M3FN, .float4E2M1FN: return "uchar"
         case .uint16: return "ushort"
         case .uint32: return "uint"
         case .uint64: return "ulong"
@@ -7804,7 +7804,7 @@ public final class CodeGenerator: @unchecked Sendable {
             return 4
         case .float16, .bfloat16, .int16, .uint16:
             return 2
-        case .int8, .uint8, .int1:
+        case .int8, .uint8, .int1, .float8E4M3FN, .float4E2M1FN:
             return 1
         }
     }

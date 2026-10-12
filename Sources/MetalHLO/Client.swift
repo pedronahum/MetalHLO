@@ -76,6 +76,22 @@ public final class Client: @unchecked Sendable {
     /// - Throws: `MetalHLOError.parseFailed` or `MetalHLOError.compilationFailed`.
     /// - Returns: A compiled `Executable` ready for execution.
     public func compile(_ mlir: String) throws -> Executable {
+        try withNarrowOutputs(try compileMPSGraph(mlir), source: mlir)
+    }
+
+    /// Records which of the program's results are declared f8E4M3FN, so the
+    /// executable encodes them (the compiled program computes them as f32).
+    private func withNarrowOutputs(_ executable: Executable, source mlir: String) -> Executable {
+        guard mlir.contains("f8E4M3FN") else { return executable }
+        let parser = Parser(source: mlir)
+        guard (try? parser.parse()) != nil else { return executable }
+        executable.narrowOutputTypes = parser.declaredNarrowOutputs.map { t in
+            t == .float8E4M3FN ? .float8E4M3FN : nil
+        }
+        return executable
+    }
+
+    private func compileMPSGraph(_ mlir: String) throws -> Executable {
         // Parse MLIR to HLOModule
         let parser = Parser(source: mlir)
         let module: HLOModule
@@ -155,6 +171,10 @@ public final class Client: @unchecked Sendable {
     /// - Throws: `MetalHLOError.parseFailed` or `MetalHLOError.compilationFailed`.
     /// - Returns: A compiled `Executable` ready for execution.
     public func compile(_ mlir: String, config: CompilationConfig) throws -> Executable {
+        try withNarrowOutputs(try compileConfigured(mlir, config: config), source: mlir)
+    }
+
+    private func compileConfigured(_ mlir: String, config: CompilationConfig) throws -> Executable {
         // Check if heterogeneous execution is requested
         if config.devicePolicy != .gpuOnly {
             return try compileHeterogeneous(mlir, config: config)

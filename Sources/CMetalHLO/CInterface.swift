@@ -190,6 +190,8 @@ private func elementTypeToC(_ swiftType: ElementType) -> Int32 {
     case .int32: return MHLO_I32
     case .int64: return MHLO_I64
     case .uint8: return MHLO_UI8
+    // No C code for narrow floats: their buffers are exposed as raw bytes.
+    case .float8E4M3FN, .float4E2M1FN: return MHLO_UI8
     case .uint16: return MHLO_UI16
     case .uint32: return MHLO_UI32
     case .uint64: return MHLO_UI64

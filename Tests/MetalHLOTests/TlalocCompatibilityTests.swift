@@ -10,6 +10,7 @@
 import Testing
 import Foundation
 @testable import MetalHLO
+import MetalHLOCore
 
 private func kernelPath() -> CompilationConfig {
     var config = CompilationConfig()
@@ -200,6 +201,78 @@ struct TlalocParserTests {
             let out = try exe.execute([k, v])
             expectClose(try out[0].toFloatArray(), [3, 3, 2, 1])
             #expect(try out[1].toInt32Array() == [1, 2, 3, 0])
+        }
+    }
+}
+
+@Suite("Tlaloc compatibility - narrow floats", .serialized)
+struct TlalocNarrowFloatTests {
+
+    @Test("f8E4M3FN codec: every byte decodes and re-encodes to itself")
+    func f8Codec() {
+        for byte in 0...255 {
+            let b = UInt8(byte)
+            let v = NarrowFloat.decodeF8E4M3FN(b)
+            if v.isNaN {
+                #expect(b & 0x7F == 0x7F, "byte \(b)")
+            } else if v == 0 {
+                #expect(b & 0x7F == 0, "byte \(b)")
+            } else {
+                #expect(NarrowFloat.encodeF8E4M3FN(v) == b, "byte \(b) value \(v)")
+            }
+        }
+        #expect(NarrowFloat.decodeF8E4M3FN(0x7E) == 448)
+        #expect(NarrowFloat.roundToF8E4M3FN(464).isEqual(to: 448))  // tie to even
+        #expect(NarrowFloat.roundToF8E4M3FN(465).isNaN)            // past 448: NaN
+    }
+
+    @Test("f8E4M3FN buffers in and out; convert rounds to the f8 grid")
+    func f8Boundary() throws {
+        let client = try Client.create()
+        let mlir = """
+        module @m {
+          func.func @main(%p: tensor<4xf8E4M3FN>, %x: tensor<4xf32>) -> (tensor<4xf32>, tensor<4xf8E4M3FN>) {
+            %w = stablehlo.convert %p : (tensor<4xf8E4M3FN>) -> tensor<4xf32>
+            %q = stablehlo.convert %x : (tensor<4xf32>) -> tensor<4xf8E4M3FN>
+            return %w, %q : tensor<4xf32>, tensor<4xf8E4M3FN>
+          }
+        }
+        """
+        // 0x38 = 1.0, 0x40 = 2.0, 0xC4 = -3.0, 0x7E = 448.
+        let p = try client.createBuffer(bytes: Data([0x38, 0x40, 0xC4, 0x7E]), shape: [4], elementType: .float8E4M3FN)
+        let x = try client.createBuffer([1.1, -0.3, 300, 1000] as [Float], shape: [4])
+        for exe in try compileBoth(client, mlir) {
+            let out = try exe.execute([p, x])
+            expectClose(try out[0].toFloatArray(), [1, 2, -3, 448])
+            #expect(out[1].elementType == .float8E4M3FN)
+            let q = try out[1].toData().map { NarrowFloat.decodeF8E4M3FN($0) }
+            #expect(q[0] == 1.125 && q[1] == -0.3125 && q[2] == 288 && q[3].isNaN, "\(q)")
+        }
+    }
+
+    @Test("bitcast_convert bytes to f8E4M3FN and to f4E2M1FN pairs")
+    func narrowBitcasts() throws {
+        let client = try Client.create()
+        let mlir = """
+        module @m {
+          func.func @main(%a: tensor<3xi32>) -> (tensor<3xf32>, tensor<6xf32>) {
+            %b = stablehlo.convert %a : (tensor<3xi32>) -> tensor<3xui8>
+            %f8 = stablehlo.bitcast_convert %b : (tensor<3xui8>) -> tensor<3xf8E4M3FN>
+            %v8 = stablehlo.convert %f8 : (tensor<3xf8E4M3FN>) -> tensor<3xf32>
+            %f4 = stablehlo.bitcast_convert %b : (tensor<3xui8>) -> tensor<3x2xf4E2M1FN>
+            %v4 = stablehlo.convert %f4 : (tensor<3x2xf4E2M1FN>) -> tensor<3x2xf32>
+            %r4 = stablehlo.reshape %v4 : (tensor<3x2xf32>) -> tensor<6xf32>
+            return %v8, %r4 : tensor<3xf32>, tensor<6xf32>
+          }
+        }
+        """
+        // 0x38: f8 1.0, f4 nibbles (8 → -0, 3 → 1.5); 0xC4: f8 -3, nibbles (4 → 2, 12 → -2);
+        // 0x07: f8 subnormal 7·2⁻⁹, nibbles (7 → 6, 0 → 0).
+        let a = try client.createBuffer([0x38, 0xC4, 0x07] as [Int32], shape: [3])
+        for exe in try compileBoth(client, mlir) {
+            let out = try exe.execute([a])
+            expectClose(try out[0].toFloatArray(), [1, -3, 7.0 / 512])
+            expectClose(try out[1].toFloatArray(), [0, 1.5, 2, -2, 6, 0])
         }
     }
 }

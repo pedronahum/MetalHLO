@@ -77,6 +77,12 @@ public enum ElementType: String, CaseIterable, Sendable {
     case float64 = "f64"
     case bfloat16 = "bf16"
 
+    // Narrow floats. Storage types only: NarrowFloatLegalization rewrites a
+    // program's narrow-float values to f32 holding exactly representable
+    // values, and Executable decodes/encodes them at its boundary.
+    case float8E4M3FN = "f8E4M3FN"
+    case float4E2M1FN = "f4E2M1FN"
+
     // Signed integers
     case int1 = "i1"
     case int8 = "i8"
@@ -94,7 +100,7 @@ public enum ElementType: String, CaseIterable, Sendable {
     public var byteSize: Int {
         switch self {
         case .int1: return 0
-        case .int8, .uint8: return 1
+        case .int8, .uint8, .float8E4M3FN, .float4E2M1FN: return 1
         case .float16, .bfloat16, .int16, .uint16: return 2
         case .float32, .int32, .uint32: return 4
         case .float64, .int64, .uint64: return 8
@@ -113,7 +119,7 @@ public enum ElementType: String, CaseIterable, Sendable {
         case .int16: return .int16
         case .int32: return .int32
         case .int64: return .int64
-        case .uint8: return .uInt8
+        case .uint8, .float8E4M3FN, .float4E2M1FN: return .uInt8
         case .uint16: return .uInt16
         case .uint32: return .uInt32
         case .uint64: return .uInt64
@@ -123,7 +129,7 @@ public enum ElementType: String, CaseIterable, Sendable {
     /// Whether this is a floating-point type.
     public var isFloatingPoint: Bool {
         switch self {
-        case .float16, .float32, .float64, .bfloat16: return true
+        case .float16, .float32, .float64, .bfloat16, .float8E4M3FN, .float4E2M1FN: return true
         default: return false
         }
     }

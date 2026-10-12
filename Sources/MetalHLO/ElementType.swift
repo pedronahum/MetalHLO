@@ -26,6 +26,14 @@ public enum ElementType: String, CaseIterable, Sendable {
     /// Brain floating point (16-bit with 8-bit exponent).
     case bfloat16 = "bf16"
 
+    /// 8-bit float, 4 exponent / 3 mantissa bits, no infinities (OCP FP8 E4M3).
+    /// Computed as f32 inside programs; buffers hold one byte per element.
+    case float8E4M3FN = "f8E4M3FN"
+
+    /// 4-bit float, 2 exponent / 1 mantissa bit (OCP FP4 E2M1). Programs may
+    /// produce it from bytes with bitcast_convert; not a buffer type.
+    case float4E2M1FN = "f4E2M1FN"
+
     // MARK: - Signed Integers
 
     /// 1-bit integer (boolean).
@@ -64,7 +72,7 @@ public enum ElementType: String, CaseIterable, Sendable {
         switch self {
         case .int1:
             return 0  // Packed bits
-        case .int8, .uint8:
+        case .int8, .uint8, .float8E4M3FN, .float4E2M1FN:
             return 1
         case .float16, .bfloat16, .int16, .uint16:
             return 2
@@ -97,7 +105,7 @@ public enum ElementType: String, CaseIterable, Sendable {
             return .int32
         case .int64:
             return .int64
-        case .uint8:
+        case .uint8, .float8E4M3FN, .float4E2M1FN:
             return .uInt8
         case .uint16:
             return .uInt16
@@ -111,7 +119,7 @@ public enum ElementType: String, CaseIterable, Sendable {
     /// Whether this is a floating-point type.
     public var isFloatingPoint: Bool {
         switch self {
-        case .float16, .float32, .float64, .bfloat16:
+        case .float16, .float32, .float64, .bfloat16, .float8E4M3FN, .float4E2M1FN:
             return true
         default:
             return false
@@ -147,6 +155,8 @@ public enum ElementType: String, CaseIterable, Sendable {
         case .float32: return .float32
         case .float64: return .float64
         case .bfloat16: return .bfloat16
+        case .float8E4M3FN: return .float8E4M3FN
+        case .float4E2M1FN: return .float4E2M1FN
         case .int1: return .int1
         case .int8: return .int8
         case .int16: return .int16
@@ -166,6 +176,8 @@ public enum ElementType: String, CaseIterable, Sendable {
         case .float32: return .float32
         case .float64: return .float64
         case .bfloat16: return .bfloat16
+        case .float8E4M3FN: return .float8E4M3FN
+        case .float4E2M1FN: return .float4E2M1FN
         case .int1: return .int1
         case .int8: return .int8
         case .int16: return .int16

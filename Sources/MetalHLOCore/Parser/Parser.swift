@@ -26,11 +26,21 @@ public final class Parser {
 
     /// Parses the source and returns an HLOModule.
     ///
+    /// Narrow-float values (f8E4M3FN, f4E2M1FN) are legalized to f32 here
+    /// (NarrowFloatLegalization); `declaredNarrowOutputs` keeps main's declared
+    /// narrow result types for the Executable boundary.
+    ///
     /// - Throws: `ParseError` if parsing fails.
     /// - Returns: The parsed HLOModule.
     public func parse() throws -> HLOModule {
-        try parseModule()
+        let (module, narrowOutputs) = try NarrowFloatLegalization.apply(try parseModule())
+        declaredNarrowOutputs = narrowOutputs
+        return module
     }
+
+    /// For each of main's results, its narrow float type as declared in the
+    /// source (nil for other types). Set by `parse()`.
+    public private(set) var declaredNarrowOutputs: [ElementType?] = []
 
     // MARK: - Module Parsing
 
@@ -3589,6 +3599,8 @@ public final class Parser {
         case "f32": elementType = .float32
         case "f64": elementType = .float64
         case "bf16": elementType = .bfloat16
+        case "f8E4M3FN": elementType = .float8E4M3FN
+        case "f4E2M1FN": elementType = .float4E2M1FN
         case "i1": elementType = .int1
         case "i8": elementType = .int8
         case "i16": elementType = .int16

@@ -96,8 +96,19 @@ public final class Executable: @unchecked Sendable {
         }
     }
 
-    /// The output tensor types (shape and element type).
+    /// The output tensor types (shape and element type), as the program
+    /// declares them.
     public var outputTypes: [TensorType] {
+        let computed = computedOutputTypes
+        guard narrowOutputTypes.contains(where: { $0 != nil }) else { return computed }
+        return computed.enumerated().map { i, t in
+            i < narrowOutputTypes.count && narrowOutputTypes[i] != nil
+                ? TensorType(shape: t.shape, elementType: narrowOutputTypes[i]!) : t
+        }
+    }
+
+    /// The output types the backend computes (narrow floats as f32).
+    private var computedOutputTypes: [TensorType] {
         switch backend {
         case .mpsGraph(let compiled, _):
             return compiled.outputTypes.map { coreType in
@@ -162,22 +173,41 @@ public final class Executable: @unchecked Sendable {
         return try float64FromExecutor(outputs)
     }
 
-    // MARK: - Float64 boundary
+    // MARK: - Float64 and narrow-float boundary
+
+    /// Main's results declared f8E4M3FN, by position (nil elsewhere). The
+    /// program computes them as f32 (NarrowFloatLegalization); they are
+    /// encoded to one byte per element on the way out.
+    internal var narrowOutputTypes: [ElementType?] = []
 
     /// Executors compute f64 as f32 (Metal has no double); callers' f64 buffers
-    /// hold 8-byte doubles. Narrow f64 inputs on the way in...
+    /// hold 8-byte doubles. Narrow f64 inputs on the way in, and decode
+    /// f8E4M3FN bytes to the f32 values the legalized program takes...
     private func float64ForExecutor(_ inputs: [Buffer]) throws -> [Buffer] {
-        guard inputs.contains(where: { $0.elementType == .float64 }) else { return inputs }
-        return try inputs.map { $0.elementType == .float64 ? Buffer(storage: try $0.storage.float64ForExecutor()) : $0 }
+        guard inputs.contains(where: { $0.elementType == .float64 || $0.elementType == .float8E4M3FN })
+        else { return inputs }
+        return try inputs.map { input in
+            switch input.elementType {
+            case .float64: return Buffer(storage: try input.storage.float64ForExecutor())
+            case .float8E4M3FN: return Buffer(storage: try input.storage.float8E4M3FNForExecutor())
+            default: return input
+            }
+        }
     }
 
-    /// ...and widen every output the program declares f64 on the way out.
+    /// ...and widen every output the program declares f64, and encode the
+    /// declared f8E4M3FN ones, on the way out.
     private func float64FromExecutor(_ outputs: [Buffer]) throws -> [Buffer] {
         let declared = outputTypes
-        guard declared.contains(where: { $0.elementType == .float64 }) else { return outputs }
+        guard declared.contains(where: { $0.elementType == .float64 || $0.elementType == .float8E4M3FN })
+        else { return outputs }
         return try outputs.enumerated().map { i, out in
-            i < declared.count && declared[i].elementType == .float64
-                ? Buffer(storage: try out.storage.float64FromExecutor()) : out
+            guard i < declared.count else { return out }
+            switch declared[i].elementType {
+            case .float64: return Buffer(storage: try out.storage.float64FromExecutor())
+            case .float8E4M3FN: return Buffer(storage: try out.storage.float8E4M3FNFromExecutor())
+            default: return out
+            }
         }
     }
 

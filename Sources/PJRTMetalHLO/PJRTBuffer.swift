@@ -70,6 +70,8 @@ final class PJRTBufferImpl: @unchecked Sendable {
         case .uint16:   return PJRT_Buffer_Type_U16
         case .uint32:   return PJRT_Buffer_Type_U32
         case .uint64:   return PJRT_Buffer_Type_U64
+        case .float8E4M3FN: return PJRT_Buffer_Type_F8E4M3FN
+        case .float4E2M1FN: return PJRT_Buffer_Type_F4E2M1FN
         }
     }
 
@@ -88,6 +90,7 @@ final class PJRTBufferImpl: @unchecked Sendable {
         case PJRT_Buffer_Type_U16:  return .uint16
         case PJRT_Buffer_Type_U32:  return .uint32
         case PJRT_Buffer_Type_U64:  return .uint64
+        case PJRT_Buffer_Type_F8E4M3FN: return .float8E4M3FN
         default: return nil
         }
     }

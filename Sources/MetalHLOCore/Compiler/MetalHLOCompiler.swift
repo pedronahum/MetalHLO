@@ -670,6 +670,12 @@ public final class MetalHLOCompiler: @unchecked Sendable {
             var intValue = UInt8(clamping: UInt(max(0, value)))
             return withUnsafeBytes(of: &intValue) { Array($0) }
 
+        case .float8E4M3FN:
+            return [NarrowFloat.encodeF8E4M3FN(Float(value))]
+
+        case .float4E2M1FN:
+            return [NarrowFloat.encodeF4E2M1FN(Float(value))]
+
         case .uint16:
             var intValue = UInt16(clamping: UInt(max(0, value)))
             return withUnsafeBytes(of: &intValue) { Array($0) }
