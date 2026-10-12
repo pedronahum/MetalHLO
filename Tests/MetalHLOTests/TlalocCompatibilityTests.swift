@@ -416,6 +416,118 @@ struct TlalocNumericsTests {
         expectClose(try large[0].toFloatArray(), [21, 22])
     }
 
+    @Test("i1 dense array constants")
+    func boolDenseConstant() throws {
+        let client = try Client.create()
+        let mlir = """
+        module @m {
+          func.func @main(%a: tensor<3xf32>, %b: tensor<3xf32>) -> tensor<3xf32> {
+            %p = stablehlo.constant dense<[true, false, true]> : tensor<3xi1>
+            %r = stablehlo.select %p, %a, %b : tensor<3xi1>, tensor<3xf32>
+            return %r : tensor<3xf32>
+          }
+        }
+        """
+        let a = try client.createBuffer([1, 2, 3] as [Float], shape: [3])
+        let b = try client.createBuffer([10, 20, 30] as [Float], shape: [3])
+        for exe in try compileBoth(client, mlir) {
+            expectClose(try exe.execute([a, b])[0].toFloatArray(), [1, 20, 3])
+        }
+    }
+
+    @Test("bf16 sum of squares at the default optimization level (reduce fusion is f32-only)")
+    func bf16ReduceOfProduct() throws {
+        let client = try Client.create()
+        let mlir = """
+        module @m {
+          func.func @main(%x: tensor<2x4xf32>) -> tensor<2xf32> {
+            %b = stablehlo.convert %x : (tensor<2x4xf32>) -> tensor<2x4xbf16>
+            %s = stablehlo.multiply %b, %b : tensor<2x4xbf16>
+            %z = stablehlo.constant dense<0.0> : tensor<bf16>
+            %r = stablehlo.reduce(%s init: %z) applies stablehlo.add across dimensions = [1] : (tensor<2x4xbf16>, tensor<bf16>) -> tensor<2xbf16>
+            %f = stablehlo.convert %r : (tensor<2xbf16>) -> tensor<2xf32>
+            return %f : tensor<2xf32>
+          }
+        }
+        """
+        let x = try client.createBuffer([1, 2, 3, 4, 0, 1, 1, 2] as [Float], shape: [2, 4])
+        let out = try client.compile(mlir, config: CompilationConfig()).execute([x])
+        expectClose(try out[0].toFloatArray(), [30, 6])
+    }
+
+    @Test("dot_general bf16 x bf16 -> f32")
+    func bf16DotToF32() throws {
+        let client = try Client.create()
+        let mlir = """
+        module @m {
+          func.func @main(%a: tensor<2x2xf32>, %b: tensor<2x2xf32>) -> tensor<2x2xf32> {
+            %x = stablehlo.convert %a : (tensor<2x2xf32>) -> tensor<2x2xbf16>
+            %y = stablehlo.convert %b : (tensor<2x2xf32>) -> tensor<2x2xbf16>
+            %d = stablehlo.dot_general %x, %y, contracting_dims = [1] x [0] : (tensor<2x2xbf16>, tensor<2x2xbf16>) -> tensor<2x2xf32>
+            %two = stablehlo.constant dense<2.0> : tensor<2x2xf32>
+            %r = stablehlo.multiply %d, %two : tensor<2x2xf32>
+            return %r : tensor<2x2xf32>
+          }
+        }
+        """
+        let a = try client.createBuffer([1, 2, 3, 4] as [Float], shape: [2, 2])
+        let b = try client.createBuffer([5, 6, 7, 8] as [Float], shape: [2, 2])
+        expectClose(try client.compile(mlir).execute([a, b])[0].toFloatArray(), [38, 44, 86, 100])
+    }
+
+    @Test("convolution window reversal flips the kernel")
+    func convolutionWindowReversal() throws {
+        let client = try Client.create()
+        let mlir = """
+        module @m {
+          func.func @main(%x: tensor<1x1x3x3xf32>, %k: tensor<1x1x2x2xf32>) -> tensor<1x1x2x2xf32> {
+            %0 = stablehlo.convolution(%x, %k) dim_numbers = [b, f, 0, 1]x[o, i, 0, 1]->[b, f, 0, 1], window = {stride = [1, 1], pad = [[0, 0], [0, 0]], lhs_dilate = [1, 1], rhs_dilate = [1, 1], reverse = [true, true]} {batch_group_count = 1 : i64, feature_group_count = 1 : i64} : (tensor<1x1x3x3xf32>, tensor<1x1x2x2xf32>) -> tensor<1x1x2x2xf32>
+            return %0 : tensor<1x1x2x2xf32>
+          }
+        }
+        """
+        let x = try client.createBuffer((1...9).map { Float($0) }, shape: [1, 1, 3, 3])
+        let k = try client.createBuffer([1, 0, 0, 0] as [Float], shape: [1, 1, 2, 2])
+        for exe in try compileBoth(client, mlir) {
+            // The flipped kernel picks x[i+1][j+1].
+            expectClose(try exe.execute([x, k])[0].toFloatArray(), [5, 6, 8, 9])
+        }
+    }
+
+    @Test("cholesky of an indefinite matrix: NaN lower triangle, zero above")
+    func choleskyIndefinite() throws {
+        let client = try Client.create()
+        let mlir = """
+        module @m {
+          func.func @main(%a: tensor<2x2xf32>) -> tensor<2x2xf32> {
+            %l = "stablehlo.cholesky"(%a) {lower = true} : (tensor<2x2xf32>) -> tensor<2x2xf32>
+            return %l : tensor<2x2xf32>
+          }
+        }
+        """
+        let a = try client.createBuffer([1, 2, 2, 1] as [Float], shape: [2, 2])
+        let l = try client.compile(mlir).execute([a])[0].toFloatArray()
+        #expect(l[0].isNaN && l[1] == 0 && l[2].isNaN && l[3].isNaN, "\(l)")
+    }
+
+    @Test("a value returned twice is two outputs on the Metal-kernel path")
+    func duplicateOutputs() throws {
+        let client = try Client.create()
+        let mlir = """
+        module @m {
+          func.func @main(%a: tensor<2xf32>) -> (tensor<2xf32>, tensor<2xf32>) {
+            %s = stablehlo.add %a, %a : tensor<2xf32>
+            return %s, %s : tensor<2xf32>, tensor<2xf32>
+          }
+        }
+        """
+        let exe = try client.compile(mlir, config: kernelPath())
+        #expect(exe.outputCount == 2)
+        let out = try exe.execute([try client.createBuffer([1, 2] as [Float], shape: [2])])
+        #expect(out.count == 2)
+        expectClose(try out[1].toFloatArray(), [2, 4])
+    }
+
     @Test("concurrent executions of one executable keep their own results")
     func concurrentExecute() throws {
         let client = try Client.create()

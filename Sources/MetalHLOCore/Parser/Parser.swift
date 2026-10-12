@@ -659,6 +659,26 @@ public final class Parser {
                     // Single-branch case: result aliases the only branch output.
                     valueAliases[op.result] = acc
                 }
+            } else if op.kind == .convolution,
+                      let reversal = op.attributes.windowReversal, reversal.contains(true),
+                      let dims = op.attributes.convolutionDimensionNumbers,
+                      op.operands.count >= 2,
+                      let kernelType = typeOf(resolveAlias(op.operands[1], aliases: valueAliases)) {
+                // Window reversal flips the kernel's spatial dims: emit that
+                // reverse explicitly and convolve with the flipped kernel.
+                let resolvedOperands = op.operands.map { resolveAlias($0, aliases: valueAliases) }
+                var reverseAttrs = HLOAttributes()
+                reverseAttrs.dimensions = zip(dims.kernelSpatialDimensions, reversal).filter { $0.1 }.map { $0.0 }
+                let flipped = "\(op.result)_kernel_reversed"
+                operations.append(HLOOperation(
+                    result: flipped, kind: .reverse, operands: [resolvedOperands[1]],
+                    resultType: kernelType, attributes: reverseAttrs))
+                var convAttrs = op.attributes
+                convAttrs.windowReversal = nil
+                operations.append(HLOOperation(
+                    result: op.result, kind: .convolution,
+                    operands: [resolvedOperands[0], flipped] + resolvedOperands.dropFirst(2),
+                    resultType: op.resultType, attributes: convAttrs))
             } else {
                 // Substitute aliases in operands for regular operations
                 let resolvedOperands = op.operands.map { resolveAlias($0, aliases: valueAliases) }
@@ -2413,7 +2433,18 @@ public final class Parser {
                         }
                         try expect(.rightBracket)
                         attributes.convPadding = pairs
-                    default: try skipBalancedGroup()  // reverse = [..]
+                    case "reverse":
+                        try expect(.leftBracket)
+                        var flags: [Bool] = []
+                        if !check(.rightBracket) {
+                            repeat {
+                                flags.append(checkKeyword(.true_) || currentToken.text == "1")
+                                advance()
+                            } while match(.comma)
+                        }
+                        try expect(.rightBracket)
+                        attributes.windowReversal = flags
+                    default: try skipBalancedGroup()
                     }
                     _ = match(.comma)
                 }
@@ -3729,6 +3760,10 @@ public final class Parser {
                     advance()
                 } else if case .integer(let i) = currentToken.kind {
                     values.append(integerToConstantDouble(i, text: currentToken.text))
+                    advance()
+                } else if checkKeyword(.true_) || checkKeyword(.false_) {
+                    // i1 arrays: dense<[true, false, ...]>
+                    values.append(checkKeyword(.true_) ? 1 : 0)
                     advance()
                 } else if check(.minus) {
                     advance()

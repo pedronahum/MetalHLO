@@ -49,7 +49,7 @@ public final class Executable: @unchecked Sendable {
         case .mpsGraph(let compiled, _):
             return compiled.inputTypes.count
         case .integrated(let executable, _):
-            return executable.inputSpecs.count
+            return executable.inputOrder.count
         case .heterogeneous(let function, _):
             return function.inputs.count
         }
@@ -61,7 +61,8 @@ public final class Executable: @unchecked Sendable {
         case .mpsGraph(let compiled, _):
             return compiled.outputTypes.count
         case .integrated(let executable, _):
-            return executable.outputSpecs.count
+            // outputSpecs is keyed by name: a value returned twice is one entry.
+            return executable.outputOrder.count
         case .heterogeneous(let function, _):
             return function.outputTypes.count
         }

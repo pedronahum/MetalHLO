@@ -1221,8 +1221,23 @@ public final class MPSGraphCompiler {
 
 
     private func compileDotGeneral(_ op: HLOOperation) throws -> MPSGraphTensor {
-        let lhs = try getOperand(op.operands[0])
-        let rhs = try getOperand(op.operands[1])
+        let product = try compileDotGeneralProduct(op)
+        // MPSGraph's matmul returns its operands' type; the op may declare a
+        // wider one (bf16 x bf16 -> f32 accumulation).
+        let want = op.resultType.elementType.mpsDataType
+        return product.dataType == want ? product : graph.cast(product, to: want, name: op.result)
+    }
+
+    private func compileDotGeneralProduct(_ op: HLOOperation) throws -> MPSGraphTensor {
+        var lhs = try getOperand(op.operands[0])
+        var rhs = try getOperand(op.operands[1])
+        // A wider declared float result (bf16 x bf16 -> f32) accumulates in it:
+        // multiply in the result type.
+        let resultType = op.resultType.elementType.mpsDataType
+        if resultType == .float32 {
+            if lhs.dataType == .bFloat16 || lhs.dataType == .float16 { lhs = graph.cast(lhs, to: .float32, name: nil) }
+            if rhs.dataType == .bFloat16 || rhs.dataType == .float16 { rhs = graph.cast(rhs, to: .float32, name: nil) }
+        }
 
         // Check if operands are floating point - MPSGraph matmul only supports float/complex
         // Use typeMap if available, otherwise infer from MPSGraphTensor dataType
@@ -2158,7 +2173,7 @@ public final class MPSGraphCompiler {
         sliceSizes: [Int]
     ) throws -> MPSGraphTensor {
 
-        guard let indicesShape = startIndices.shape?.map({ $0.intValue }) else {
+        guard let indicesShape = staticShape(op.operands[1], startIndices) else {
             throw CompilationError.undefinedValue("\(op.result)_indices")
         }
 
@@ -2169,7 +2184,7 @@ public final class MPSGraphCompiler {
         // gatherND alone takes whole trailing slices at leading-dim indices; any
         // other gather (windowed slices, unordered or uncollapsed indexed dims,
         // offset dims not trailing) goes through the general lowering.
-        if let operandShape = operand.shape?.map({ $0.intValue }),
+        if let operandShape = staticShape(op.operands[0], operand),
            !gatherIsPlainGatherND(
                dimNumbers, operandShape: operandShape,
                numBatchDims: indexVectorDim < indicesRank ? indicesRank - 1 : indicesRank) {
@@ -2643,6 +2658,14 @@ public final class MPSGraphCompiler {
     }
 
     /// Compile scatter with no batching dimensions.
+    /// The static shape of `tensor` (the value named `name`): the graph's own
+    /// when known, else the declared type — loop-carried tensors inside an
+    /// MPSGraph while body can have no static shape.
+    private func staticShape(_ name: String, _ tensor: MPSGraphTensor) -> [Int]? {
+        if let shape = tensor.shape?.map({ $0.intValue }), !shape.contains(where: { $0 < 0 }) { return shape }
+        return typeMap[name]?.shape
+    }
+
     /// StableHLO scatter (no batching dims) by its definition: every update
     /// element lands at operand[start(scatter index) + window offset], combined
     /// by `scatterMode`. Builds that full coordinate for each update element
@@ -2658,9 +2681,9 @@ public final class MPSGraphCompiler {
         dimNumbers: ScatterDimensionNumbers,
         scatterMode: MPSGraphScatterMode
     ) throws -> MPSGraphTensor {
-        guard let operandShape = operand.shape?.map({ $0.intValue }),
-              let indicesShape = scatterIndices.shape?.map({ $0.intValue }),
-              let updatesShape = updates.shape?.map({ $0.intValue }),
+        guard let operandShape = staticShape(op.operands[0], operand),
+              let indicesShape = staticShape(op.operands[1], scatterIndices),
+              let updatesShape = staticShape(op.operands[2], updates),
               !operandShape.isEmpty else {
             throw CompilationError.undefinedValue("\(op.result)_shape")
         }
@@ -5114,6 +5137,8 @@ public final class MPSGraphCompiler {
         let rowIdx = graph.cast(
             graph.coordinate(alongAxis: rowAxis, withShape: columnShape, name: nil), to: dataType, name: nil)
         let zero = graph.constant(0.0, dataType: dataType)
+        // Whether any pivot of a matrix is NaN (not positive definite) — [..., 1, 1].
+        var failed: MPSGraphTensor? = nil
 
         for j in 0..<n {
             // A[..., :, j] — full column of the input, shape [..., N, 1].
@@ -5130,6 +5155,8 @@ public final class MPSGraphCompiler {
             // running[i] / pivot (the diagonal itself is pivot); rows i < j are 0.
             let pivotRaw = graph.sliceTensor(running, dimension: rowAxis, start: j, length: 1, name: nil)
             let pivot = graph.squareRoot(with: pivotRaw, name: nil)
+            let pivotNaN = graph.notEqual(pivot, pivot, name: nil)
+            failed = failed.map { graph.logicalOR($0, pivotNaN, name: nil) } ?? pivotNaN
             let divided = graph.division(running, pivot, name: nil)
             let keepMask = graph.greaterThanOrEqualTo(
                 rowIdx, graph.constant(Double(j), dataType: dataType), name: nil)
@@ -5137,9 +5164,20 @@ public final class MPSGraphCompiler {
         }
 
         // Assemble L = [col0 | col1 | ... ] → [..., N, N].
-        let lowerL = graph.concatTensors(cols, dimension: colAxis, name: lower ? op.result : nil)
+        var lowerL = graph.concatTensors(cols, dimension: colAxis, name: nil)
+        // XLA's convention for a matrix that is not positive definite: its
+        // whole lower triangle (diagonal included) is NaN, the rest stays 0.
+        if let failed {
+            let shape = aShape
+            let r = graph.coordinate(alongAxis: rowAxis, withShape: shape, name: nil)
+            let c = graph.coordinate(alongAxis: colAxis, withShape: shape, name: nil)
+            let lowerMask = graph.greaterThanOrEqualTo(r, c, name: nil)
+            let nan = graph.constant(Double.nan, dataType: dataType)
+            lowerL = graph.select(predicate: graph.logicalAND(failed, lowerMask, name: nil),
+                                  trueTensor: nan, falseTensor: lowerL, name: nil)
+        }
         if lower {
-            return lowerL
+            return graph.identity(with: lowerL, name: op.result)
         }
         // Upper factor requested: return Lᵀ.
         return graph.transposeTensor(lowerL, dimension: rowAxis, withDimension: colAxis, name: op.result)
@@ -5232,6 +5270,7 @@ public final class MPSGraphCompiler {
         var localValueMap: [String: MPSGraphTensor] = [:]
         for (arg, operandName) in zip(region.arguments, op.operands) {
             localValueMap[arg.name] = try getOperand(operandName)
+            self.regionValueTypes[arg.name] = arg.type
         }
 
         // Compile the body operations in order, threading results through the
@@ -5293,6 +5332,7 @@ public final class MPSGraphCompiler {
                 var localValueMap: [String: MPSGraphTensor] = [:]
                 for (arg, tensor) in zip(condRegion.arguments, inputTensors) {
                     localValueMap[arg.name] = tensor
+                    self.regionValueTypes[arg.name] = arg.type
                 }
 
                 // Add input tensors to resultTensors - these get passed to the after block
@@ -5340,6 +5380,7 @@ public final class MPSGraphCompiler {
                 var localValueMap: [String: MPSGraphTensor] = [:]
                 for (arg, tensor) in zip(bodyRegion.arguments, inputTensors) {
                     localValueMap[arg.name] = tensor
+                    self.regionValueTypes[arg.name] = arg.type
                 }
 
                 // Compile operations in body region

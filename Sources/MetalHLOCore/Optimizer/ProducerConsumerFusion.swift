@@ -785,6 +785,11 @@ public struct ReduceFusion: Sendable {
             guard let dataOperand = op.operands.first,
                   let (producer, _) = udi.definingOp(for: dataOperand) else { dbgNoProducer += 1; continue }
             guard udi.uses(of: producer.result).count == 1 else { dbgMultiUse += 1; continue }
+            // The fused kernel reads and writes `float` buffers
+            // (generateFusedReduceSource), so only f32 reduces fuse; a bf16 one
+            // read its input as floats and produced garbage.
+            guard producer.resultType.elementType == .float32,
+                  op.resultType.elementType == .float32 else { continue }
 
             // Build a pointwise chain + external operand list from the producer.
             guard let (chain, externals) = Self.chainFromProducer(producer) else { dbgNotChain += 1; continue }

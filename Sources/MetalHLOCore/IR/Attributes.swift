@@ -168,6 +168,10 @@ public struct HLOAttributes: Sendable {
     /// 2-input, 2-result stablehlo.reduce that jnp.argmax/argmin lowers to.
     public var argReduceIndexType: TensorType?
 
+    /// Convolution window reversal per spatial dim (`window = {reverse = [...]}`):
+    /// the parser rewrites it into a `reverse` of the kernel's spatial dims.
+    public var windowReversal: [Bool]?
+
     /// Sort descending instead of ascending.
     public var sortDescending: Bool?
 
